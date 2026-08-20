@@ -23,11 +23,22 @@ Phase 6 hangs one more dispatch off the end of each *frame* (not each
 substep): ``surface`` splats the particles onto a scalar grid and extracts a
 mesh from it, which is the add-on's actual output. The point-cloud viz is now
 a debug overlay behind a checkbox rather than the thing the user watches.
+
+Phase 7 wires that to the timeline. ``_state["last_frame"]`` is the frame the
+GPU state actually represents, which is not the same thing as the scene's
+current frame: the handler re-seeds at or before the scene's start frame,
+steps forward frame by frame from there, and *holds* on a backward scrub -
+without a cache there is no honest way to go back, so it says so in the panel
+rather than quietly showing a frame it never simulated. Seeding is from a
+fixed RNG seed and the substep size comes only from the scene's frame rate, so
+the same timeline replays identically every time.
 """
 
 import math
 import random
 import struct
+import time
+from collections import deque
 
 import bpy
 import gpu
@@ -63,6 +74,14 @@ MAX_PARTICLES = 16384
 # cell-clear time for no benefit.
 MAX_CELLS = 262144
 MAX_CELLS_PER_AXIS = 128
+
+# Frames to simulate in one go when the timeline jumps forward. Playback only
+# ever asks for one, so this bounds how long a forward scrub can lock the UI up
+# before the handler gives up and admits the frame is approximate.
+MAX_CATCHUP_FRAMES = 30
+
+# Frames of wall-clock timing averaged for the panel's ms/frame readout.
+TIMING_WINDOW = 30
 
 # Courant-style limit on the substep: a particle must not cross a meaningful
 # fraction of a smoothing radius before the pressure field can respond.
@@ -110,6 +129,14 @@ _state = {
     "shaders": {},
     "textures": {},
     "substeps": 0,
+    # Playback bookkeeping (Phase 7). `last_frame` is the frame the GPU state
+    # represents; `seed_frame` is the frame the run is seeded at and re-seeds
+    # at. `warning` is user-facing text for the panel, set when the timeline
+    # asks for something the solver cannot honestly deliver.
+    "seed_frame": 0,
+    "last_frame": 0,
+    "warning": None,
+    "timings": deque(maxlen=TIMING_WINDOW),
 }
 
 
@@ -379,6 +406,14 @@ def _substep(dt):
 
 
 def _step(frame_dt):
+    """Advance one frame of simulated time and refresh the frame's output.
+
+    Timed end to end rather than per stage: compute dispatches return before
+    the GPU has run them, so it is the read-back at the end that the whole
+    frame's GPU work actually lands in. Only the total means anything.
+    """
+    started = time.perf_counter()
+
     config = _state["config"]
     substeps, dt = config.substep_dt(frame_dt)
     _state["substeps"] = substeps
@@ -387,6 +422,8 @@ def _step(frame_dt):
 
     _update_surface(dt)
     _update_viz()
+
+    _state["timings"].append((time.perf_counter() - started) * 1000.0)
 
 
 def _update_surface(dt):
@@ -424,28 +461,70 @@ def _update_viz():
     viz.set_points([p[:3] for p in positions])
 
 
-def _start(domain):
+def _seed(domain):
+    """Re-resolve the run's parameters and refill particle state from scratch.
+
+    Everything except the compiled shaders is rebuilt, so a re-seed picks up
+    edits to fluid level, resolution and the solver parameters. The shaders
+    depend only on the binding layout, never on the config, so they survive -
+    which is what makes re-seeding cheap enough to do on every playback loop.
+    """
     config = _resolve_config(domain)
     _state["config"] = config
-    _state["domain"] = domain
     _state["textures"] = _allocate(config)
-    _state["shaders"] = _compile_passes()
-    _state["running"] = True
 
     if domain.flowx_domain.show_surface:
-        surface.start(domain, config)
+        if surface.is_running():
+            surface.reseed(domain, config)
+        else:
+            surface.start(domain, config)
         # Extract once up front so the seeded fluid is visible as a surface
         # straight away instead of as an empty object until playback starts.
         # The splat gathers through the spatial hash, so that has to exist -
         # a zero-length step builds it without advancing the simulation.
         _build_grid(0.0)
         _update_surface(0.0)
+    elif surface.is_running():
+        surface.stop()
 
     _update_viz()
+
+
+def _reset_clock(scene):
+    """Pin the run's timeline to `scene` and drop the previous run's stats."""
+    _state["seed_frame"] = scene.frame_start
+    _state["last_frame"] = scene.frame_current
+    _state["warning"] = None
+    _state["substeps"] = 0
+    _state["timings"].clear()
+
+
+def _start(domain):
+    _state["domain"] = domain
+    _state["shaders"] = _compile_passes()
+    _state["running"] = True
+    _seed(domain)
+    _reset_clock(bpy.context.scene)
+
     viz.enable()
     if _on_frame_change not in bpy.app.handlers.frame_change_pre:
         bpy.app.handlers.frame_change_pre.append(_on_frame_change)
     viz.tag_viewports_redraw()
+
+
+def reseed(scene=None):
+    """Re-seed the running solver at the domain's current fluid level.
+
+    Returns False if there is nothing to re-seed - the solver isn't running,
+    or its domain has been deleted out from under it.
+    """
+    domain = _state["domain"]
+    if not _state["running"] or not is_alive(domain):
+        return False
+    _seed(domain)
+    _reset_clock(scene or bpy.context.scene)
+    viz.tag_viewports_redraw()
+    return True
 
 
 def stop():
@@ -453,15 +532,63 @@ def stop():
         bpy.app.handlers.frame_change_pre.remove(_on_frame_change)
     surface.stop()
     _state.update({"running": False, "config": None, "domain": None, "shaders": {}, "textures": {}})
+    _state["timings"].clear()
+    _state["warning"] = None
     viz.disable()
+
+
+def _frame_dt(scene):
+    """Simulated seconds per frame, from the scene's frame rate."""
+    fps = scene.render.fps / scene.render.fps_base if scene.render.fps_base else 24.0
+    return 1.0 / fps if fps > 0 else 1.0 / 24.0
 
 
 @persistent
 def _on_frame_change(scene, _depsgraph):
+    """Step the solver to `scene.frame_current`, or say why it can't.
+
+    Three cases, in the order the timeline hits them during playback: the
+    scene's start frame (or anything before it, including negative frames) is
+    the run's origin and re-seeds; a forward jump steps that many frames; a
+    backward one holds, because replaying it would mean re-simulating from the
+    seed frame and there is no cache to do it from.
+    """
     if not _state["running"]:
         return
-    fps = scene.render.fps / scene.render.fps_base if scene.render.fps_base else 24.0
-    _step(1.0 / fps if fps > 0 else 1.0 / 24.0)
+
+    frame = scene.frame_current
+    if frame <= _state["seed_frame"]:
+        reseed(scene)
+        viz.tag_viewports_redraw()
+        return
+
+    pending = frame - _state["last_frame"]
+    if pending == 0:
+        # Re-entering the frame the state already represents (a frame_set to
+        # the current frame): there is nothing to advance and nothing wrong.
+        return
+    if pending < 0:
+        _state["warning"] = (
+            f"Frame {frame} is behind the simulation, which is at frame "
+            f"{_state['last_frame']}. Flow-X has no cache to scrub back through - "
+            f"return to frame {_state['seed_frame']} to re-seed and re-run."
+        )
+        return
+
+    if pending > MAX_CATCHUP_FRAMES:
+        _state["warning"] = (
+            f"Jumped {pending} frames; only {MAX_CATCHUP_FRAMES} were simulated, so "
+            f"this frame is approximate. Return to frame {_state['seed_frame']} and "
+            "play forward for a correct result."
+        )
+        pending = MAX_CATCHUP_FRAMES
+    else:
+        _state["warning"] = None
+
+    frame_dt = _frame_dt(scene)
+    for _ in range(pending):
+        _step(frame_dt)
+    _state["last_frame"] = frame
     viz.tag_viewports_redraw()
 
 
@@ -474,6 +601,7 @@ def stats():
     config = _state["config"]
     if config is None:
         return None
+    timings = _state["timings"]
     return {
         "particles": config.particle_count,
         "cells": config.cell_count,
@@ -482,6 +610,10 @@ def stats():
         "spacing": config.spacing,
         "substeps": _state["substeps"],
         "surface": surface.stats(),
+        "seed_frame": _state["seed_frame"],
+        "frame": _state["last_frame"],
+        "warning": _state["warning"],
+        "step_ms": sum(timings) / len(timings) if timings else None,
     }
 
 
@@ -523,5 +655,27 @@ class FLOWX_OT_sph_toggle(Operator):
         self.report(
             {"INFO"},
             f"Flow-X SPH solver running ({_state['config'].particle_count} particles)",
+        )
+        return {"FINISHED"}
+
+
+class FLOWX_OT_sph_reset(Operator):
+    """Re-seed the fluid at the domain's fluid level and restart the simulation clock"""
+
+    bl_idname = "flowx.sph_reset"
+    bl_label = "Reset Simulation"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        return is_running()
+
+    def execute(self, context):
+        if not reseed(context.scene):
+            self.report({"WARNING"}, "Nothing to reset - the solver is not running.")
+            return {"CANCELLED"}
+        self.report(
+            {"INFO"},
+            f"Flow-X simulation re-seeded ({_state['config'].particle_count} particles)",
         )
         return {"FINISHED"}

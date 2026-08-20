@@ -31,6 +31,13 @@ OPERATORS_TO_SMOKE_TEST = [
     ("flowx.sph_toggle", {}),
 ]
 
+# Operators that only make sense while the solver is running, so they run after
+# the toggle above rather than being folded into that list (which also runs
+# with no GPU context, where the solver never starts).
+SOLVER_OPERATORS_TO_SMOKE_TEST = [
+    ("flowx.sph_reset", {}),
+]
+
 
 def _get_operator(idname):
     module_name, func_name = idname.split(".")
@@ -86,6 +93,56 @@ def _check_solver():
 
     _check_particles(sph, stats)
     _check_surface(sph, stats)
+    _check_playback(sph)
+
+
+def _check_playback(sph):
+    """Phase 7: the handler's three timeline cases, and the ms/step readout.
+
+    The solver has no cache, so the contract is: re-seed at or before the
+    scene's start frame, step forward, and hold with a warning on a backward
+    scrub rather than showing a frame that was never simulated.
+    """
+    for idname, kwargs in SOLVER_OPERATORS_TO_SMOKE_TEST:
+        result = _get_operator(idname)(**kwargs)
+        if "FINISHED" not in result:
+            raise RuntimeError(f"{idname} returned {result}, expected FINISHED")
+        print(f"[smoke_test] ran {idname} -> {result}")
+
+    scene = bpy.context.scene
+    scene.frame_set(scene.frame_start + 4)
+    stats = sph.stats()
+    if stats["frame"] != scene.frame_current:
+        raise RuntimeError(
+            f"solver is at frame {stats['frame']}, expected {scene.frame_current} "
+            "after stepping forward"
+        )
+    if stats["warning"]:
+        raise RuntimeError(f"unexpected playback warning stepping forward: {stats['warning']}")
+    if stats["step_ms"] is None:
+        raise RuntimeError("no ms/step timing was recorded while stepping")
+
+    # Backward scrub: hold the simulated frame, and say so.
+    simulated = stats["frame"]
+    scene.frame_set(scene.frame_start + 2)
+    stats = sph.stats()
+    if stats["frame"] != simulated:
+        raise RuntimeError(
+            f"solver stepped to {stats['frame']} on a backward scrub; it should have "
+            f"held at {simulated}"
+        )
+    if not stats["warning"]:
+        raise RuntimeError("a backward scrub should warn rather than silently hold")
+
+    # The start frame is the run's origin: re-seed and clear the warning.
+    scene.frame_set(scene.frame_start)
+    stats = sph.stats()
+    if stats["frame"] != scene.frame_start:
+        raise RuntimeError(f"scrubbing to the start frame did not re-seed (at {stats['frame']})")
+    if stats["warning"]:
+        raise RuntimeError(f"re-seeding left a stale warning: {stats['warning']}")
+
+    print(f"[smoke_test] playback: re-seeded at frame {scene.frame_start}, backward scrub warned")
 
 
 def _check_particles(sph, stats):

@@ -124,15 +124,29 @@ def resolve(domain, config):
 
 def start(domain, config):
     """Compile the splat pass and allocate its grid. Safe to call repeatedly."""
-    surface = resolve(domain, config)
-    _state["config"] = surface
-    _state["texture"] = make_texture(surface.sample_count, channels=1, fmt="R32F")
     _state["shader"] = build_compute_shader(
         [shader_source("sph_common"), shader_source("surface_splat")],
         _IMAGES,
         _PUSH_CONSTANTS,
         LOCAL_GROUP_SIZE,
     )
+    reseed(domain, config)
+
+
+def reseed(domain, config):
+    """Re-resolve the grid for a re-seeded solver, keeping the compiled shader.
+
+    The splat shader depends only on its binding layout, so a re-seed - which
+    happens on every playback loop - only has to resize the grid to whatever
+    the domain's surface settings now ask for.
+    """
+    if _state["shader"] is None:
+        return
+    surface = resolve(domain, config)
+    _state["config"] = surface
+    _state["texture"] = make_texture(surface.sample_count, channels=1, fmt="R32F")
+    _state["vertices"] = 0
+    _state["triangles"] = 0
     _state["object"] = _surface_object(domain)
 
 
