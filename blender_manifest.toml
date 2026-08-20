@@ -1,0 +1,22 @@
+schema_version = "1.0.0"
+
+id = "flow_x"
+name = "Flow-X"
+version = "0.1.0"
+tagline = "GPU-simulated SPH fluids with a live surface mesh"
+maintainer = "James Palmer <james.pa@outlook.com>"
+type = "add-on"
+
+tags = ["Physics"]
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:MIT",
+]
+
+copyright = ["2026 James Palmer"]
+
+[permissions]
+# No file/network/clipboard access needed yet. Revisit as phases land
+# (e.g. Phase 8 demo .blend files may need "files" for import helpers).

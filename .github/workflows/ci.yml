@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+      - run: black --check .
+
+  smoke-test:
+    # Requires a self-hosted runner with `blender` on PATH (Blender 4.2+).
+    runs-on: [self-hosted, blender]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect Blender resource version
+        run: |
+          echo "BLENDER_VERSION=$(blender --version | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)" >> "$GITHUB_ENV"
+
+      - name: Symlink extension into a throwaway Blender config dir
+        env:
+          BLENDER_USER_RESOURCES: ${{ runner.temp }}/blender-config
+        run: python3 scripts/dev_link.py --blender-version "$BLENDER_VERSION"
+
+      - name: Run headless smoke test
+        env:
+          BLENDER_USER_RESOURCES: ${{ runner.temp }}/blender-config
+        run: blender --background --python scripts/smoke_test.py
