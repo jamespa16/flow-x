@@ -9,11 +9,16 @@ Run from the repo root (after `python3 scripts/dev_link.py`):
     blender --background --python scripts/smoke_test.py
 """
 
+import math
 import sys
 
 import bpy
 
 ADDON_MODULE = "bl_ext.user_default.flow_x"
+
+# Set by _init_gpu(): whether this run has a GPU context, and so whether the
+# solver's compute passes are expected to actually run.
+_gpu_available = False
 
 # (operator idname, kwargs) pairs to run once the extension is enabled.
 OPERATORS_TO_SMOKE_TEST = [
@@ -21,6 +26,7 @@ OPERATORS_TO_SMOKE_TEST = [
     ("mesh.primitive_cube_add", {"size": 0.5, "location": (0, 0, 0)}),
     ("flowx.toggle_collider", {}),
     ("flowx.solver_gpu_test_toggle", {}),
+    ("flowx.sph_toggle", {}),
 ]
 
 
@@ -29,7 +35,62 @@ def _get_operator(idname):
     return getattr(getattr(bpy.ops, module_name), func_name)
 
 
+def _init_gpu():
+    """Bring up a GPU context in background mode, where Blender offers one.
+
+    Without this the solver operators report a warning and no-op, so nothing
+    would ever compile a compute shader in CI. gpu.init() only exists in
+    Blender 5.0+; on older builds this stays a compile-free smoke test.
+    """
+    global _gpu_available
+    import gpu
+
+    if not bpy.app.background:
+        _gpu_available = True
+        return
+    if not hasattr(gpu, "init"):
+        print("[smoke_test] gpu.init() unavailable; GPU passes will be skipped")
+        return
+    try:
+        gpu.init()
+    except Exception as exc:
+        print(f"[smoke_test] gpu.init() failed ({exc}); GPU passes will be skipped")
+    else:
+        _gpu_available = True
+        print(f"[smoke_test] GPU backend: {gpu.platform.backend_type_get()}")
+
+
+def _check_solver():
+    """Confirm the SPH solver really started, and step it a few frames.
+
+    The solver operators deliberately report a warning instead of raising when
+    there's no GPU context, so a green operator run alone would not catch a
+    broken compute shader. Where a GPU is available, insist that the last
+    toggle in OPERATORS_TO_SMOKE_TEST actually left the solver running.
+    """
+    if not _gpu_available:
+        print("[smoke_test] no GPU context; skipping solver step check")
+        return
+
+    sph = sys.modules[ADDON_MODULE].solver.sph
+    if not sph.is_running():
+        raise RuntimeError("flowx.sph_toggle did not start the solver (see warnings above)")
+
+    scene = bpy.context.scene
+    for frame in range(1, 4):
+        scene.frame_set(frame)
+    stats = sph.stats()
+    print(f"[smoke_test] stepped SPH solver 3 frames: {stats}")
+
+    points = sph.viz.points()
+    if len(points) != stats["particles"]:
+        raise RuntimeError(f"expected {stats['particles']} particles, read back {len(points)}")
+    if not all(all(math.isfinite(c) for c in p) for p in points):
+        raise RuntimeError("solver produced non-finite particle positions")
+
+
 def main():
+    _init_gpu()
     bpy.ops.extensions.repo_refresh_all()
 
     bpy.ops.preferences.addon_enable(module=ADDON_MODULE)
@@ -42,6 +103,8 @@ def main():
         if "FINISHED" not in result:
             raise RuntimeError(f"{idname} returned {result}, expected FINISHED")
         print(f"[smoke_test] ran {idname} -> {result}")
+
+    _check_solver()
 
     bpy.ops.preferences.addon_disable(module=ADDON_MODULE)
     if ADDON_MODULE in bpy.context.preferences.addons:

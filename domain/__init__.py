@@ -50,6 +50,57 @@ class FlowXDomainSettings(PropertyGroup):
         subtype="PERCENTAGE",
     )
 
+    # Phase 4 solver parameters. Enough knobs to keep the physics out of the
+    # source, not a tuning UI - that's post-MVP. Defaults are sized for a
+    # roughly 2m domain in Blender's default metric units.
+    smoothing_radius: FloatProperty(
+        name="Smoothing Radius",
+        description=(
+            "SPH kernel support radius, in metres. Particles are seeded half a radius "
+            "apart, so halving this roughly octuples the particle count - the solver "
+            "coarsens it back if that exceeds its particle budget"
+        ),
+        default=0.1,
+        min=0.005,
+        max=2.0,
+        subtype="DISTANCE",
+    )
+    rest_density: FloatProperty(
+        name="Rest Density",
+        description="Target density of the fluid at rest, in kg/m^3 (water is 1000)",
+        default=1000.0,
+        min=1.0,
+        max=20000.0,
+    )
+    stiffness: FloatProperty(
+        name="Stiffness",
+        description=(
+            "Tait equation-of-state stiffness. Higher resists compression harder but "
+            "raises the speed of sound, which forces smaller substeps"
+        ),
+        default=20000.0,
+        min=1.0,
+        max=1000000.0,
+    )
+    viscosity: FloatProperty(
+        name="Viscosity",
+        description="Dynamic viscosity coefficient; higher is thicker and more damped",
+        default=0.1,
+        min=0.0,
+        max=10.0,
+    )
+    max_substeps: IntProperty(
+        name="Max Substeps",
+        description=(
+            "Upper bound on solver substeps per frame. The solver takes as many as "
+            "stability requires up to this limit; past it, it advances less than a "
+            "full frame of simulated time rather than going unstable"
+        ),
+        default=24,
+        min=1,
+        max=200,
+    )
+
 
 def world_bounds(obj):
     """Return (min, max) corners of obj's bounding box, in world space."""
