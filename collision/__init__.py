@@ -23,6 +23,12 @@ _OVERLAY_POINT_SIZE = 4.0
 _grids = {}
 _draw_handle = None
 
+# Union of every tagged collider's occupancy, in the same domain-resolution
+# grid, kept ready for the Phase 5 solver to sample. Rebuilt whenever any
+# collider's own grid changes rather than read from `_grids` per frame, so a
+# multi-collider scene costs the solver one texture lookup, not several.
+_solver_grid = {"texture": None, "voxel_size": 0.0, "dims": (1, 1, 1)}
+
 
 class ColliderGrid:
     """Voxelized occupancy for one collider, sized to the domain's grid."""
@@ -61,8 +67,8 @@ class FLOWX_OT_toggle_collider(Operator):
         settings = obj.flowx_collider
         settings.is_collider = not settings.is_collider
 
+        domain = find_domain(context.scene)
         if settings.is_collider:
-            domain = find_domain(context.scene)
             if domain is None:
                 settings.is_collider = False
                 self.report(
@@ -73,6 +79,8 @@ class FLOWX_OT_toggle_collider(Operator):
             _rebuild_grid(domain, obj)
         else:
             _grids.pop(obj.name, None)
+            if domain is not None:
+                _rebuild_solver_grid(domain)
 
         _tag_viewports_redraw()
         return {"FINISHED"}
@@ -82,6 +90,36 @@ def occupied_count(obj_name):
     """Number of occupied voxels in obj_name's collider grid, or 0 if untracked."""
     grid = _grids.get(obj_name)
     return len(grid.points) if grid is not None else 0
+
+
+def get_solver_grid():
+    """(texture, voxel_size, dims) for the SPH solver's collider sampling.
+
+    `texture` is None when there are no tagged colliders, or when the upload
+    failed (e.g. no GL context in a headless run) - the solver treats that the
+    same way, as "nothing to collide with".
+    """
+    return _solver_grid["texture"], _solver_grid["voxel_size"], _solver_grid["dims"]
+
+
+def _rebuild_solver_grid(domain):
+    if not _grids:
+        _solver_grid.update(texture=None, voxel_size=0.0, dims=(1, 1, 1))
+        return
+
+    origin, voxel_size, dims = _domain_grid_geometry(domain)
+    nx, ny, nz = dims
+    union = bytearray(nx * ny * nz)
+    for grid in _grids.values():
+        # A grid built against a stale domain resolution is skipped until its
+        # own transform/geometry update rebuilds it at the current one.
+        if grid.dims != dims:
+            continue
+        for idx, occupied in enumerate(grid.occupancy):
+            if occupied:
+                union[idx] = 1
+
+    _solver_grid.update(texture=_upload_to_gpu(union, dims), voxel_size=voxel_size, dims=dims)
 
 
 def _domain_grid_geometry(domain):
@@ -163,6 +201,7 @@ def _rebuild_grid(domain, obj):
 
     gpu_buf = _upload_to_gpu(occupancy, dims)
     _grids[obj.name] = ColliderGrid(dims, occupancy, points, gpu_buf)
+    _rebuild_solver_grid(domain)
 
 
 def _tag_viewports_redraw():
@@ -230,6 +269,7 @@ def unregister():
     if _on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_update)
     _grids.clear()
+    _solver_grid.update(texture=None, voxel_size=0.0, dims=(1, 1, 1))
     del Object.flowx_collider
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)

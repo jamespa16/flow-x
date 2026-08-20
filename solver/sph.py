@@ -13,16 +13,24 @@ backend, so the (cell key, particle index) pairs go through a bitonic sort
 instead - pure compare-exchange, no atomics, O(log^2 n) host-driven passes.
 Dispatch overhead measured at ~13 us, so the extra passes cost single-digit
 milliseconds per frame rather than anything structural.
+
+The integrate pass also does Phase 5's collision response: it samples the
+collider occupancy grid built in ``collision`` and pushes a particle out to
+the nearest free voxel, with a velocity reflection/damping term along the
+push direction (see ``shaders/sph_integrate.glsl``).
 """
 
 import math
 import random
+import struct
 
 import bpy
+import gpu
 from bpy.app.handlers import persistent
 from bpy.types import Operator
 from mathutils import Vector
 
+from ..collision import get_solver_grid
 from ..domain import find_domain, world_bounds
 from . import viz
 from .gpu_util import (
@@ -55,7 +63,8 @@ MAX_CELLS_PER_AXIS = 128
 CFL_FACTOR = 0.25
 
 # Every SPH pass declares this same push-constant block so shaders/sph_common.glsl
-# can provide shared helpers. 112 bytes total - see that file before adding to it.
+# can provide shared helpers. 128 bytes total, right at the budget - see that
+# file before adding to it.
 _PUSH_CONSTANTS = (
     ("IVEC4", "i_layout"),
     ("IVEC4", "i_grid"),
@@ -64,6 +73,7 @@ _PUSH_CONSTANTS = (
     ("VEC4", "f_hi"),
     ("VEC4", "f_sph"),
     ("VEC4", "f_sim"),
+    ("IVEC4", "i_collider"),
 )
 
 _IMAGES = (
@@ -74,6 +84,7 @@ _IMAGES = (
     ("RGBA32F", "FLOAT_2D", "keys_img"),
     ("R32F", "FLOAT_2D", "cell_start_img"),
     ("R32F", "FLOAT_2D", "cell_end_img"),
+    ("R32F", "FLOAT_3D", "collider_img"),
 )
 
 _PASSES = (
@@ -270,10 +281,36 @@ def _compile_passes():
     }
 
 
+_EMPTY_COLLIDER_TEXTURE = None
+
+
+def _empty_collider_texture():
+    """1x1x1 "nothing occupied" texture, bound when no collider is tagged."""
+    global _EMPTY_COLLIDER_TEXTURE
+    if _EMPTY_COLLIDER_TEXTURE is None:
+        buf = gpu.types.Buffer("FLOAT", [1], [0.0])
+        _EMPTY_COLLIDER_TEXTURE = gpu.types.GPUTexture((1, 1, 1), format="R32F", data=buf)
+    return _EMPTY_COLLIDER_TEXTURE
+
+
+def _collider_binding():
+    """(texture, i_collider) fetched live each bind, so toggling a collider's
+    tag mid-run takes effect on the very next substep rather than needing the
+    solver restarted.
+    """
+    texture, voxel_size, dims = get_solver_grid()
+    if texture is None:
+        # A voxel size of 0 tells the shader there's nothing to sample.
+        return _empty_collider_texture(), (1, 1, 1, 0)
+    voxel_size_bits = struct.unpack("<i", struct.pack("<f", voxel_size))[0]
+    return texture, (*dims, voxel_size_bits)
+
+
 def _bind(name, dt, sort_k=0, sort_j=0):
     """Bind a pass's shader with the shared push-constant block and images."""
     config = _state["config"]
     shader = _state["shaders"][name]
+    collider_texture, i_collider = _collider_binding()
     shader.bind()
     shader.uniform_int(
         "i_layout",
@@ -288,8 +325,12 @@ def _bind(name, dt, sort_k=0, sort_j=0):
         (config.smoothing_radius, config.mass, config.rest_density, config.stiffness),
     )
     shader.uniform_float("f_sim", (config.viscosity, dt, GRAVITY, BOUNDARY_DAMPING))
+    shader.uniform_int("i_collider", i_collider)
     for image_name in (image[2] for image in _IMAGES):
-        shader.image(image_name, _state["textures"][image_name])
+        if image_name == "collider_img":
+            shader.image(image_name, collider_texture)
+        else:
+            shader.image(image_name, _state["textures"][image_name])
     return shader
 
 
