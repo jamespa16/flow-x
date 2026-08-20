@@ -16,8 +16,9 @@ import bpy
 ADDON_MODULE = "bl_ext.user_default.flow_x"
 
 # (operator idname, kwargs) pairs to run once the extension is enabled.
-# Empty in Phase 0; Phase 1 adds ("flowx.domain_add", {}), etc.
-OPERATORS_TO_SMOKE_TEST = []
+OPERATORS_TO_SMOKE_TEST = [
+    ("flowx.domain_add", {}),
+]
 
 
 def _get_operator(idname):
