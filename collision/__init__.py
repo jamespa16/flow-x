@@ -115,16 +115,20 @@ def _point_inside(bvh, point, direction, epsilon=1e-4):
     return count % 2 == 1
 
 
-def _upload_to_gpu(occupancy):
+def _upload_to_gpu(occupancy, dims):
+    # Blender's Python GPU API has no read-write storage buffer type (confirmed
+    # while standing up the Phase 3 compute round-trip) - only uniform buffers,
+    # samplers and images are bindable. So the occupancy grid uploads as a 3D
+    # R32F image instead of a nonexistent GPUStorageBuf; a compute shader can
+    # later sample it with imageLoad(...).r > 0.5.
     try:
-        buf = gpu.types.Buffer("UBYTE", [len(occupancy)], occupancy)
-        return gpu.types.GPUStorageBuf(buf)
+        values = [float(v) for v in occupancy]
+        buf = gpu.types.Buffer("FLOAT", [len(values)], values)
+        return gpu.types.GPUTexture(dims, format="R32F", data=buf)
     except Exception as exc:
-        # GPU storage buffer support/behavior isn't proven yet - Phase 3 stands up and
-        # validates the full GPU compute round-trip. Until then this upload is
-        # best-effort so the CPU-side debug overlay keeps working regardless of
+        # Best-effort so the CPU-side debug overlay keeps working regardless of
         # platform/context quirks (e.g. no GL context in --background runs).
-        print(f"[flow-x] Skipping GPU collider buffer upload: {exc}")
+        print(f"[flow-x] Skipping GPU collider texture upload: {exc}")
         return None
 
 
@@ -157,7 +161,7 @@ def _rebuild_grid(domain, obj):
                     occupancy[(k * ny + j) * nx + i] = 1
                     points.append(center)
 
-    gpu_buf = _upload_to_gpu(occupancy)
+    gpu_buf = _upload_to_gpu(occupancy, dims)
     _grids[obj.name] = ColliderGrid(dims, occupancy, points, gpu_buf)
 
 

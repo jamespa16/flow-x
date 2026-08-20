@@ -20,6 +20,7 @@ OPERATORS_TO_SMOKE_TEST = [
     ("flowx.domain_add", {}),
     ("mesh.primitive_cube_add", {"size": 0.5, "location": (0, 0, 0)}),
     ("flowx.toggle_collider", {}),
+    ("flowx.solver_gpu_test_toggle", {}),
 ]
 
 

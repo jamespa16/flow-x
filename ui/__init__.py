@@ -5,6 +5,7 @@ from bpy.types import Panel
 
 from ..collision import FLOWX_OT_toggle_collider, occupied_count
 from ..domain import world_bounds
+from ..solver import PARTICLE_COUNT, FLOWX_OT_solver_gpu_test_toggle, is_running
 
 
 class FLOWX_PT_domain(Panel):
@@ -33,6 +34,18 @@ class FLOWX_PT_domain(Panel):
         col = box.column(align=True)
         col.label(text=f"Min: ({lo.x:.2f}, {lo.y:.2f}, {lo.z:.2f})")
         col.label(text=f"Max: ({hi.x:.2f}, {hi.y:.2f}, {hi.z:.2f})")
+
+        box = layout.box()
+        box.label(text="GPU Compute (Phase 3 smoke test)")
+        running = is_running()
+        box.operator(
+            FLOWX_OT_solver_gpu_test_toggle.bl_idname,
+            text="Stop Smoke Test" if running else "Run Smoke Test",
+            icon="PAUSE" if running else "PLAY",
+            depress=running,
+        )
+        if running:
+            box.label(text=f"{PARTICLE_COUNT} particles falling under gravity")
 
 
 class FLOWX_PT_collider(Panel):
