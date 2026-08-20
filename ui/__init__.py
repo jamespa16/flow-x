@@ -102,6 +102,49 @@ class FLOWX_PT_solver(Panel):
             col.label(text=f"Effective radius: {stats['smoothing_radius']:.4f} m", icon="INFO")
 
 
+class FLOWX_PT_surface(Panel):
+    bl_label = "Surface"
+    bl_idname = "FLOWX_PT_surface"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Flow-X"
+    bl_parent_id = "FLOWX_PT_domain"
+
+    @classmethod
+    def poll(cls, context):
+        return FLOWX_PT_domain.poll(context)
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.active_object.flowx_domain
+
+        layout.prop(settings, "show_surface")
+
+        col = layout.column(align=True)
+        col.enabled = settings.show_surface
+        col.prop(settings, "surface_resolution")
+        col.prop(settings, "surface_iso")
+
+        layout.prop(settings, "show_particles")
+
+        stats = sph.stats()
+        surface_stats = stats["surface"] if stats else None
+        if surface_stats is None:
+            layout.label(text="Extracted into a '.FluidSurface' child on each frame.")
+            return
+
+        box = layout.box()
+        col = box.column(align=True)
+        dims = "x".join(str(n) for n in surface_stats["dims"])
+        col.label(text=f"Samples: {dims} ({surface_stats['samples']})")
+        col.label(
+            text=f"Mesh: {surface_stats['vertices']} verts, " f"{surface_stats['triangles']} tris"
+        )
+        # The grid coarsens itself to stay inside its sample budget, so show
+        # the spacing it actually settled on rather than the requested one.
+        col.label(text=f"Sample spacing: {surface_stats['spacing']:.4f} m")
+
+
 class FLOWX_PT_collider(Panel):
     bl_label = "Flow-X Collider"
     bl_idname = "FLOWX_PT_collider"
@@ -132,7 +175,7 @@ class FLOWX_PT_collider(Panel):
             layout.label(text=f"Voxels: {occupied_count(obj.name)}")
 
 
-_classes = (FLOWX_PT_domain, FLOWX_PT_solver, FLOWX_PT_collider)
+_classes = (FLOWX_PT_domain, FLOWX_PT_solver, FLOWX_PT_surface, FLOWX_PT_collider)
 
 
 def register():

@@ -64,6 +64,42 @@ def read_texture(texture, count, channels=4):
     return out
 
 
+def read_scalar_texture(texture, count):
+    """Read a single-channel 2D texture back as a flat list of `count` floats.
+
+    Cheaper than read_texture() for the large grids the surface pass produces:
+    it extends row by row instead of indexing every item, and a single-channel
+    format is a quarter of the read-back an RGBA32F one would be. Blender hands
+    back an R32F texel as a bare float on some backends and as a 1-element
+    sequence on others, so both are unwrapped.
+    """
+    values = []
+    for row in texture.read().to_list():
+        values.extend(row)
+        if len(values) >= count:
+            break
+    del values[count:]
+    if values and isinstance(values[0], (list, tuple)):
+        values = [value[0] for value in values]
+    return values
+
+
+def bind_push_constants(shader, values):
+    """Bind a {name: 4-tuple} push-constant block onto an already-bound shader.
+
+    Whether a slot is an int or a float vector follows the `i_`/`f_` naming the
+    GLSL block uses (see shaders/sph_common.glsl); passing a float tuple that
+    happens to hold whole numbers therefore still binds as floats.
+    """
+    for name, value in values.items():
+        if name.startswith("i_"):
+            shader.uniform_int(name, value)
+        elif name.startswith("f_"):
+            shader.uniform_float(name, value)
+        else:
+            raise ValueError(f"push constant {name!r} must be named i_* or f_*")
+
+
 def build_compute_shader(sources, images, push_constants, local_size):
     """Compile a compute shader from GLSL sources plus its resource bindings.
 

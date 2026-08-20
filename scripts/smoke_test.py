@@ -23,6 +23,8 @@ _gpu_available = False
 # (operator idname, kwargs) pairs to run once the extension is enabled.
 OPERATORS_TO_SMOKE_TEST = [
     ("flowx.domain_add", {}),
+    # A collider inside the domain, so the surface has something to wrap
+    # around - Phase 6's exit criterion covers the two together.
     ("mesh.primitive_cube_add", {"size": 0.5, "location": (0, 0, 0)}),
     ("flowx.toggle_collider", {}),
     ("flowx.solver_gpu_test_toggle", {}),
@@ -82,11 +84,66 @@ def _check_solver():
     stats = sph.stats()
     print(f"[smoke_test] stepped SPH solver 3 frames: {stats}")
 
+    _check_particles(sph, stats)
+    _check_surface(sph, stats)
+
+
+def _check_particles(sph, stats):
+    """The debug overlay, which the domain has to opt into since Phase 6."""
+    domain = sys.modules[ADDON_MODULE].domain.find_domain(bpy.context.scene)
+    if not domain.flowx_domain.show_particles:
+        if sph.viz.points():
+            raise RuntimeError("particle overlay is off but points were still read back")
+        return
+
     points = sph.viz.points()
     if len(points) != stats["particles"]:
         raise RuntimeError(f"expected {stats['particles']} particles, read back {len(points)}")
     if not all(all(math.isfinite(c) for c in p) for p in points):
         raise RuntimeError("solver produced non-finite particle positions")
+
+
+def _check_surface(sph, stats):
+    """Phase 6: the extracted surface mesh is the add-on's actual output.
+
+    The exit criterion is a continuous surface rather than points, so a green
+    dispatch isn't enough - insist on a real mesh with faces, sitting inside
+    the domain bounds.
+    """
+    surface_stats = stats["surface"]
+    if surface_stats is None:
+        raise RuntimeError("surface extraction did not start (see warnings above)")
+
+    domain = sys.modules[ADDON_MODULE].domain.find_domain(bpy.context.scene)
+    name = domain.name + sys.modules[ADDON_MODULE].solver.surface.SURFACE_SUFFIX
+    obj = bpy.data.objects.get(name)
+    if obj is None:
+        raise RuntimeError(f"expected a surface object named {name!r}")
+    if obj.parent is not domain:
+        raise RuntimeError(f"{name} should be parented to the domain")
+
+    mesh = obj.data
+    if len(mesh.polygons) == 0 or len(mesh.vertices) == 0:
+        raise RuntimeError(
+            f"{name} has no geometry ({len(mesh.vertices)} verts, "
+            f"{len(mesh.polygons)} faces) - the fluid should have a surface by now"
+        )
+    if not mesh.materials:
+        raise RuntimeError(f"{name} was built without a material")
+
+    lo, hi = sys.modules[ADDON_MODULE].domain.world_bounds(domain)
+    matrix = obj.matrix_world
+    tolerance = surface_stats["spacing"] * 2.0
+    for vertex in mesh.vertices:
+        point = matrix @ vertex.co
+        for axis in range(3):
+            if not (lo[axis] - tolerance <= point[axis] <= hi[axis] + tolerance):
+                raise RuntimeError(f"surface vertex {tuple(point)} lies outside the domain")
+
+    print(
+        f"[smoke_test] surface mesh: {len(mesh.vertices)} verts, "
+        f"{len(mesh.polygons)} faces from {surface_stats['samples']} samples"
+    )
 
 
 def main():

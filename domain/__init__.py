@@ -89,6 +89,49 @@ class FlowXDomainSettings(PropertyGroup):
         min=0.0,
         max=10.0,
     )
+    # Phase 6 surface reconstruction. The grid the surface is extracted from is
+    # deliberately independent of the solver's, so the look can be refined
+    # without disturbing physics that already behaves.
+    show_surface: BoolProperty(
+        name="Surface Mesh",
+        description=(
+            "Extract a liquid surface mesh from the particles each frame, into a "
+            "child object named '<Domain>.FluidSurface'"
+        ),
+        default=True,
+    )
+    show_particles: BoolProperty(
+        name="Debug Particles",
+        description=(
+            "Draw the raw SPH particles as a point-cloud overlay. Costs a per-frame "
+            "read-back of every particle position, so it is off unless you're "
+            "checking what the solver is doing underneath the surface"
+        ),
+        default=False,
+    )
+    surface_resolution: IntProperty(
+        name="Surface Resolution",
+        description=(
+            "Sample grid resolution along the domain's longest axis, for surface "
+            "extraction only. Cost grows with the cube of this and the extraction "
+            "runs on the CPU, so raise it for a final look rather than while "
+            "setting the shot up"
+        ),
+        default=48,
+        min=8,
+        max=192,
+    )
+    surface_iso: FloatProperty(
+        name="Surface Iso-Value",
+        description=(
+            "Density threshold the surface is extracted at, as a fraction of rest "
+            "density. Lower fattens the fluid and closes gaps between particles; "
+            "higher shrinks it toward the particle centres"
+        ),
+        default=0.5,
+        min=0.01,
+        max=4.0,
+    )
     max_substeps: IntProperty(
         name="Max Substeps",
         description=(
@@ -109,6 +152,22 @@ def world_bounds(obj):
     ys = [c.y for c in corners]
     zs = [c.z for c in corners]
     return Vector((min(xs), min(ys), min(zs))), Vector((max(xs), max(ys), max(zs)))
+
+
+def is_alive(datablock):
+    """Whether a datablock reference still points at live data.
+
+    Blender invalidates the Python wrapper when the data is removed, and then
+    touching any field - `.name` included - raises ReferenceError rather than
+    returning None. The solver holds references across frames, so it has to ask
+    before it dereferences.
+    """
+    if datablock is None:
+        return False
+    try:
+        return bool(datablock.name)
+    except ReferenceError:
+        return False
 
 
 def find_domain(scene):

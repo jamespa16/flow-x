@@ -18,6 +18,11 @@ The integrate pass also does Phase 5's collision response: it samples the
 collider occupancy grid built in ``collision`` and pushes a particle out to
 the nearest free voxel, with a velocity reflection/damping term along the
 push direction (see ``shaders/sph_integrate.glsl``).
+
+Phase 6 hangs one more dispatch off the end of each *frame* (not each
+substep): ``surface`` splats the particles onto a scalar grid and extracts a
+mesh from it, which is the add-on's actual output. The point-cloud viz is now
+a debug overlay behind a checkbox rather than the thing the user watches.
 """
 
 import math
@@ -31,10 +36,11 @@ from bpy.types import Operator
 from mathutils import Vector
 
 from ..collision import get_solver_grid
-from ..domain import find_domain, world_bounds
-from . import viz
+from ..domain import find_domain, is_alive, world_bounds
+from . import surface, viz
 from .gpu_util import (
     TEXTURE_WIDTH,
+    bind_push_constants,
     build_compute_shader,
     dispatch_1d,
     make_texture,
@@ -100,6 +106,7 @@ _PASSES = (
 _state = {
     "running": False,
     "config": None,
+    "domain": None,
     "shaders": {},
     "textures": {},
     "substeps": 0,
@@ -306,26 +313,37 @@ def _collider_binding():
     return texture, (*dims, voxel_size_bits)
 
 
+def push_constant_values(config, dt, i_collider, sort_k=0, sort_j=0):
+    """The shared push-constant block as {name: 4-tuple}.
+
+    Phase 6's splat pass binds this same block against the same
+    shaders/sph_common.glsl prelude, overriding only the slots it repurposes,
+    so it is built here rather than inline in _bind().
+    """
+    return {
+        "i_layout": (config.particle_count, TEXTURE_WIDTH, TEXTURE_WIDTH, config.sorted_count),
+        "i_grid": (*config.cell_dims, config.cell_count),
+        "i_sort": (sort_k, sort_j, 0, 0),
+        "f_lo": (*config.lo, config.cell_size),
+        "f_hi": (*config.hi, config.particle_radius),
+        "f_sph": (
+            config.smoothing_radius,
+            config.mass,
+            config.rest_density,
+            config.stiffness,
+        ),
+        "f_sim": (config.viscosity, dt, GRAVITY, BOUNDARY_DAMPING),
+        "i_collider": i_collider,
+    }
+
+
 def _bind(name, dt, sort_k=0, sort_j=0):
     """Bind a pass's shader with the shared push-constant block and images."""
     config = _state["config"]
     shader = _state["shaders"][name]
     collider_texture, i_collider = _collider_binding()
     shader.bind()
-    shader.uniform_int(
-        "i_layout",
-        (config.particle_count, TEXTURE_WIDTH, TEXTURE_WIDTH, config.sorted_count),
-    )
-    shader.uniform_int("i_grid", (*config.cell_dims, config.cell_count))
-    shader.uniform_int("i_sort", (sort_k, sort_j, 0, 0))
-    shader.uniform_float("f_lo", (*config.lo, config.cell_size))
-    shader.uniform_float("f_hi", (*config.hi, config.particle_radius))
-    shader.uniform_float(
-        "f_sph",
-        (config.smoothing_radius, config.mass, config.rest_density, config.stiffness),
-    )
-    shader.uniform_float("f_sim", (config.viscosity, dt, GRAVITY, BOUNDARY_DAMPING))
-    shader.uniform_int("i_collider", i_collider)
+    bind_push_constants(shader, push_constant_values(config, dt, i_collider, sort_k, sort_j))
     for image_name in (image[2] for image in _IMAGES):
         if image_name == "collider_img":
             shader.image(image_name, collider_texture)
@@ -367,6 +385,41 @@ def _step(frame_dt):
     for _ in range(substeps):
         _substep(dt)
 
+    _update_surface(dt)
+    _update_viz()
+
+
+def _update_surface(dt):
+    """Re-extract the fluid surface, once per frame rather than per substep.
+
+    It's the only CPU round-trip in the pipeline, and nothing between substeps
+    looks at its output.
+    """
+    if not surface.is_running():
+        return
+    collider = _collider_binding()
+    surface.update(
+        _state["config"],
+        _state["textures"],
+        push_constant_values(_state["config"], dt, collider[1]),
+        collider,
+    )
+
+
+def _update_viz():
+    """Refresh the debug point cloud, if the domain still asks for one.
+
+    Phase 6's surface mesh is the real output now, so the particle read-back -
+    the largest single transfer in a step - is skipped unless the user turns
+    the overlay back on to check what the solver is doing underneath.
+    """
+    config = _state["config"]
+    domain = _state["domain"]
+    if not is_alive(domain):
+        return
+    if not domain.flowx_domain.show_particles:
+        viz.set_points([])
+        return
     positions = read_texture(_state["textures"]["positions_img"], config.particle_count)
     viz.set_points([p[:3] for p in positions])
 
@@ -374,12 +427,21 @@ def _step(frame_dt):
 def _start(domain):
     config = _resolve_config(domain)
     _state["config"] = config
+    _state["domain"] = domain
     _state["textures"] = _allocate(config)
     _state["shaders"] = _compile_passes()
     _state["running"] = True
 
-    positions = read_texture(_state["textures"]["positions_img"], config.particle_count)
-    viz.set_points([p[:3] for p in positions])
+    if domain.flowx_domain.show_surface:
+        surface.start(domain, config)
+        # Extract once up front so the seeded fluid is visible as a surface
+        # straight away instead of as an empty object until playback starts.
+        # The splat gathers through the spatial hash, so that has to exist -
+        # a zero-length step builds it without advancing the simulation.
+        _build_grid(0.0)
+        _update_surface(0.0)
+
+    _update_viz()
     viz.enable()
     if _on_frame_change not in bpy.app.handlers.frame_change_pre:
         bpy.app.handlers.frame_change_pre.append(_on_frame_change)
@@ -389,7 +451,8 @@ def _start(domain):
 def stop():
     if _on_frame_change in bpy.app.handlers.frame_change_pre:
         bpy.app.handlers.frame_change_pre.remove(_on_frame_change)
-    _state.update({"running": False, "config": None, "shaders": {}, "textures": {}})
+    surface.stop()
+    _state.update({"running": False, "config": None, "domain": None, "shaders": {}, "textures": {}})
     viz.disable()
 
 
@@ -418,6 +481,7 @@ def stats():
         "smoothing_radius": config.smoothing_radius,
         "spacing": config.spacing,
         "substeps": _state["substeps"],
+        "surface": surface.stats(),
     }
 
 
