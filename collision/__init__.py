@@ -1,9 +1,231 @@
-"""Collider tagging and voxelization (Phase 2)."""
+"""Collider tagging and CPU-side voxelization (Phase 2)."""
+
+import math
+
+import bpy
+import gpu
+from bpy.app.handlers import persistent
+from bpy.props import BoolProperty, PointerProperty
+from bpy.types import Object, Operator, PropertyGroup
+from gpu_extras.batch import batch_for_shader
+from mathutils import Vector
+from mathutils.bvhtree import BVHTree
+
+from ..domain import find_domain, world_bounds
+
+# Safety cap on ray-cast bounces during the inside/outside parity test, so a
+# non-manifold/non-closed collider mesh can't spin the voxelizer forever.
+_MAX_RAY_BOUNCES = 64
+
+_OVERLAY_COLOR = (1.0, 0.35, 0.1, 0.9)
+_OVERLAY_POINT_SIZE = 4.0
+
+_grids = {}
+_draw_handle = None
+
+
+class ColliderGrid:
+    """Voxelized occupancy for one collider, sized to the domain's grid."""
+
+    __slots__ = ("dims", "occupancy", "points", "gpu_buf")
+
+    def __init__(self, dims, occupancy, points, gpu_buf):
+        self.dims = dims
+        self.occupancy = occupancy
+        self.points = points
+        self.gpu_buf = gpu_buf
+
+
+class FlowXColliderSettings(PropertyGroup):
+    is_collider: BoolProperty(
+        name="Is Flow-X Collider",
+        description="Marks this object as a Flow-X fluid collider",
+        default=False,
+    )
+
+
+class FLOWX_OT_toggle_collider(Operator):
+    """Toggle Flow-X collider tagging on the active object"""
+
+    bl_idname = "flowx.toggle_collider"
+    bl_label = "Toggle Fluid Collider"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == "MESH"
+
+    def execute(self, context):
+        obj = context.active_object
+        settings = obj.flowx_collider
+        settings.is_collider = not settings.is_collider
+
+        if settings.is_collider:
+            domain = find_domain(context.scene)
+            if domain is None:
+                settings.is_collider = False
+                self.report(
+                    {"WARNING"},
+                    "No Flow-X fluid domain in scene; add one before tagging colliders.",
+                )
+                return {"CANCELLED"}
+            _rebuild_grid(domain, obj)
+        else:
+            _grids.pop(obj.name, None)
+
+        _tag_viewports_redraw()
+        return {"FINISHED"}
+
+
+def occupied_count(obj_name):
+    """Number of occupied voxels in obj_name's collider grid, or 0 if untracked."""
+    grid = _grids.get(obj_name)
+    return len(grid.points) if grid is not None else 0
+
+
+def _domain_grid_geometry(domain):
+    """(origin, voxel_size, dims) for the domain's voxel grid, per its resolution."""
+    lo, hi = world_bounds(domain)
+    size = hi - lo
+    longest = max(size.x, size.y, size.z)
+    if longest <= 0.0:
+        return lo, 0.0, (0, 0, 0)
+    voxel_size = longest / domain.flowx_domain.resolution
+    dims = tuple(max(1, round(axis / voxel_size)) for axis in (size.x, size.y, size.z))
+    return lo, voxel_size, dims
+
+
+def _index_range(obj_min, obj_max, origin, voxel_size, count):
+    lo = max(0, math.floor((obj_min - origin) / voxel_size))
+    hi = min(count, math.ceil((obj_max - origin) / voxel_size))
+    return lo, hi
+
+
+def _point_inside(bvh, point, direction, epsilon=1e-4):
+    """Parity test: odd number of ray hits along `direction` means inside."""
+    count = 0
+    origin = point
+    for _ in range(_MAX_RAY_BOUNCES):
+        hit, _normal, _index, _dist = bvh.ray_cast(origin, direction)
+        if hit is None:
+            break
+        count += 1
+        origin = hit + direction * epsilon
+    return count % 2 == 1
+
+
+def _upload_to_gpu(occupancy):
+    try:
+        buf = gpu.types.Buffer("UBYTE", [len(occupancy)], occupancy)
+        return gpu.types.GPUStorageBuf(buf)
+    except Exception as exc:
+        # GPU storage buffer support/behavior isn't proven yet - Phase 3 stands up and
+        # validates the full GPU compute round-trip. Until then this upload is
+        # best-effort so the CPU-side debug overlay keeps working regardless of
+        # platform/context quirks (e.g. no GL context in --background runs).
+        print(f"[flow-x] Skipping GPU collider buffer upload: {exc}")
+        return None
+
+
+def _rebuild_grid(domain, obj):
+    origin, voxel_size, dims = _domain_grid_geometry(domain)
+    if voxel_size <= 0.0:
+        _grids.pop(obj.name, None)
+        return
+
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    bvh = BVHTree.FromObject(obj, depsgraph)
+
+    obj_lo, obj_hi = world_bounds(obj)
+    nx, ny, nz = dims
+    i0, i1 = _index_range(obj_lo.x, obj_hi.x, origin.x, voxel_size, nx)
+    j0, j1 = _index_range(obj_lo.y, obj_hi.y, origin.y, voxel_size, ny)
+    k0, k1 = _index_range(obj_lo.z, obj_hi.z, origin.z, voxel_size, nz)
+
+    occupancy = bytearray(nx * ny * nz)
+    points = []
+    direction = Vector((0.0, 0.0, 1.0))
+    for k in range(k0, k1):
+        z = origin.z + (k + 0.5) * voxel_size
+        for j in range(j0, j1):
+            y = origin.y + (j + 0.5) * voxel_size
+            for i in range(i0, i1):
+                x = origin.x + (i + 0.5) * voxel_size
+                center = Vector((x, y, z))
+                if _point_inside(bvh, center, direction):
+                    occupancy[(k * ny + j) * nx + i] = 1
+                    points.append(center)
+
+    gpu_buf = _upload_to_gpu(occupancy)
+    _grids[obj.name] = ColliderGrid(dims, occupancy, points, gpu_buf)
+
+
+def _tag_viewports_redraw():
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == "VIEW_3D":
+                area.tag_redraw()
+
+
+@persistent
+def _on_depsgraph_update(scene, depsgraph):
+    domain = None
+    for update in depsgraph.updates:
+        obj = update.id
+        if not isinstance(obj, bpy.types.Object) or obj.name not in _grids:
+            continue
+        if not (update.is_updated_transform or update.is_updated_geometry):
+            continue
+        if domain is None:
+            domain = find_domain(scene)
+            if domain is None:
+                break
+        _rebuild_grid(domain, obj)
+        _tag_viewports_redraw()
+
+
+def _draw_collider_grids():
+    if not _grids:
+        return
+    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+    gpu.state.point_size_set(_OVERLAY_POINT_SIZE)
+    gpu.state.blend_set("ALPHA")
+    shader.bind()
+    shader.uniform_float("color", _OVERLAY_COLOR)
+    for grid in _grids.values():
+        if not grid.points:
+            continue
+        batch = batch_for_shader(shader, "POINTS", {"pos": grid.points})
+        batch.draw(shader)
+    gpu.state.blend_set("NONE")
+
+
+_classes = (
+    FlowXColliderSettings,
+    FLOWX_OT_toggle_collider,
+)
 
 
 def register():
-    pass
+    for cls in _classes:
+        bpy.utils.register_class(cls)
+    Object.flowx_collider = PointerProperty(type=FlowXColliderSettings)
+    bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph_update)
+    global _draw_handle
+    _draw_handle = bpy.types.SpaceView3D.draw_handler_add(
+        _draw_collider_grids, (), "WINDOW", "POST_VIEW"
+    )
 
 
 def unregister():
-    pass
+    global _draw_handle
+    if _draw_handle is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(_draw_handle, "WINDOW")
+        _draw_handle = None
+    if _on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_update)
+    _grids.clear()
+    del Object.flowx_collider
+    for cls in reversed(_classes):
+        bpy.utils.unregister_class(cls)

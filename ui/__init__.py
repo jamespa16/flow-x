@@ -3,6 +3,7 @@
 import bpy
 from bpy.types import Panel
 
+from ..collision import FLOWX_OT_toggle_collider, occupied_count
 from ..domain import world_bounds
 
 
@@ -34,7 +35,37 @@ class FLOWX_PT_domain(Panel):
         col.label(text=f"Max: ({hi.x:.2f}, {hi.y:.2f}, {hi.z:.2f})")
 
 
-_classes = (FLOWX_PT_domain,)
+class FLOWX_PT_collider(Panel):
+    bl_label = "Flow-X Collider"
+    bl_idname = "FLOWX_PT_collider"
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "object"
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj is not None and obj.type == "MESH" and not obj.flowx_domain.is_domain
+
+    def draw(self, context):
+        layout = self.layout
+        obj = context.active_object
+        is_collider = obj.flowx_collider.is_collider
+
+        row = layout.row()
+        icon = "CHECKBOX_HLT" if is_collider else "CHECKBOX_DEHLT"
+        row.operator(
+            FLOWX_OT_toggle_collider.bl_idname,
+            text="Fluid Collider",
+            icon=icon,
+            depress=is_collider,
+        )
+
+        if is_collider:
+            layout.label(text=f"Voxels: {occupied_count(obj.name)}")
+
+
+_classes = (FLOWX_PT_domain, FLOWX_PT_collider)
 
 
 def register():

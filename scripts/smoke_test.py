@@ -18,6 +18,8 @@ ADDON_MODULE = "bl_ext.user_default.flow_x"
 # (operator idname, kwargs) pairs to run once the extension is enabled.
 OPERATORS_TO_SMOKE_TEST = [
     ("flowx.domain_add", {}),
+    ("mesh.primitive_cube_add", {"size": 0.5, "location": (0, 0, 0)}),
+    ("flowx.toggle_collider", {}),
 ]
 
 
