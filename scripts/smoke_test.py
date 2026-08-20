@@ -10,11 +10,14 @@ Run from the repo root (after `python3 scripts/dev_link.py`):
 """
 
 import math
+import os
 import sys
+from pathlib import Path
 
 import bpy
 
 ADDON_MODULE = "bl_ext.user_default.flow_x"
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Set by _init_gpu(): whether this run has a GPU context, and so whether the
 # solver's compute passes are expected to actually run.
@@ -93,6 +96,7 @@ def _check_solver():
 
     _check_particles(sph, stats)
     _check_surface(sph, stats)
+    _check_collider_grids()
     _check_playback(sph)
 
 
@@ -143,6 +147,40 @@ def _check_playback(sph):
         raise RuntimeError(f"re-seeding left a stale warning: {stats['warning']}")
 
     print(f"[smoke_test] playback: re-seeded at frame {scene.frame_start}, backward scrub warned")
+
+
+def _check_collider_grids():
+    """Colliders overlapping the domain must have non-empty voxel grids.
+
+    Without this, a collider that voxelizes to nothing (e.g. a parity query
+    in the wrong coordinate space) passes every other check: the surface
+    still extracts, the particles still fall - the fluid just passes straight
+    through the obstacle.
+    """
+    mod = sys.modules[ADDON_MODULE]
+    collision = mod.collision
+    domain = mod.domain.find_domain(bpy.context.scene)
+    dom_lo, dom_hi = mod.domain.world_bounds(domain)
+    for obj in bpy.context.scene.objects:
+        if obj.type != "MESH" or not obj.flowx_collider.is_collider:
+            continue
+        obj_lo, obj_hi = mod.domain.world_bounds(obj)
+        overlaps = not (
+            obj_lo.x >= dom_hi.x
+            or obj_hi.x <= dom_lo.x
+            or obj_lo.y >= dom_hi.y
+            or obj_hi.y <= dom_lo.y
+            or obj_lo.z >= dom_hi.z
+            or obj_hi.z <= dom_lo.z
+        )
+        if not overlaps:
+            continue
+        voxels = collision.occupied_count(obj.name)
+        if voxels == 0:
+            raise RuntimeError(
+                f"collider '{obj.name}' overlaps the domain but voxelized to nothing"
+            )
+        print(f"[smoke_test] collider '{obj.name}': {voxels} voxels")
 
 
 def _check_particles(sph, stats):
@@ -203,11 +241,95 @@ def _check_surface(sph, stats):
     )
 
 
+def _install_packaged_zip():
+    """Install the packaged extension from FLOWX_ZIP, when set.
+
+    Release CI sets this to the zip built from the tagged commit, together
+    with a fresh BLENDER_USER_RESOURCES and no dev symlink - so the zip
+    itself is what gets installed and smoke tested, exactly what a third
+    party would do.
+    """
+    zip_path = os.environ.get("FLOWX_ZIP")
+    if not zip_path:
+        return
+    if bpy.app.version >= (5, 0):
+        # Blender 5.x renamed the op: the directory and the files to install
+        # from it are separate properties (files is a collection of
+        # {"name": ...} items). Dispatch on version, not hasattr - bpy.ops
+        # hands out a proxy for any attribute and only fails at call time.
+        result = bpy.ops.extensions.package_install_files(
+            directory=os.path.dirname(zip_path),
+            files=[{"name": os.path.basename(zip_path)}],
+            repo="user_default",
+            enable_on_install=True,
+        )
+    else:
+        result = bpy.ops.extensions.repo_install_local(directory=zip_path)
+    if "FINISHED" not in result:
+        raise RuntimeError(f"installing {zip_path} returned {result}")
+    print(f"[smoke_test] installed packaged extension from {zip_path}")
+
+
+def _run_demo(demo):
+    """Start the solver on one demo scene and apply the standard checks."""
+    mod = sys.modules[ADDON_MODULE]
+    scene = bpy.context.scene
+    domain = mod.domain.find_domain(scene)
+    if domain is None:
+        raise RuntimeError(f"{demo.name}: no tagged fluid domain found")
+    colliders = [obj.name for obj in scene.objects if obj.flowx_collider.is_collider]
+    if not colliders:
+        raise RuntimeError(f"{demo.name}: no tagged colliders found")
+    print(f"[smoke_test] {demo.name}: domain='{domain.name}', colliders={colliders}")
+
+    result = _get_operator("flowx.sph_toggle")()
+    if "FINISHED" not in result:
+        raise RuntimeError(f"{demo.name}: flowx.sph_toggle returned {result}")
+    sph = mod.solver.sph
+    if not sph.is_running():
+        raise RuntimeError(f"{demo.name}: solver did not start (see warnings above)")
+
+    for frame in range(scene.frame_start, scene.frame_start + 6):
+        scene.frame_set(frame)
+    stats = sph.stats()
+    _check_particles(sph, stats)
+    _check_surface(sph, stats)
+    _check_collider_grids()
+
+
+def _check_demo_scenes():
+    """Phase 8: replay the shipped demo scenes the way a user would.
+
+    The exit criterion is that a third party opens a demo, hits play, and
+    gets the surface mesh - so open every file in demos/ and apply the same
+    solver and surface checks the empty-scene pass uses.
+    """
+    if not _gpu_available:
+        print("[smoke_test] no GPU context; skipping demo scene replay")
+        return
+
+    demos_dir = REPO_ROOT / "demos"
+    demo_files = sorted(demos_dir.glob("*.blend"))
+    if not demo_files:
+        raise RuntimeError(f"no demo .blend files in {demos_dir}; run scripts/make_demo.py")
+
+    for demo in demo_files:
+        print(f"[smoke_test] replaying demo {demo.name}")
+        # Stop the previous run (the empty-scene pass, or the earlier demo)
+        # before its scene is replaced: a running toggle would stop rather
+        # than start, and the old scene's domain dies with the file.
+        sys.modules[ADDON_MODULE].solver.sph.stop()
+        bpy.ops.wm.open_mainfile(filepath=str(demo))
+        _run_demo(demo)
+
+
 def main():
     _init_gpu()
+    _install_packaged_zip()
     bpy.ops.extensions.repo_refresh_all()
 
-    bpy.ops.preferences.addon_enable(module=ADDON_MODULE)
+    if ADDON_MODULE not in bpy.context.preferences.addons:
+        bpy.ops.preferences.addon_enable(module=ADDON_MODULE)
     if ADDON_MODULE not in bpy.context.preferences.addons:
         raise RuntimeError(f"{ADDON_MODULE} did not appear in enabled addons after enable")
     print(f"[smoke_test] enabled {ADDON_MODULE}")
@@ -219,6 +341,7 @@ def main():
         print(f"[smoke_test] ran {idname} -> {result}")
 
     _check_solver()
+    _check_demo_scenes()
 
     bpy.ops.preferences.addon_disable(module=ADDON_MODULE)
     if ADDON_MODULE in bpy.context.preferences.addons:

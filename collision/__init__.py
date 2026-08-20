@@ -77,6 +77,7 @@ class FLOWX_OT_toggle_collider(Operator):
                 )
                 return {"CANCELLED"}
             _rebuild_grid(domain, obj)
+            _warn_collisionless(self, context, domain, obj)
         else:
             _grids.pop(obj.name, None)
             if domain is not None:
@@ -84,6 +85,38 @@ class FLOWX_OT_toggle_collider(Operator):
 
         _tag_viewports_redraw()
         return {"FINISHED"}
+
+
+def _warn_collisionless(operator, context, domain, obj):
+    """Report a collider that cannot possibly collide, as tagged.
+
+    Both cases leave the tag on: the object may gain geometry or move into the
+    domain later, and the depsgraph handler rebuilds the grid when it does. A
+    silent tag that never collides is worse than a tag that says why.
+    """
+    depsgraph = context.evaluated_depsgraph_get()
+    if len(obj.evaluated_get(depsgraph).data.polygons) == 0:
+        operator.report(
+            {"WARNING"},
+            f"'{obj.name}' has no faces, so it will not collide until it gains geometry.",
+        )
+        return
+
+    obj_lo, obj_hi = world_bounds(obj)
+    dom_lo, dom_hi = world_bounds(domain)
+    if (
+        obj_lo.x >= dom_hi.x
+        or obj_hi.x <= dom_lo.x
+        or obj_lo.y >= dom_hi.y
+        or obj_hi.y <= dom_lo.y
+        or obj_lo.z >= dom_hi.z
+        or obj_hi.z <= dom_lo.z
+    ):
+        operator.report(
+            {"WARNING"},
+            f"'{obj.name}' lies outside the domain bounds, so it will not "
+            "collide until it overlaps the domain.",
+        )
 
 
 def occupied_count(obj_name):
@@ -100,6 +133,31 @@ def get_solver_grid():
     same way, as "nothing to collide with".
     """
     return _solver_grid["texture"], _solver_grid["voxel_size"], _solver_grid["dims"]
+
+
+def ensure_grids(scene=None):
+    """Rebuild the voxel grids for tagged colliders that don't have one.
+
+    The grids live in memory only, so after a Blender restart - or an
+    extension disable/enable, e.g. from scripts/reload_on_save.py - tagged
+    colliders come back with their tag but no grid until one of them next
+    changes transform or geometry. The solver would then sample an empty
+    collider grid and the fluid would pass straight through, so this is
+    called at solver start to reconcile tags with grids.
+    """
+    scene = scene or bpy.context.scene
+    domain = find_domain(scene)
+    if domain is None:
+        return
+    origin, voxel_size, dims = _domain_grid_geometry(domain)
+    if voxel_size <= 0.0:
+        return
+    for obj in scene.objects:
+        if obj.type != "MESH" or not obj.flowx_collider.is_collider:
+            continue
+        grid = _grids.get(obj.name)
+        if grid is None or grid.dims != dims:
+            _rebuild_grid(domain, obj)
 
 
 def _rebuild_solver_grid(domain):
@@ -177,7 +235,26 @@ def _rebuild_grid(domain, obj):
         return
 
     depsgraph = bpy.context.evaluated_depsgraph_get()
-    bvh = BVHTree.FromObject(obj, depsgraph)
+    try:
+        bvh = BVHTree.FromObject(obj, depsgraph)
+    except Exception as exc:
+        # A mesh that cannot be built into a BVH (e.g. malformed geometry)
+        # collides with nothing rather than raising on every transform update.
+        print(f"[flow-x] Could not build a collider BVH for '{obj.name}': {exc}")
+        bvh = None
+    if bvh is None:
+        _grids.pop(obj.name, None)
+        _rebuild_solver_grid(domain)
+        return
+
+    # FromObject builds the tree in the object's *local* space, while the
+    # voxel centers are world space - so the query ray is transformed into
+    # local space. The transform is an invertible affine map, which sends the
+    # ray to a ray, so the inside/outside parity of the hit count is exact.
+    # (Skipping this is why a collider not sitting at the origin voxelized
+    # to nothing: its world-space centers all landed outside the local tree.)
+    inv_matrix = obj.matrix_world.inverted()
+    direction = (inv_matrix.to_3x3() @ Vector((0.0, 0.0, 1.0))).normalized()
 
     obj_lo, obj_hi = world_bounds(obj)
     nx, ny, nz = dims
@@ -187,17 +264,15 @@ def _rebuild_grid(domain, obj):
 
     occupancy = bytearray(nx * ny * nz)
     points = []
-    direction = Vector((0.0, 0.0, 1.0))
     for k in range(k0, k1):
         z = origin.z + (k + 0.5) * voxel_size
         for j in range(j0, j1):
             y = origin.y + (j + 0.5) * voxel_size
             for i in range(i0, i1):
                 x = origin.x + (i + 0.5) * voxel_size
-                center = Vector((x, y, z))
-                if _point_inside(bvh, center, direction):
+                if _point_inside(bvh, inv_matrix @ Vector((x, y, z)), direction):
                     occupancy[(k * ny + j) * nx + i] = 1
-                    points.append(center)
+                    points.append(Vector((x, y, z)))
 
     gpu_buf = _upload_to_gpu(occupancy, dims)
     _grids[obj.name] = ColliderGrid(dims, occupancy, points, gpu_buf)

@@ -46,8 +46,8 @@ from bpy.app.handlers import persistent
 from bpy.types import Operator
 from mathutils import Vector
 
-from ..collision import get_solver_grid
-from ..domain import find_domain, is_alive, world_bounds
+from ..collision import ensure_grids, get_solver_grid
+from ..domain import find_domain, is_alive, is_degenerate, world_bounds
 from . import surface, viz
 from .gpu_util import (
     TEXTURE_WIDTH,
@@ -500,6 +500,10 @@ def _reset_clock(scene):
 
 
 def _start(domain):
+    # Collider grids are in-memory only, so after a restart or an extension
+    # reload a tagged collider may have its tag but no grid; build the missing
+    # ones so the first substep collides correctly.
+    ensure_grids(bpy.context.scene)
     _state["domain"] = domain
     _state["shaders"] = _compile_passes()
     _state["running"] = True
@@ -516,10 +520,14 @@ def reseed(scene=None):
     """Re-seed the running solver at the domain's current fluid level.
 
     Returns False if there is nothing to re-seed - the solver isn't running,
-    or its domain has been deleted out from under it.
+    its domain has been deleted out from under it, or the domain has been
+    zeroed to no volume, in which case the caller should stop the run rather
+    than keep simulating a stale or degenerate config.
     """
     domain = _state["domain"]
     if not _state["running"] or not is_alive(domain):
+        return False
+    if is_degenerate(domain):
         return False
     _seed(domain)
     _reset_clock(scene or bpy.context.scene)
@@ -535,6 +543,24 @@ def stop():
     _state["timings"].clear()
     _state["warning"] = None
     viz.disable()
+
+
+def _deferred_stop():
+    stop()
+    return None
+
+
+def stop_deferred():
+    """Stop the run from inside a frame handler.
+
+    Removing the frame or draw handlers mid-dispatch skips whatever handlers
+    follow this one for that frame, so only the flag flips now and the
+    teardown - handler removal, GPU state, draw handler - lands a tick later.
+    """
+    _state["running"] = False
+    viz.disable()
+    if not bpy.app.timers.is_registered(_deferred_stop):
+        bpy.app.timers.register(_deferred_stop, first_interval=0.1)
 
 
 def _frame_dt(scene):
@@ -556,9 +582,20 @@ def _on_frame_change(scene, _depsgraph):
     if not _state["running"]:
         return
 
+    # The domain is the run's config source and the surface mesh's parent. If
+    # it was deleted, or zeroed to no volume, out from under the run, stop
+    # rather than keep simulating a stale or degenerate config with no panel
+    # left to stop it from.
+    domain = _state["domain"]
+    if not is_alive(domain) or is_degenerate(domain):
+        stop_deferred()
+        return
+
     frame = scene.frame_current
     if frame <= _state["seed_frame"]:
-        reseed(scene)
+        if not reseed(scene):
+            stop_deferred()
+            return
         viz.tag_viewports_redraw()
         return
 
@@ -597,9 +634,14 @@ def is_running():
 
 
 def stats():
-    """Resolved run parameters for the panel, or None when not running."""
+    """Resolved run parameters for the panel, or None when not running.
+
+    The flag is checked, not just the config: a run stopped mid-frame (its
+    domain deleted) drops the flag before the deferred teardown clears the
+    config, and the panel would otherwise draw stats for a dead run.
+    """
     config = _state["config"]
-    if config is None:
+    if not _state["running"] or config is None:
         return None
     timings = _state["timings"]
     return {
@@ -642,6 +684,13 @@ class FLOWX_OT_sph_toggle(Operator):
         if domain.flowx_domain.fluid_level <= 0.0:
             self.report({"WARNING"}, "Fluid level is 0% - nothing to seed.")
             return {"CANCELLED"}
+        if is_degenerate(domain):
+            self.report(
+                {"WARNING"},
+                "The domain has no volume (an axis is scaled to zero) - "
+                "scale it back up before running the simulation.",
+            )
+            return {"CANCELLED"}
 
         try:
             _start(domain)
@@ -672,7 +721,15 @@ class FLOWX_OT_sph_reset(Operator):
 
     def execute(self, context):
         if not reseed(context.scene):
-            self.report({"WARNING"}, "Nothing to reset - the solver is not running.")
+            domain = _state["domain"]
+            if is_alive(domain) and is_degenerate(domain):
+                self.report(
+                    {"WARNING"},
+                    "The domain has no volume (an axis is scaled to zero) - "
+                    "scale it back up before resetting.",
+                )
+            else:
+                self.report({"WARNING"}, "Nothing to reset - the solver is not running.")
             return {"CANCELLED"}
         self.report(
             {"INFO"},

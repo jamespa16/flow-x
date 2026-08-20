@@ -4,7 +4,7 @@ import bpy
 from bpy.types import Panel
 
 from ..collision import FLOWX_OT_toggle_collider, occupied_count
-from ..domain import world_bounds
+from ..domain import FLOWX_OT_domain_add, find_domain, world_bounds
 from ..solver import (
     PARTICLE_COUNT,
     FLOWX_OT_solver_gpu_test_toggle,
@@ -32,6 +32,31 @@ def _wrap(text, width):
     if line:
         lines.append(line)
     return lines
+
+
+class FLOWX_PT_no_domain(Panel):
+    """Shown in the Flow-X tab while the scene has no domain at all.
+
+    Without this, a fresh scene shows an empty Flow-X tab and the only way to
+    start is knowing the domain lives in the Add menu.
+    """
+
+    bl_label = "Flow-X"
+    bl_idname = "FLOWX_PT_no_domain"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Flow-X"
+
+    @classmethod
+    def poll(cls, context):
+        return find_domain(context.scene) is None
+
+    def draw(self, context):
+        box = self.layout.box()
+        box.alert = True
+        col = box.column(align=True)
+        col.label(text="No fluid domain in this scene")
+        col.operator(FLOWX_OT_domain_add.bl_idname, text="Add Fluid Domain", icon="MOD_FLUID")
 
 
 class FLOWX_PT_domain(Panel):
@@ -265,6 +290,7 @@ class FLOWX_PT_collider(Panel):
 
 
 _classes = (
+    FLOWX_PT_no_domain,
     FLOWX_PT_domain,
     FLOWX_PT_solver,
     FLOWX_PT_playback,

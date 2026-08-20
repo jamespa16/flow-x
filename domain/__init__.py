@@ -154,6 +154,19 @@ def world_bounds(obj):
     return Vector((min(xs), min(ys), min(zs))), Vector((max(xs), max(ys), max(zs)))
 
 
+def is_degenerate(obj):
+    """Whether the domain's world bounds have no volume.
+
+    True when any axis is scaled to zero (or below a size the solver could
+    meaningfully resolve), e.g. the user hit Ctrl+2 on the domain. Starting
+    the solver on such a domain would seed a single particle in a zero-thick
+    box, so the operators refuse instead.
+    """
+    lo, hi = world_bounds(obj)
+    size = hi - lo
+    return min(size.x, size.y, size.z) <= 1e-6
+
+
 def is_alive(datablock):
     """Whether a datablock reference still points at live data.
 
