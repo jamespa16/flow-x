@@ -161,7 +161,7 @@ def cache_path(domain, scene):
     """Where the run's cache file lives (an override, or next to the .blend)."""
     override = domain.flowx_domain.cache_path
     if override:
-        return Path(override).expanduser()
+        return Path(bpy.path.abspath(override)).expanduser()
     if bpy.data.filepath:
         return Path(bpy.data.filepath).with_suffix(".flowx_cache")
     return Path(tempfile.gettempdir()) / "flow-x" / f"{scene.name}.flowx_cache"
