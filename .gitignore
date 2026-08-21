@@ -4,4 +4,5 @@ __pycache__/
 dist/
 *.blend1
 *.blend2
+*.flowx_cache
 .DS_Store

@@ -1,6 +1,6 @@
 """Headless smoke test for the Flow-X extension.
 
-Verifies the extension installs and enables cleanly in Blender 4.2+, with
+Verifies the extension installs and enables cleanly in Blender 5.2+, with
 zero errors, on a clean checkout - the Phase 0 exit criterion. Later phases
 should append their new operators to OPERATORS_TO_SMOKE_TEST below and this
 script will exercise each one after enabling the extension.
@@ -100,14 +100,16 @@ def _check_solver():
     _check_surface(sph, stats)
     _check_collider_grids()
     _check_playback(sph)
+    _check_cache(sph)
 
 
 def _check_playback(sph):
-    """Phase 7: the handler's three timeline cases, and the ms/step readout.
+    """Phase 7: the handler's timeline cases without a cache, and the ms/step readout.
 
-    The solver has no cache, so the contract is: re-seed at or before the
-    scene's start frame, step forward, and hold with a warning on a backward
-    scrub rather than showing a frame that was never simulated.
+    The disk cache is off by default, so the contract here is the uncached
+    one: re-seed at or before the scene's start frame, step forward, and hold
+    with a warning on a backward scrub rather than showing a frame that was
+    never simulated. _check_cache covers the enabled path.
     """
     for idname, kwargs in SOLVER_OPERATORS_TO_SMOKE_TEST:
         result = _get_operator(idname)(**kwargs)
@@ -149,6 +151,140 @@ def _check_playback(sph):
         raise RuntimeError(f"re-seeding left a stale warning: {stats['warning']}")
 
     print(f"[smoke_test] playback: re-seeded at frame {scene.frame_start}, backward scrub warned")
+
+
+def _check_cache(sph):
+    """The disk cache: write-through, scrub-back loads, invalidation, clear.
+
+    Caching is off by default, so first confirm the uncached contract still
+    holds, then enable it and check: the file grows one frame per simulated
+    frame, a backward scrub loads the frame without a warning, loading the
+    same frame twice round-trips exactly, a settings change discards the old
+    file, and Clear Cache deletes it and restores the warn-and-hold behavior.
+    """
+    mod = sys.modules[ADDON_MODULE]
+    cache = mod.solver.cache
+    gpu_util = mod.solver.gpu_util
+    scene = bpy.context.scene
+    domain = mod.domain.find_domain(scene)
+    settings = domain.flowx_domain
+    start = scene.frame_start
+
+    def positions():
+        return gpu_util.read_texture(
+            sph._state["textures"]["positions_img"], sph._state["config"].particle_count
+        )
+
+    # Cache off: a backward scrub holds and warns, as before.
+    scene.frame_set(start + 3)
+    scene.frame_set(start + 1)
+    stats = sph.stats()
+    if stats["frame"] != start + 3:
+        raise RuntimeError(
+            f"backward scrub with no cache should hold at {start + 3}, solver at {stats['frame']}"
+        )
+    if not stats["warning"]:
+        raise RuntimeError("backward scrub with no cache should warn")
+
+    # Enable and re-seed: a fresh file, no frames yet.
+    settings.cache_enabled = True
+    result = _get_operator("flowx.sph_reset")()
+    if "FINISHED" not in result:
+        raise RuntimeError(f"flowx.sph_reset with caching on returned {result}")
+    info = cache.info()
+    if not info["open"]:
+        raise RuntimeError("caching is enabled but no cache file is open")
+    if info["frames"] is not None:
+        raise RuntimeError(f"fresh cache should hold no frames, holds {info['frames']}")
+    path = cache.cache_path(domain, scene)
+
+    # Every simulated frame lands on disk.
+    for frame in (start + 1, start + 2, start + 3):
+        scene.frame_set(frame)
+    # The reset above re-seeded at frame start + 1 (the scene was parked
+    # there), so the seeded frame itself is not stored: the file holds the
+    # frames simulated after it.
+    info = cache.info()
+    if info["frames"] != (start + 2, start + 3):
+        raise RuntimeError(
+            f"cache should hold frames {start + 2}-{start + 3}, holds {info['frames']}"
+        )
+    if not path.exists():
+        raise RuntimeError(f"cache file is missing at {path}")
+
+    # Backward scrub: the frame loads, with no warning.
+    scene.frame_set(start + 2)
+    stats = sph.stats()
+    if stats["frame"] != start + 2:
+        raise RuntimeError(
+            f"cached backward scrub should be at frame {start + 2}, solver at {stats['frame']}"
+        )
+    if stats["warning"]:
+        raise RuntimeError(f"cached backward scrub should not warn: {stats['warning']}")
+    loaded = positions()
+    if not all(math.isfinite(c) for p in loaded for c in p):
+        raise RuntimeError("the loaded cache frame has non-finite particle positions")
+
+    # A forward jump into the cached range loads rather than simulates.
+    scene.frame_set(start + 3)
+    stats = sph.stats()
+    if stats["frame"] != start + 3 or stats["warning"]:
+        raise RuntimeError(
+            f"forward jump into the cached range should load cleanly "
+            f"(at {stats['frame']}, warning: {stats['warning']})"
+        )
+
+    # Loading the same frame again round-trips exactly. (The seeded frame
+    # itself is never stored, so the round trip goes through a second,
+    # different cached frame on the way back.)
+    scene.frame_set(start + 3)
+    scene.frame_set(start + 2)
+    if positions() != loaded:
+        raise RuntimeError("loading the same cached frame twice did not round-trip exactly")
+
+    # A settings change moves the config hash: re-seed starts a fresh file.
+    old_hash = cache.config_hash(domain, scene)
+    settings.fluid_level = 75.0
+    if cache.config_hash(domain, scene) == old_hash:
+        raise RuntimeError("changing the fluid level did not change the config hash")
+    result = _get_operator("flowx.sph_reset")()
+    if "FINISHED" not in result:
+        raise RuntimeError(f"flowx.sph_reset after a settings change returned {result}")
+    info = cache.info()
+    if info["frames"] is not None:
+        raise RuntimeError(
+            f"changed settings should have discarded the old cache, holds {info['frames']}"
+        )
+
+    # The run continues from the fresh file; the stale tail is not loaded.
+    for frame in (start + 1, start + 2):
+        scene.frame_set(frame)
+    scene.frame_set(start + 5)
+    stats = sph.stats()
+    if stats["frame"] != start + 5:
+        raise RuntimeError(
+            f"forward jump after invalidation should have simulated to {start + 5}, "
+            f"solver at {stats['frame']}"
+        )
+    if stats["warning"]:
+        raise RuntimeError(
+            f"forward simulation after invalidation should not warn: {stats['warning']}"
+        )
+
+    # Clear Cache deletes the file; the uncached contract returns.
+    result = _get_operator("flowx.cache_clear")()
+    if "FINISHED" not in result:
+        raise RuntimeError(f"flowx.cache_clear returned {result}")
+    if path.exists():
+        raise RuntimeError(f"cache file still exists after clear: {path}")
+    scene.frame_set(start + 1)
+    stats = sph.stats()
+    if stats["frame"] != start + 5:
+        raise RuntimeError("with the cache cleared, a backward scrub should hold")
+    if not stats["warning"]:
+        raise RuntimeError("with the cache cleared, a backward scrub should warn")
+
+    print(f"[smoke_test] disk cache: write, load, invalidation, clear ({path})")
 
 
 def _check_collider_grids():

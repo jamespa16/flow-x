@@ -2,7 +2,7 @@
 """Symlink this repo into Blender's extensions directory, for local dev.
 
 Usage:
-    python3 scripts/dev_link.py [--blender-version 4.2]
+    python3 scripts/dev_link.py [--blender-version 5.2]
 
 Creates a symlink named after the extension id (see blender_manifest.toml)
 inside Blender's "user_default" local extensions repository, pointing back
@@ -47,8 +47,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--blender-version",
-        default="4.2",
-        help="Blender resource-version directory to link into, e.g. 4.2 or 5.2 "
+        default="5.2",
+        help="Blender resource-version directory to link into, e.g. 5.2 "
         "(match whatever `blender --version` reports as the major.minor)",
     )
     args = parser.parse_args()

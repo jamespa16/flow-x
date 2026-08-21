@@ -1,6 +1,8 @@
 """Collider tagging and CPU-side voxelization (Phase 2)."""
 
+import hashlib
 import math
+import struct
 
 import bpy
 import gpu
@@ -123,6 +125,22 @@ def occupied_count(obj_name):
     """Number of occupied voxels in obj_name's collider grid, or 0 if untracked."""
     grid = _grids.get(obj_name)
     return len(grid.points) if grid is not None else 0
+
+
+def grid_fingerprint(obj_name):
+    """sha256 over a collider's current voxel grid, or None if it has none.
+
+    The grid - not the mesh - is what the solver actually sees, so this is
+    the right thing for the disk cache to key collider geometry on: a mesh
+    edit that doesn't change the voxels leaves a cached run still valid.
+    """
+    grid = _grids.get(obj_name)
+    if grid is None:
+        return None
+    digest = hashlib.sha256()
+    digest.update(struct.pack("<3I", *grid.dims))
+    digest.update(bytes(grid.occupancy))
+    return digest.digest()
 
 
 def get_solver_grid():

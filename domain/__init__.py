@@ -1,7 +1,7 @@
 """Fluid Domain object: bounds, resolution, fluid level (Phase 1)."""
 
 import bpy
-from bpy.props import BoolProperty, FloatProperty, IntProperty, PointerProperty
+from bpy.props import BoolProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
 from bpy.types import Object, Operator, PropertyGroup
 from mathutils import Vector
 
@@ -151,6 +151,28 @@ class FlowXDomainSettings(PropertyGroup):
         default=24,
         min=1,
         max=200,
+    )
+    # Post-MVP disk cache. Off by default: it writes a file into the user's
+    # project on every simulated frame, which should be a choice, not a side
+    # effect.
+    cache_enabled: BoolProperty(
+        name="Cache to Disk",
+        description=(
+            "Write each simulated frame's particle state to a file, so scrubbing "
+            "back through the timeline loads that frame instead of re-simulating. "
+            "The file accumulates across Blender restarts until the simulation "
+            "settings or colliders change"
+        ),
+        default=False,
+    )
+    cache_path: StringProperty(
+        name="Cache Path",
+        description=(
+            "File the cache is written to. Leave empty to write '<scene>.flowx_cache' "
+            "next to the saved .blend file (an unsaved scene uses the system temp dir)"
+        ),
+        subtype="FILE_PATH",
+        default="",
     )
 
 

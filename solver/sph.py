@@ -29,11 +29,15 @@ a debug overlay behind a checkbox rather than the thing the user watches.
 Phase 7 wires that to the timeline. ``_state["last_frame"]`` is the frame the
 GPU state actually represents, which is not the same thing as the scene's
 current frame: the handler re-seeds at or before the scene's start frame,
-steps forward frame by frame from there, and *holds* on a backward scrub -
-without a cache there is no honest way to go back, so it says so in the panel
+steps forward frame by frame from there, and on a backward scrub loads the
+frame from the disk cache when one holds it - otherwise it *holds*, because
+with no cache there is no honest way to go back, and it says so in the panel
 rather than quietly showing a frame it never simulated. Seeding is from a
 fixed RNG seed and the substep size comes only from the scene's frame rate, so
-the same timeline replays identically every time.
+the same timeline replays identically every time; that determinism is what
+makes the cache (``cache``) able to trust a stored frame: same settings and
+same collider state hash to the same file, and a per-frame collider-matrix
+fingerprint walk catches animation edits the config hash cannot see.
 """
 
 import math
@@ -50,7 +54,7 @@ from mathutils import Vector
 
 from ..collision import ensure_grids, get_solver_grid
 from ..domain import find_domain, is_alive, is_degenerate, world_bounds
-from . import surface, viz
+from . import cache, surface, viz
 from .gpu_util import (
     TEXTURE_WIDTH,
     bind_image,
@@ -418,7 +422,7 @@ def _substep(dt):
         dispatch_1d(_bind(name, dt), config.particle_count, LOCAL_GROUP_SIZE)
 
 
-def _step(frame_dt):
+def _step(frame_dt, frame):
     """Advance one frame of simulated time and refresh the frame's output.
 
     Timed end to end rather than per stage: compute dispatches return before
@@ -433,9 +437,19 @@ def _step(frame_dt):
     for _ in range(substeps):
         _substep(dt)
 
-    _update_surface(dt)
-    _update_viz()
+    # The cache is the only other consumer of the particle state after a step,
+    # and the debug overlay wants the same read-back - share it when both do.
+    positions = None
+    if cache.is_open() or _state["domain"].flowx_domain.show_particles:
+        positions = read_texture(_state["textures"]["positions_img"], config.particle_count)
+    if cache.is_open():
+        velocities = read_texture(_state["textures"]["velocities_img"], config.particle_count)
+        cache.write_frame(frame, positions, velocities)
 
+    _update_surface(dt)
+    _update_viz(positions)
+
+    _state["last_frame"] = frame
     _state["timings"].append((time.perf_counter() - started) * 1000.0)
 
 
@@ -456,12 +470,13 @@ def _update_surface(dt):
     )
 
 
-def _update_viz():
+def _update_viz(positions=None):
     """Refresh the debug point cloud, if the domain still asks for one.
 
     Phase 6's surface mesh is the real output now, so the particle read-back -
     the largest single transfer in a step - is skipped unless the user turns
     the overlay back on to check what the solver is doing underneath.
+    A step that already read the positions for the cache passes them in.
     """
     config = _state["config"]
     domain = _state["domain"]
@@ -470,7 +485,8 @@ def _update_viz():
     if not domain.flowx_domain.show_particles:
         viz.set_points([])
         return
-    positions = read_texture(_state["textures"]["positions_img"], config.particle_count)
+    if positions is None:
+        positions = read_texture(_state["textures"]["positions_img"], config.particle_count)
     viz.set_points([p[:3] for p in positions])
 
 
@@ -522,6 +538,7 @@ def _start(domain):
     _state["running"] = True
     _seed(domain)
     _reset_clock(bpy.context.scene)
+    cache.open(bpy.context.scene, domain, _state["config"].particle_count)
 
     viz.enable()
     if _on_frame_change not in bpy.app.handlers.frame_change_pre:
@@ -542,8 +559,13 @@ def reseed(scene=None):
         return False
     if is_degenerate(domain):
         return False
+    scene = scene or bpy.context.scene
     _seed(domain)
-    _reset_clock(scene or bpy.context.scene)
+    _reset_clock(scene)
+    # Re-open the cache so a mid-run edit to any hashed setting - or to the
+    # toggle itself - decides the file's fate on this re-seed: reuse while the
+    # hash still matches, start fresh when it has moved.
+    cache.open(scene, domain, _state["config"].particle_count)
     viz.tag_viewports_redraw()
     return True
 
@@ -551,6 +573,7 @@ def reseed(scene=None):
 def stop():
     if _on_frame_change in bpy.app.handlers.frame_change_pre:
         bpy.app.handlers.frame_change_pre.remove(_on_frame_change)
+    cache.close()
     surface.stop()
     _state.update({"running": False, "config": None, "domain": None, "shaders": {}, "textures": {}})
     _state["timings"].clear()
@@ -582,15 +605,58 @@ def _frame_dt(scene):
     return 1.0 / fps if fps > 0 else 1.0 / 24.0
 
 
+def _apply_cached(positions, velocities, frame):
+    """Install a cached frame's particle state and refresh its outputs.
+
+    Only positions and velocities are stored; the spatial hash is rebuilt for
+    the loaded particles (a zero-length step, exactly as a re-seed does) so
+    the surface splat can gather, and the frame's surface is extracted from
+    the scene's current collider grid - which the depsgraph path has already
+    brought to this frame before the handler ran.
+    """
+    config = _state["config"]
+    _state["textures"]["positions_img"] = make_texture(config.particle_count, values=positions)
+    _state["textures"]["velocities_img"] = make_texture(config.particle_count, values=velocities)
+    _state["last_frame"] = frame
+    _state["warning"] = None
+    _build_grid(0.0)
+    _update_surface(0.0)
+    _update_viz()
+    viz.tag_viewports_redraw()
+
+
+def _pick_up_cache_end(scene, domain, frame):
+    """Load the cache's furthest frame when it lies between here and `frame`.
+
+    A forward jump that outruns the catch-up budget can often start much
+    closer to its target than the live state: the cache may already hold the
+    ground in between, from this run or an earlier one with the same hash.
+    """
+    header = cache.header()
+    if header is None:
+        return False
+    end = header["last_frame"]
+    if not _state["last_frame"] < end < frame:
+        return False
+    loaded = cache.try_load(end, scene, domain)
+    if loaded is None:
+        return False
+    _apply_cached(*loaded, end)
+    return True
+
+
 @persistent
 def _on_frame_change(scene, _depsgraph):
     """Step the solver to `scene.frame_current`, or say why it can't.
 
-    Three cases, in the order the timeline hits them during playback: the
-    scene's start frame (or anything before it, including negative frames) is
-    the run's origin and re-seeds; a forward jump steps that many frames; a
-    backward one holds, because replaying it would mean re-simulating from the
-    seed frame and there is no cache to do it from.
+    In the order the timeline hits them during playback: the scene's start
+    frame (or anything before it, including negative frames) is the run's
+    origin and re-seeds; a frame the disk cache still holds - verified
+    against the scene's current settings and collider state - loads with no
+    simulation at all, which is the honest way back; a forward jump steps
+    frame by frame, picking the cache's end up first when the jump outruns
+    the catch-up budget; and a backward jump with no usable cache holds
+    rather than showing a frame that was never simulated.
     """
     if not _state["running"]:
         return
@@ -605,6 +671,10 @@ def _on_frame_change(scene, _depsgraph):
         return
 
     frame = scene.frame_current
+    if frame == _state["last_frame"]:
+        # Re-entering the frame the state already represents (a frame_set to
+        # the current frame): there is nothing to advance and nothing wrong.
+        return
     if frame <= _state["seed_frame"]:
         if not reseed(scene):
             stop_deferred()
@@ -612,33 +682,42 @@ def _on_frame_change(scene, _depsgraph):
         viz.tag_viewports_redraw()
         return
 
-    pending = frame - _state["last_frame"]
-    if pending == 0:
-        # Re-entering the frame the state already represents (a frame_set to
-        # the current frame): there is nothing to advance and nothing wrong.
+    loaded = cache.try_load(frame, scene, domain)
+    if loaded is not None:
+        _apply_cached(*loaded, frame)
         return
+
+    pending = frame - _state["last_frame"]
     if pending < 0:
-        _state["warning"] = (
+        _state["warning"] = cache.warning() or (
             f"Frame {frame} is behind the simulation, which is at frame "
             f"{_state['last_frame']}. Flow-X has no cache to scrub back through - "
-            f"return to frame {_state['seed_frame']} to re-seed and re-run."
+            "enable the cache and play forward, or return to the seed frame to re-run."
         )
         return
 
     if pending > MAX_CATCHUP_FRAMES:
-        _state["warning"] = (
-            f"Jumped {pending} frames; only {MAX_CATCHUP_FRAMES} were simulated, so "
-            f"this frame is approximate. Return to frame {_state['seed_frame']} and "
-            "play forward for a correct result."
-        )
-        pending = MAX_CATCHUP_FRAMES
+        if _pick_up_cache_end(scene, domain, frame):
+            pending = frame - _state["last_frame"]
+        if pending > MAX_CATCHUP_FRAMES:
+            _state["warning"] = (
+                f"Jumped {frame - _state['last_frame']} frames; only "
+                f"{MAX_CATCHUP_FRAMES} were simulated, so this frame is approximate. "
+                f"Return to frame {_state['seed_frame']} and play forward for a correct "
+                "result."
+            )
+            pending = MAX_CATCHUP_FRAMES
     else:
         _state["warning"] = None
 
     frame_dt = _frame_dt(scene)
-    for _ in range(pending):
-        _step(frame_dt)
-    _state["last_frame"] = frame
+    target = _state["last_frame"] + pending
+    while _state["last_frame"] < target:
+        _step(frame_dt, _state["last_frame"] + 1)
+    # A clamped jump only simulated as far as `target`, but the run claims
+    # the scene's frame anyway - the warning above says why it's approximate.
+    if frame != target:
+        _state["last_frame"] = frame
     viz.tag_viewports_redraw()
 
 
@@ -669,6 +748,7 @@ def stats():
         "frame": _state["last_frame"],
         "warning": _state["warning"],
         "step_ms": sum(timings) / len(timings) if timings else None,
+        "cache": cache.info(),
     }
 
 

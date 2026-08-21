@@ -7,6 +7,7 @@ from ..collision import FLOWX_OT_toggle_collider, occupied_count
 from ..domain import FLOWX_OT_domain_add, find_domain, world_bounds
 from ..solver import (
     PARTICLE_COUNT,
+    FLOWX_OT_cache_clear,
     FLOWX_OT_solver_gpu_test_toggle,
     FLOWX_OT_sph_reset,
     FLOWX_OT_sph_toggle,
@@ -165,6 +166,7 @@ class FLOWX_PT_playback(Panel):
     def draw(self, context):
         layout = self.layout
         scene = context.scene
+        settings = context.active_object.flowx_domain
         stats = sph.stats()
 
         if stats is None:
@@ -199,6 +201,27 @@ class FLOWX_PT_playback(Panel):
             for line in _wrap(stats["warning"], 44):
                 column.label(text=line, icon=icon)
                 icon = "BLANK1"
+
+        box = layout.box()
+        box.label(text="Cache")
+        col = box.column(align=True)
+        col.prop(settings, "cache_enabled")
+        col.prop(settings, "cache_path")
+        cache = stats["cache"]
+        if cache["frames"] is not None:
+            first, last = cache["frames"]
+            size = (cache["size"] or 0) / 1048576.0
+            col.label(text=f"Frames {first}-{last} on disk ({size:.1f} MB)")
+        elif cache["open"]:
+            col.label(text="No frames written yet - the first simulated frame starts the file.")
+        else:
+            col.label(
+                text="Off until enabled - then scrubbing back loads frames instead of re-running."
+            )
+        if cache["warning"]:
+            for line in _wrap(cache["warning"], 44):
+                col.label(text=line, icon="ERROR")
+        col.operator(FLOWX_OT_cache_clear.bl_idname, text="Clear Cache", icon="TRASH")
 
         box = layout.box()
         box.label(text="Performance")

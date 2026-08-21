@@ -15,7 +15,7 @@ Explicitly **out of scope for MVP**: photoreal surface shading (foam, whitecaps,
 
 | Decision | Choice | Why |
 |---|---|---|
-| Target Blender version | 4.2 LTS+ | New Extensions platform (`blender_manifest.toml`), stable `gpu` compute API |
+| Target Blender version | 5.2 LTS+ (raised from 4.2 LTS+ in v0.2.0, when the disk cache needed the string-form `permissions` manifest schema) | New Extensions platform (`blender_manifest.toml`), stable `gpu` compute API |
 | Distribution format | Blender Extension (not legacy `bl_info` add-on) | Extensions is the only supported path going forward |
 | GPU compute path | Blender's `gpu` module + GLSL compute shaders (`gpu.compute.dispatch`) | Runs inside Blender's existing GL context — no native build/toolchain per OS/GPU. A native CUDA/Vulkan backend is a post-MVP perf stretch goal, not required for MVP |
 | Solver algorithm | WCSPH (weakly-compressible SPH) | Simplest SPH variant that's numerically stable enough to demo; PCISPH/PBF are later perf/quality upgrades |
@@ -106,7 +106,7 @@ Explicitly **out of scope for MVP**: photoreal surface shading (foam, whitecaps,
 
 - GPU-side marching cubes (histopyramid / atomic-counter triangle compaction), replacing the CPU readback path once it becomes the bottleneck.
 - Surface shading beyond a flat default material: foam/whitecaps, refraction, spray particles.
-- Bake-to-disk caching so scrubbing/rendering doesn't require re-simulating from frame 0.
+- ~~Bake-to-disk caching so scrubbing/rendering doesn't require re-simulating from frame 0.~~ Shipped in v0.2.0: a per-frame write-through cache (`solver/cache.py`, Playback > Cache in the N-panel) that validates each loaded frame against a settings hash and per-frame collider-matrix fingerprints.
 - PCISPH or Position-Based Fluids for stiffer, more incompressible behavior at lower iteration counts.
 - Multi-domain and domain-to-domain interaction.
 - Moving/deforming/skinned colliders (currently limited to rigid transform updates).
