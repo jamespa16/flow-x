@@ -72,15 +72,26 @@ class FlowXDomainSettings(PropertyGroup):
         min=1.0,
         max=20000.0,
     )
-    stiffness: FloatProperty(
-        name="Stiffness",
+    pbf_iterations: IntProperty(
+        name="Solver Iterations",
         description=(
-            "Tait equation-of-state stiffness. Higher resists compression harder but "
-            "raises the speed of sound, which forces smaller substeps"
+            "Jacobi density-constraint solves per substep. More reduces density "
+            "error but costs proportionally more GPU dispatches"
         ),
-        default=20000.0,
-        min=1.0,
-        max=1000000.0,
+        default=4,
+        min=1,
+        max=20,
+    )
+    pbf_relaxation: FloatProperty(
+        name="Constraint Relaxation",
+        description=(
+            "CFM-style epsilon added to the density constraint's lambda "
+            "denominator. Prevents a division blow-up when a particle's "
+            "neighborhood is nearly empty; higher softens the constraint"
+        ),
+        default=100.0,
+        min=0.0,
+        max=100000.0,
     )
     viscosity: FloatProperty(
         name="Viscosity",
@@ -88,6 +99,17 @@ class FlowXDomainSettings(PropertyGroup):
         default=0.1,
         min=0.0,
         max=10.0,
+    )
+    pbf_scorr_k: FloatProperty(
+        name="Anti-Clustering Strength",
+        description=(
+            "s_corr tensile-instability correction. Resists particles clumping "
+            "into tight clusters under tension (e.g. a stretched sheet of fluid); "
+            "0 disables the term"
+        ),
+        default=0.1,
+        min=0.0,
+        max=1.0,
     )
     # Phase 6 surface reconstruction. The grid the surface is extracted from is
     # deliberately independent of the solver's, so the look can be refined
