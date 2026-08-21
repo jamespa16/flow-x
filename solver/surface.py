@@ -28,6 +28,7 @@ from mathutils import Vector
 from ..domain import is_alive
 from . import marching_cubes
 from .gpu_util import (
+    bind_image,
     bind_push_constants,
     build_compute_shader,
     dispatch_1d,
@@ -79,6 +80,9 @@ _state = {
     "texture": None,
     "config": None,
     "object": None,
+    # Names this compiled shader has no slot for (the OpenGL backend
+    # eliminates slots a pass never reads - see gpu_util.bind_image).
+    "missing": set(),
     "vertices": 0,
     "triangles": 0,
 }
@@ -144,6 +148,8 @@ def start(domain, config):
         _PUSH_CONSTANTS,
         LOCAL_GROUP_SIZE,
     )
+    # The absent-slot set only describes this particular compile.
+    _state["missing"] = set()
     reseed(domain, config)
 
 
@@ -220,15 +226,16 @@ def update(config, textures, constants, collider):
     # carve colliders and gather neighbours from the wrong cells.
     values["f_hi"] = (surface.lo.x, surface.lo.y, surface.lo.z, 0.0)
 
+    missing = _state["missing"]
     shader.bind()
-    bind_push_constants(shader, values)
+    bind_push_constants(shader, values, missing)
     for _fmt, _type, name in _IMAGES:
         if name == "surface_img":
-            shader.image(name, _state["texture"])
+            bind_image(shader, name, _state["texture"], missing)
         elif name == "collider_img":
-            shader.image(name, collider_texture)
+            bind_image(shader, name, collider_texture, missing)
         else:
-            shader.image(name, textures[name])
+            bind_image(shader, name, textures[name], missing)
     dispatch_1d(shader, surface.sample_count, LOCAL_GROUP_SIZE)
 
     field = read_scalar_texture(_state["texture"], surface.sample_count)

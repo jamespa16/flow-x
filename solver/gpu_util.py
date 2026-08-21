@@ -10,6 +10,11 @@ probing the module directly rather than from the docs:
 * 1D textures cannot be read back - ``GPUTexture.read()`` reports a
   zero-length first dimension for them. All particle/grid state therefore
   lives in 2D textures, addressed as a flat array wrapped at ``TEXTURE_WIDTH``.
+* The OpenGL backend dead-code-eliminates push-constant uniforms and images
+  that a compiled pass never reads, while Metal keeps every declared slot.
+  A shared block therefore cannot be assumed present in every pass: bind it
+  through the per-shader ``missing`` sets in bind_push_constants()/
+  bind_image(), which remember what this particular compile has no slot for.
 
 There is no read-write storage buffer in the Python API at all, so images are
 the only mutable GPU state available.
@@ -84,20 +89,52 @@ def read_scalar_texture(texture, count):
     return values
 
 
-def bind_push_constants(shader, values):
+def _remember_missing(missing, name, exc):
+    """Record a resource the compiled shader has no slot for, or re-raise.
+
+    Only a "not found" lookup is remembered: that is the OpenGL backend
+    having eliminated a slot the pass never reads, and a constant the pass
+    does read can never be looked up as missing, so the skip is a no-op.
+    Anything else is a real error and must still surface.
+    """
+    if "not found" in str(exc):
+        missing.add(name)
+    else:
+        raise
+
+
+def bind_push_constants(shader, values, missing):
     """Bind a {name: 4-tuple} push-constant block onto an already-bound shader.
 
-    Whether a slot is an int or a float vector follows the `i_`/`f_` naming the
-    GLSL block uses (see shaders/sph_common.glsl); passing a float tuple that
+    `missing` is a per-compiled-shader set of names the backend has already
+    reported as absent; it is updated as bindings are attempted (see
+    _remember_missing), so only the first dispatch pays each lookup. Whether
+    a slot is an int or a float vector follows the `i_`/`f_` naming the GLSL
+    block uses (see shaders/sph_common.glsl); passing a float tuple that
     happens to hold whole numbers therefore still binds as floats.
     """
     for name, value in values.items():
-        if name.startswith("i_"):
-            shader.uniform_int(name, value)
-        elif name.startswith("f_"):
-            shader.uniform_float(name, value)
-        else:
-            raise ValueError(f"push constant {name!r} must be named i_* or f_*")
+        if name in missing:
+            continue
+        try:
+            if name.startswith("i_"):
+                shader.uniform_int(name, value)
+            elif name.startswith("f_"):
+                shader.uniform_float(name, value)
+            else:
+                raise ValueError(f"push constant {name!r} must be named i_* or f_*")
+        except Exception as exc:
+            _remember_missing(missing, name, exc)
+
+
+def bind_image(shader, name, texture, missing):
+    """Bind an image, remembering names the compiled pass has no slot for."""
+    if name in missing:
+        return
+    try:
+        shader.image(name, texture)
+    except Exception as exc:
+        _remember_missing(missing, name, exc)
 
 
 def build_compute_shader(sources, images, push_constants, local_size):

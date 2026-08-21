@@ -53,6 +53,7 @@ from ..domain import find_domain, is_alive, is_degenerate, world_bounds
 from . import surface, viz
 from .gpu_util import (
     TEXTURE_WIDTH,
+    bind_image,
     bind_push_constants,
     build_compute_shader,
     dispatch_1d,
@@ -129,6 +130,10 @@ _state = {
     "config": None,
     "domain": None,
     "shaders": {},
+    # Per-pass sets of push-constant/image names this compiled shader has no
+    # slot for (the OpenGL backend eliminates slots a pass never reads - see
+    # gpu_util.bind_push_constants). Rebuilt alongside the shaders.
+    "missing": {},
     "textures": {},
     "substeps": 0,
     # Playback bookkeeping (Phase 7). `last_frame` is the frame the GPU state
@@ -309,12 +314,15 @@ def _allocate(config):
 
 def _compile_passes():
     prelude = shader_source("sph_common")
-    return {
+    shaders = {
         name: build_compute_shader(
             [prelude, shader_source(name)], _IMAGES, _PUSH_CONSTANTS, LOCAL_GROUP_SIZE
         )
         for name in _PASSES
     }
+    # The absent-slot sets only describe this particular compile.
+    _state["missing"] = {name: set() for name in _PASSES}
+    return shaders
 
 
 _EMPTY_COLLIDER_TEXTURE = None
@@ -370,14 +378,17 @@ def _bind(name, dt, sort_k=0, sort_j=0):
     """Bind a pass's shader with the shared push-constant block and images."""
     config = _state["config"]
     shader = _state["shaders"][name]
+    missing = _state["missing"][name]
     collider_texture, i_collider = _collider_binding()
     shader.bind()
-    bind_push_constants(shader, push_constant_values(config, dt, i_collider, sort_k, sort_j))
+    bind_push_constants(
+        shader, push_constant_values(config, dt, i_collider, sort_k, sort_j), missing
+    )
     for image_name in (image[2] for image in _IMAGES):
         if image_name == "collider_img":
-            shader.image(image_name, collider_texture)
+            bind_image(shader, image_name, collider_texture, missing)
         else:
-            shader.image(image_name, _state["textures"][image_name])
+            bind_image(shader, image_name, _state["textures"][image_name], missing)
     return shader
 
 
