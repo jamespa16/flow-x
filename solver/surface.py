@@ -23,6 +23,7 @@ import struct
 
 import bmesh
 import bpy
+from mathutils import Vector
 
 from ..domain import is_alive
 from . import marching_cubes
@@ -86,11 +87,19 @@ _state = {
 class SurfaceConfig:
     """Resolved surface-grid parameters for one run."""
 
-    __slots__ = ("dims", "spacing", "sample_count", "kernel_radius", "iso")
+    __slots__ = ("dims", "spacing", "sample_count", "kernel_radius", "iso", "lo")
 
 
 def resolve(domain, config):
-    """Surface grid sized from the domain's settings and the solver's bounds."""
+    """Surface grid sized from the domain's settings and the solver's bounds.
+
+    The grid starts one kernel radius *before* the domain's low corner and
+    runs one past its high corner. The fluid's bled kernel density falls to
+    zero only a kernel radius outside each wall, so a grid that stops at the
+    domain bounds has no "outside" sample where a wall's iso-surface closes -
+    marching clips the surface open there and the fluid renders as a tray
+    missing every side whose wall sits on the boundary.
+    """
     settings = domain.flowx_domain
     size = config.hi - config.lo
     longest = max(size.x, size.y, size.z)
@@ -99,26 +108,31 @@ def resolve(domain, config):
     surface.iso = settings.surface_iso
     surface.spacing = max(longest / max(settings.surface_resolution, 1), 1e-6)
 
+    def _kernel_radius(spacing):
+        # A grid coarser than the fluid needs a wider kernel or the field turns
+        # into isolated blobs at the sample points; a finer one gains nothing
+        # from going below the solver's own smoothing radius.
+        return min(
+            max(config.smoothing_radius, spacing * 1.5),
+            SURFACE_CELL_RADIUS * config.cell_size,
+        )
+
     for _ in range(8):
         # Samples sit on lattice points, so covering N cells along an axis
-        # takes N+1 of them. Rounding up means the lattice always reaches past
-        # the domain's far corner rather than clipping the surface there.
-        dims = tuple(
-            max(2, int(-(-axis // surface.spacing)) + 1) for axis in (size.x, size.y, size.z)
-        )
+        # takes N+1 of them. Rounding up means the lattice reaches past the
+        # margin on every side rather than clipping the surface at a wall.
+        margin = _kernel_radius(surface.spacing)
+        extent = size + Vector((2 * margin, 2 * margin, 2 * margin))
+        dims = tuple(max(2, int(-(-axis // surface.spacing)) + 1) for axis in extent)
         if dims[0] * dims[1] * dims[2] <= MAX_SAMPLES:
             break
         surface.spacing *= 1.25
+
     surface.dims = dims
     surface.sample_count = dims[0] * dims[1] * dims[2]
-
-    # A grid coarser than the fluid needs a wider kernel or the field turns
-    # into isolated blobs at the sample points; a finer one gains nothing from
-    # going below the solver's own smoothing radius.
-    surface.kernel_radius = min(
-        max(config.smoothing_radius, surface.spacing * 1.5),
-        SURFACE_CELL_RADIUS * config.cell_size,
-    )
+    surface.kernel_radius = _kernel_radius(surface.spacing)
+    margin = surface.kernel_radius
+    surface.lo = config.lo - Vector((margin, margin, margin))
     return surface
 
 
@@ -198,6 +212,10 @@ def update(config, textures, constants, collider):
     values["i_collider"] = i_collider
     # Same block, but the kernel radius is the surface grid's, not the solver's.
     values["f_sph"] = (surface.kernel_radius, *constants["f_sph"][1:])
+    # The grid starts one kernel radius before the domain's low corner (see
+    # resolve); the shader must splat from that true origin or the bled density
+    # at the walls is sampled from the wrong cells and the surface clips open.
+    values["f_lo"] = (surface.lo.x, surface.lo.y, surface.lo.z, constants["f_lo"][3])
 
     shader.bind()
     bind_push_constants(shader, values)
@@ -212,7 +230,7 @@ def update(config, textures, constants, collider):
 
     field = read_scalar_texture(_state["texture"], surface.sample_count)
     vertices, triangles = marching_cubes.extract(
-        field, surface.dims, config.lo, surface.spacing, surface.iso
+        field, surface.dims, surface.lo, surface.spacing, surface.iso
     )
 
     _state["vertices"] = len(vertices)
