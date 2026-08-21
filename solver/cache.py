@@ -32,7 +32,6 @@ Each frame (fixed size):
 
     positions      (N*4 f32)
     velocities     (N*4 f32)
-    per collider: 64-bit fingerprint of the object's world matrix (Q)
 
 `last_frame` in the header is rewritten after every frame write, so a torn
 tail from a crash is ignored on load. The seed frame itself is never stored:
@@ -41,15 +40,14 @@ its state is the deterministic seed, and the handler re-seeds there anyway.
 Validity. The config hash covers everything that changes the physics: the
 extension version (code constants live in it), the frame rate, the domain's
 world bounds and resolution, every solver parameter, and per tagged collider
-its name and voxel-grid hash. A file is only trusted while the scene
-still hashes to its header's hash. Transform-only edits (re-keying a
-collider's animation) do not change that hash, so each frame also stores a
-per-collider world-matrix fingerprint; loading frame F verifies every
-fingerprint from the first stored frame to F - incrementally, so frames
-already checked while the colliders were in their current state are not
-re-read and a long scrub stays O(1) per frame - and any mismatch
-invalidates the cache rather than showing a state the scene could not have
-produced.
+its name, a transform-invariant mesh fingerprint (so only an actual edit to
+the geometry counts, not the collider simply moving), and a motion
+fingerprint - the active action's keyframes when the collider is animated,
+or its current world matrix when it isn't - so re-keying a collider's
+animation or manually moving a static one invalidates the cache, but an
+animated collider simply playing forward does not. A file is only trusted
+while the scene still hashes to its header's hash, checked once per write
+and once per load rather than by walking historical frames.
 
 Writes are write-through: every simulated frame is appended as it runs, so
 the cache accumulates across Blender restarts for as long as the config hash
@@ -65,16 +63,15 @@ from pathlib import Path
 import bpy
 from bpy.types import Operator
 
-from ..collision import grid_fingerprint
+from ..collision import mesh_fingerprint
 from ..domain import find_domain, world_bounds
 
 MAGIC = b"FLWXCA01"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 # magic, format_version, flowx_version, particle_count, seed_frame, last_frame,
 # fps, collider_count
 _FIXED_HEADER = struct.Struct("<8sI16sIiifI")
-_FINGERPRINT = struct.Struct("<Q")
 
 # A header is the fixed part plus one (length + name) pair per collider; 8 KiB
 # covers any collider list this add-on will ever see.
@@ -115,10 +112,42 @@ def collider_names(scene):
     )
 
 
-def _fingerprint(obj):
-    """8-byte digest of the object's world matrix at the current frame."""
-    packed = struct.pack("<16f", *[value for row in obj.matrix_world for value in row])
-    return int.from_bytes(hashlib.sha256(packed).digest()[:8], "little")
+def _action_fcurves(action, slot):
+    """An action's fcurves for one slot, layered or legacy (Blender 4.4+/pre-4.4)."""
+    if hasattr(action, "fcurves"):
+        yield from action.fcurves
+        return
+    for layer in action.layers:
+        for strip in layer.strips:
+            if strip.type != "KEYFRAME":
+                continue
+            channelbag = strip.channelbag(slot, ensure=False)
+            if channelbag is not None:
+                yield from channelbag.fcurves
+
+
+def _motion_fingerprint(obj):
+    """Bytes identifying a collider's motion, for the config hash.
+
+    An animated collider's world matrix legitimately differs frame to frame,
+    so hashing a live sample would make the config hash disagree with itself
+    across a single run. Instead this hashes the *definition* of the motion:
+    the active action's keyframes when the object is animated, or its
+    current (constant for the run) world matrix when it isn't. Either one
+    only changes when the collider's actual motion changes - a re-key or a
+    manual move - not by simply playing the animation forward.
+    """
+    anim = obj.animation_data
+    action = anim.action if anim else None
+    if action is None:
+        return struct.pack("<16f", *[value for row in obj.matrix_world for value in row])
+    digest = hashlib.sha256()
+    for fcurve in _action_fcurves(action, anim.action_slot):
+        digest.update(fcurve.data_path.encode("utf-8"))
+        digest.update(struct.pack("<i", fcurve.array_index))
+        for point in fcurve.keyframe_points:
+            digest.update(struct.pack("<2f", point.co[0], point.co[1]))
+    return digest.digest()
 
 
 def config_hash(domain, scene):
@@ -152,8 +181,9 @@ def config_hash(domain, scene):
     )
     for name in collider_names(scene):
         digest.update(name.encode("utf-8"))
-        fingerprint = grid_fingerprint(name)
-        digest.update(fingerprint if fingerprint is not None else b"")
+        mesh_fp = mesh_fingerprint(name)
+        digest.update(mesh_fp if mesh_fp is not None else b"")
+        digest.update(_motion_fingerprint(scene.objects[name]))
     return digest.digest()
 
 
@@ -229,7 +259,7 @@ def _unpack_header(data):
         "colliders": colliders,
         "config_hash": config_hash,
         "header_size": offset + 32,
-        "frame_size": 8 * 4 * particle_count + 8 * len(colliders),
+        "frame_size": 8 * 4 * particle_count,
     }
 
 
@@ -290,16 +320,12 @@ def open(scene, domain, particle_count):
                 "colliders": collider_names(scene),
                 "config_hash": current_hash,
                 "header_size": 0,
-                "frame_size": 8 * 4 * particle_count + 8 * len(collider_names(scene)),
+                "frame_size": 8 * 4 * particle_count,
             }
             packed = _pack_header(header)
             header["header_size"] = len(packed)
             file.write(packed)
             file.flush()
-        # The fingerprint walk is incremental across loads (see try_load); a
-        # fresh open has verified nothing yet.
-        header["verified_through"] = None
-        header["verified_fingerprint"] = None
         _state.update(file=file, path=str(path), header=header)
     except OSError as exc:
         _state["warning"] = (
@@ -342,7 +368,6 @@ def write_frame(frame, positions, velocities, domain):
         file.seek(offset)
         file.write(struct.pack(f"<{count * 4}f", *[c for item in positions for c in item]))
         file.write(struct.pack(f"<{count * 4}f", *[c for item in velocities for c in item]))
-        file.write(b"".join(_FINGERPRINT.pack(_fingerprint(scene.objects[name])) for name in names))
         header["last_frame"] = max(header["last_frame"], frame)
         file.seek(0)
         file.write(_pack_header(header))
@@ -354,9 +379,9 @@ def write_frame(frame, positions, velocities, domain):
 def try_load(frame, scene, domain):
     """(positions, velocities) for a cached frame, or None with a warning set.
 
-    The frame must be inside the file's covered range, the scene must still
-    hash to the file's config hash, and every stored collider fingerprint from
-    the first frame to `frame` must match the scene's - otherwise the scene
+    The frame must be inside the file's covered range and the scene must
+    still hash to the file's config hash - which covers each collider's
+    motion definition, not just its live transform - otherwise the scene
     changed after the run and the stored state is not honest.
     """
     file = _state["file"]
@@ -379,31 +404,6 @@ def try_load(frame, scene, domain):
         return None
     try:
         first = header["seed_frame"] + 1
-        data_size = 8 * 4 * header["particle_count"]
-        colliders = header["colliders"]
-        current = tuple(_fingerprint(scene.objects[name]) for name in colliders)
-        # The walk is incremental: while the colliders stay in the state that
-        # was verified, already-checked frames are re-read no more, so a scrub
-        # re-walks from the first frame only after a collider actually
-        # changes - one new frame per forward step, none at all scrubbing
-        # back - instead of rewinding to the start on every load.
-        verified = header["verified_through"]
-        if verified is None or header["verified_fingerprint"] != current:
-            verify_from = first
-        else:
-            verify_from = max(first, verified + 1)
-        for f in range(verify_from, frame + 1):
-            file.seek(header["header_size"] + (f - first) * header["frame_size"] + data_size)
-            stored = struct.unpack(f"<{len(colliders)}Q", file.read(8 * len(colliders)))
-            if stored != current:
-                _state["warning"] = (
-                    "A collider's animation no longer matches the cached run - "
-                    f"return to frame {header['seed_frame']} to re-run and rebuild "
-                    "the cache."
-                )
-                return None
-        header["verified_through"] = frame if verified is None else max(verified, frame)
-        header["verified_fingerprint"] = current
         file.seek(header["header_size"] + (frame - first) * header["frame_size"])
         n4 = header["particle_count"] * 4
         positions = list(struct.unpack(f"<{n4}f", file.read(4 * n4)))
