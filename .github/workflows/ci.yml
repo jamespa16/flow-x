@@ -33,8 +33,6 @@ jobs:
     # full solver, surface and demo-replay checks run on CPU. When it
     # doesn't, the smoke test degrades to install/enable/dispatch checks.
     runs-on: ubuntu-latest
-    env:
-      BLENDER_USER_RESOURCES: ${{ runner.temp }}/blender-config
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -61,8 +59,14 @@ jobs:
 
       # BLENDER_USER_RESOURCES points both steps at a throwaway config dir,
       # which also makes dev_link.py's --blender-version argument moot.
+      # (The runner context is only available in step-level env, not the
+      # job level, so it lives on each step rather than the job.)
       - name: Symlink extension into a throwaway Blender config dir
+        env:
+          BLENDER_USER_RESOURCES: ${{ runner.temp }}/blender-config
         run: python3 scripts/dev_link.py
 
       - name: Run headless smoke test
+        env:
+          BLENDER_USER_RESOURCES: ${{ runner.temp }}/blender-config
         run: blender --background --python scripts/smoke_test.py

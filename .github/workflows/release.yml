@@ -15,8 +15,6 @@ jobs:
     # Free hosted runner: blender-downloader fetches the pinned Blender
     # build, which is used to verify the packaged zip before publishing.
     runs-on: ubuntu-latest
-    env:
-      BLENDER_USER_RESOURCES: ${{ runner.temp }}/release-blender-config
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -48,6 +46,8 @@ jobs:
       # then the full smoke test runs against it - i.e. the exact third-party
       # path the MVP exit criterion describes, including the demo scenes.
       - name: Install the zip in a fresh Blender and smoke test it
+        env:
+          BLENDER_USER_RESOURCES: ${{ runner.temp }}/release-blender-config
         run: |
           export FLOWX_ZIP=$(ls "$RUNNER_TEMP/dist/"*.zip)
           blender --background --python scripts/smoke_test.py
