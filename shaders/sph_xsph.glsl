@@ -18,9 +18,12 @@
  * same order of approximation XSPH already tolerated under WCSPH (there it
  * read a density computed before force integration moved anything) and is
  * not worth a second density pass to correct.
+ *
+ * The blend strength is f_sim.x (the Viscosity domain property) rather than
+ * a fixed constant, so raising it visibly thickens/damps the fluid as its
+ * description promises; sph.py's viscous_dt CFL term already bounds dt
+ * against this same value to keep the blend stable.
  */
-
-#define XSPH_EPSILON 0.5
 
 void main()
 {
@@ -74,5 +77,6 @@ void main()
     }
   }
 
-  imageStore(delta_img, ti, vec4(XSPH_EPSILON * v_xsph, 0.0));
+  float xsph_epsilon = f_sim.x;
+  imageStore(delta_img, ti, vec4(xsph_epsilon * v_xsph, 0.0));
 }

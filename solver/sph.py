@@ -141,9 +141,9 @@ _IMAGES = (
     # substep sph_xsph's velocity correction.
     ("RGBA32F", "FLOAT_2D", "delta_img"),
     # xyz = surface-tension color-field gradient (normal), w = curvature. Only
-    # meaningful when surface_tension > 0; sph_normal.glsl still runs every
-    # substep regardless (it's a small fraction of the substep's cost next to
-    # the grid build), so the array is always allocated.
+    # meaningful when surface_tension > 0, in which case sph_normal.glsl
+    # writes it fresh every substep before sph_predict.glsl reads it; the
+    # array is always allocated even when the pass is skipped.
     ("RGBA32F", "FLOAT_2D", "normal_img"),
     ("RGBA32F", "FLOAT_2D", "keys_img"),
     ("R32F", "FLOAT_2D", "cell_start_img"),
@@ -477,7 +477,11 @@ def _build_grid(dt):
 
 def _substep(dt):
     config = _state["config"]
-    dispatch_1d(_bind("sph_normal", dt), config.particle_count, LOCAL_GROUP_SIZE)
+    # sph_predict.glsl treats sigma <= 0 as a no-op, so skip the normal/
+    # curvature pass's neighbor loop entirely when surface tension is off
+    # (the shipped default) rather than paying for a dispatch nothing reads.
+    if config.surface_tension > 0.0:
+        dispatch_1d(_bind("sph_normal", dt), config.particle_count, LOCAL_GROUP_SIZE)
     dispatch_1d(_bind("sph_predict", dt), config.particle_count, LOCAL_GROUP_SIZE)
     _build_grid(dt)
     for _ in range(config.iterations):
