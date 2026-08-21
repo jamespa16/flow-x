@@ -6,6 +6,11 @@ on:
       - "v*"
   workflow_dispatch:
 
+# The publish step creates the GitHub release and uploads the zip with the
+# workflow's token; the repo default grants it read-only.
+permissions:
+  contents: write
+
 # Pinned to the LTS the dev machines run. blender-downloader resolves it to
 # the official linux-x64 tarball (https://download.blender.org/release/).
 env:
