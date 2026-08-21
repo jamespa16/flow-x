@@ -4,14 +4,42 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+
+# Pinned to the LTS the dev machines run; must match ci.yml.
+env:
+  BLENDER_VERSION: "5.2.0"
 
 jobs:
   package-and-publish:
-    # Same self-hosted runner as the smoke test: it needs `blender` on PATH
-    # (4.2+) to verify the packaged zip before it is published.
-    runs-on: [self-hosted, blender]
+    # Free hosted runner: blender-downloader fetches the pinned Blender
+    # build, which is used to verify the packaged zip before publishing.
+    runs-on: ubuntu-latest
+    env:
+      BLENDER_USER_RESOURCES: ${{ runner.temp }}/release-blender-config
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install blender-downloader
+
+      - name: Cache the extracted Blender build
+        id: blender-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/blender-${{ env.BLENDER_VERSION }}
+          key: blender-${{ env.BLENDER_VERSION }}-linux-x64
+
+      - name: Download and extract Blender ${{ env.BLENDER_VERSION }}
+        if: steps.blender-cache.outputs.cache-hit != 'true'
+        run: |
+          blender-downloader "$BLENDER_VERSION" -q --extract --remove-compressed \
+            -d "${{ runner.temp }}/blender-${BLENDER_VERSION}"
+      - name: Put blender on PATH
+        run: |
+          echo "${{ runner.temp }}/blender-${BLENDER_VERSION}/blender-${BLENDER_VERSION}-linux-x64" >> "$GITHUB_PATH"
+          blender --version | head -1
 
       - name: Package the extension zip
         run: python3 scripts/package.py "$GITHUB_WORKSPACE" "$RUNNER_TEMP/dist"
@@ -20,8 +48,6 @@ jobs:
       # then the full smoke test runs against it - i.e. the exact third-party
       # path the MVP exit criterion describes, including the demo scenes.
       - name: Install the zip in a fresh Blender and smoke test it
-        env:
-          BLENDER_USER_RESOURCES: ${{ runner.temp }}/release-blender-config
         run: |
           export FLOWX_ZIP=$(ls "$RUNNER_TEMP/dist/"*.zip)
           blender --background --python scripts/smoke_test.py
