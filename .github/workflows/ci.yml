@@ -50,6 +50,8 @@ jobs:
       - name: Download and extract Blender ${{ env.BLENDER_VERSION }}
         if: steps.blender-cache.outputs.cache-hit != 'true'
         run: |
+          # blender-downloader stats the output dir before creating it.
+          mkdir -p "${{ runner.temp }}/blender-${BLENDER_VERSION}"
           blender-downloader "$BLENDER_VERSION" -q --extract --remove-compressed \
             -d "${{ runner.temp }}/blender-${BLENDER_VERSION}"
       - name: Put blender on PATH
