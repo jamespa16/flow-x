@@ -35,13 +35,20 @@ _solver_grid = {"texture": None, "voxel_size": 0.0, "dims": (1, 1, 1)}
 class ColliderGrid:
     """Voxelized occupancy for one collider, sized to the domain's grid."""
 
-    __slots__ = ("dims", "occupancy", "points", "gpu_buf")
+    __slots__ = ("dims", "occupancy", "points", "gpu_buf", "fingerprint")
 
     def __init__(self, dims, occupancy, points, gpu_buf):
         self.dims = dims
         self.occupancy = occupancy
         self.points = points
         self.gpu_buf = gpu_buf
+        # Hashed once here rather than per request: the grid is immutable
+        # once built (it changes only by being replaced), while the disk
+        # cache fingerprints it on every simulated frame.
+        digest = hashlib.sha256()
+        digest.update(struct.pack("<3I", *dims))
+        digest.update(bytes(occupancy))
+        self.fingerprint = digest.digest()
 
 
 class FlowXColliderSettings(PropertyGroup):
@@ -130,17 +137,15 @@ def occupied_count(obj_name):
 def grid_fingerprint(obj_name):
     """sha256 over a collider's current voxel grid, or None if it has none.
 
-    The grid - not the mesh - is what the solver actually sees, so this is
-    the right thing for the disk cache to key collider geometry on: a mesh
-    edit that doesn't change the voxels leaves a cached run still valid.
+    The digest is computed at grid build time and stored on the grid, so
+    asking for it is a dict lookup - the disk cache asks every simulated
+    frame, and the grid only changes when a rebuild replaces it. The grid -
+    not the mesh - is what the solver actually sees, so this is the right
+    thing for the disk cache to key collider geometry on: a mesh edit that
+    doesn't change the voxels leaves a cached run still valid.
     """
     grid = _grids.get(obj_name)
-    if grid is None:
-        return None
-    digest = hashlib.sha256()
-    digest.update(struct.pack("<3I", *grid.dims))
-    digest.update(bytes(grid.occupancy))
-    return digest.digest()
+    return None if grid is None else grid.fingerprint
 
 
 def get_solver_grid():

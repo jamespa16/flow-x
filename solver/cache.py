@@ -44,9 +44,12 @@ world bounds and resolution, every solver parameter, and per tagged collider
 its name and voxel-grid hash. A file is only trusted while the scene
 still hashes to its header's hash. Transform-only edits (re-keying a
 collider's animation) do not change that hash, so each frame also stores a
-per-collider world-matrix fingerprint; loading frame F re-verifies every
-fingerprint from the first stored frame to F, and any mismatch invalidates
-the cache rather than showing a state the scene could not have produced.
+per-collider world-matrix fingerprint; loading frame F verifies every
+fingerprint from the first stored frame to F - incrementally, so frames
+already checked while the colliders were in their current state are not
+re-read and a long scrub stays O(1) per frame - and any mismatch
+invalidates the cache rather than showing a state the scene could not have
+produced.
 
 Writes are write-through: every simulated frame is appended as it runs, so
 the cache accumulates across Blender restarts for as long as the config hash
@@ -293,6 +296,10 @@ def open(scene, domain, particle_count):
             header["header_size"] = len(packed)
             file.write(packed)
             file.flush()
+        # The fingerprint walk is incremental across loads (see try_load); a
+        # fresh open has verified nothing yet.
+        header["verified_through"] = None
+        header["verified_fingerprint"] = None
         _state.update(file=file, path=str(path), header=header)
     except OSError as exc:
         _state["warning"] = (
@@ -373,19 +380,30 @@ def try_load(frame, scene, domain):
     try:
         first = header["seed_frame"] + 1
         data_size = 8 * 4 * header["particle_count"]
-        for f in range(first, frame + 1):
+        colliders = header["colliders"]
+        current = tuple(_fingerprint(scene.objects[name]) for name in colliders)
+        # The walk is incremental: while the colliders stay in the state that
+        # was verified, already-checked frames are re-read no more, so a scrub
+        # re-walks from the first frame only after a collider actually
+        # changes - one new frame per forward step, none at all scrubbing
+        # back - instead of rewinding to the start on every load.
+        verified = header["verified_through"]
+        if verified is None or header["verified_fingerprint"] != current:
+            verify_from = first
+        else:
+            verify_from = max(first, verified + 1)
+        for f in range(verify_from, frame + 1):
             file.seek(header["header_size"] + (f - first) * header["frame_size"] + data_size)
-            stored = struct.unpack(
-                f"<{len(header['colliders'])}Q",
-                file.read(8 * len(header["colliders"])),
-            )
-            if stored != tuple(_fingerprint(scene.objects[name]) for name in header["colliders"]):
+            stored = struct.unpack(f"<{len(colliders)}Q", file.read(8 * len(colliders)))
+            if stored != current:
                 _state["warning"] = (
                     "A collider's animation no longer matches the cached run - "
                     f"return to frame {header['seed_frame']} to re-run and rebuild "
                     "the cache."
                 )
                 return None
+        header["verified_through"] = frame if verified is None else max(verified, frame)
+        header["verified_fingerprint"] = current
         file.seek(header["header_size"] + (frame - first) * header["frame_size"])
         n4 = header["particle_count"] * 4
         positions = list(struct.unpack(f"<{n4}f", file.read(4 * n4)))
@@ -475,4 +493,4 @@ class FLOWX_OT_cache_clear(Operator):
     def execute(self, context):
         ok, message = clear(find_domain(context.scene), context.scene)
         self.report({"INFO" if ok else "WARNING"}, message)
-        return {"FINISHED" if ok else {"CANCELLED"}}
+        return {"FINISHED"} if ok else {"CANCELLED"}
