@@ -1,9 +1,16 @@
 /* PBF pass 1: apply external forces to velocity, then predict a position.
  *
  * This is PBF's replacement for WCSPH's pressure force: there is no pressure
- * term here at all, only gravity. Incompressibility is restored afterwards
- * by the constraint-solve loop (sph_lambda/sph_delta/sph_apply_delta), not
- * by anything in this pass.
+ * term here at all, only gravity and the surface-tension cohesion force
+ * (Morris 2000) read from normal_img, which sph_normal.glsl computed from
+ * last substep's state before this substep's grid was rebuilt. Incompressi-
+ * bility is restored afterwards by the constraint-solve loop (sph_lambda/
+ * sph_delta/sph_apply_delta), not by anything in this pass.
+ *
+ * i_sort.w carries the surface tension coefficient sigma (bit-packed as a
+ * float - see sph.py's push_constant_values for why it rides in an otherwise-
+ * unused sort lane); 0 makes the term a no-op without needing a branch to
+ * skip the pass entirely.
  *
  * The speed clamp lives here rather than after the constraint loop, because
  * the constraint loop's correctness depends on the neighbor grid built from
@@ -23,9 +30,19 @@ void main()
   ivec2 t = particle_texel(i);
   float dt = f_sim.y;
   float h = f_sph.x;
+  float mass = f_sph.y;
+  float sigma = intBitsToFloat(i_sort.w);
 
   vec3 v = imageLoad(velocities_img, t).xyz;
   v.z += f_sim.z * dt;
+
+  if (sigma > 0.0) {
+    vec4 n = imageLoad(normal_img, t);
+    float mag = length(n.xyz);
+    if (mag > 1e-4) {
+      v += (-sigma * n.w * n.xyz / mag / mass) * dt;
+    }
+  }
 
   float v_max = 0.4 * h / max(dt, 1e-6);
   float speed = length(v);

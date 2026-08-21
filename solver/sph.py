@@ -4,9 +4,9 @@ Each substep runs as a chain of compute dispatches over GPU-resident particle
 state, with no CPU round-trip except the position read-back that feeds the
 debug point-cloud viz:
 
-    predict (gravity) -> grid keys -> bitonic sort -> cell clear -> cell
-    ranges -> [lambda -> delta -> apply delta] x iterations -> velocity ->
-    XSPH -> finalize (collision + domain clamp)
+    predict (gravity + surface tension) -> grid keys -> bitonic sort ->
+    cell clear -> cell ranges -> [lambda -> delta -> apply delta] x iterations
+    -> velocity -> XSPH -> finalize (collision + domain clamp)
 
 This is Position Based Fluids (Macklin & Muller 2013), not WCSPH: there is no
 pressure force and no equation-of-state stiffness. A particle is predicted
@@ -140,6 +140,11 @@ _IMAGES = (
     # velocities_img: sph_delta's position correction, then later in the same
     # substep sph_xsph's velocity correction.
     ("RGBA32F", "FLOAT_2D", "delta_img"),
+    # xyz = surface-tension color-field gradient (normal), w = curvature. Only
+    # meaningful when surface_tension > 0; sph_normal.glsl still runs every
+    # substep regardless (it's a small fraction of the substep's cost next to
+    # the grid build), so the array is always allocated.
+    ("RGBA32F", "FLOAT_2D", "normal_img"),
     ("RGBA32F", "FLOAT_2D", "keys_img"),
     ("R32F", "FLOAT_2D", "cell_start_img"),
     ("R32F", "FLOAT_2D", "cell_end_img"),
@@ -151,6 +156,7 @@ _IMAGES = (
 # spring, so a handful of Jacobi passes gets close enough without needing to
 # detect convergence on the GPU.
 _PASSES = (
+    "sph_normal",
     "sph_predict",
     "sph_grid_key",
     "sph_sort",
@@ -256,9 +262,7 @@ def _resolve_config(domain):
     config.relaxation = settings.pbf_relaxation
     config.iterations = settings.pbf_iterations
     config.scorr_strength = settings.pbf_scorr_k
-    # Wired up once surface tension lands (sph_normal.glsl / normal_img); 0 is
-    # a no-op in sph_predict.glsl's tension term.
-    config.surface_tension = 0.0
+    config.surface_tension = settings.surface_tension
     config.viscosity = settings.viscosity
     config.max_substeps = settings.max_substeps
 
@@ -358,6 +362,7 @@ def _allocate(config):
         # read predicted_img before sph_predict has ever run.
         "predicted_img": make_texture(config.particle_count, values=positions),
         "delta_img": make_texture(config.particle_count, values=zeros),
+        "normal_img": make_texture(config.particle_count, values=zeros),
         "keys_img": make_texture(config.sorted_count),
         "cell_start_img": make_texture(config.cell_count, channels=1, fmt="R32F"),
         "cell_end_img": make_texture(config.cell_count, channels=1, fmt="R32F"),
@@ -472,6 +477,7 @@ def _build_grid(dt):
 
 def _substep(dt):
     config = _state["config"]
+    dispatch_1d(_bind("sph_normal", dt), config.particle_count, LOCAL_GROUP_SIZE)
     dispatch_1d(_bind("sph_predict", dt), config.particle_count, LOCAL_GROUP_SIZE)
     _build_grid(dt)
     for _ in range(config.iterations):

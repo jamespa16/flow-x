@@ -170,13 +170,14 @@ def config_hash(domain, scene):
     )
     digest.update(
         struct.pack(
-            "<ffffffII",
+            "<fffffffII",
             settings.fluid_level,
             settings.smoothing_radius,
             settings.rest_density,
             settings.pbf_relaxation,
             settings.pbf_scorr_k,
             settings.viscosity,
+            settings.surface_tension,
             settings.max_substeps,
             settings.pbf_iterations,
         )

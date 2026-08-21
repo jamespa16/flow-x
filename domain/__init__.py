@@ -111,6 +111,17 @@ class FlowXDomainSettings(PropertyGroup):
         min=0.0,
         max=1.0,
     )
+    surface_tension: FloatProperty(
+        name="Surface Tension",
+        description=(
+            "Cohesion coefficient for the color-field curvature force that pulls "
+            "particles at the fluid's surface inward, in N/m order-of-magnitude "
+            "units. 0 disables the pass entirely"
+        ),
+        default=0.0,
+        min=0.0,
+        max=10.0,
+    )
     # Phase 6 surface reconstruction. The grid the surface is extracted from is
     # deliberately independent of the solver's, so the look can be refined
     # without disturbing physics that already behaves.
