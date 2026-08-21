@@ -320,6 +320,7 @@ class FLOWX_PT_collider(Panel):
 
         if is_collider:
             layout.label(text=f"Voxels: {occupied_count(obj.name)}")
+            layout.prop(obj.flowx_collider, "is_animated")
 
 
 _classes = (

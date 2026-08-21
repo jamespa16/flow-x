@@ -80,7 +80,10 @@ play, done.
   compile on Blender's Metal backend.
 - **Colliders.** CPU-voxelized into the domain's grid (BVH ray parity) and
   uploaded as a 3D texture the integrate pass samples; rebuilt when a
-  collider's transform or geometry changes.
+  collider's transform or geometry changes. A keyframed collider is tagged
+  with the *Animated Collider* option (Object Properties > Flow-X Collider),
+  which rebuilds its grid every frame from its animation so the fluid tracks
+  its motion.
 - **Surface.** Particles are splatted onto a scalar grid on the GPU, read
   back once per frame, and extracted with a self-contained marching-cubes
   implementation into the `<Domain>.FluidSurface` child mesh.

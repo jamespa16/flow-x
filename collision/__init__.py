@@ -51,6 +51,12 @@ class FlowXColliderSettings(PropertyGroup):
         description="Marks this object as a Flow-X fluid collider",
         default=False,
     )
+    is_animated: BoolProperty(
+        name="Animated Collider",
+        description="Rebuild this collider's voxel grid every frame from its "
+        "animation, so a keyframed collider tracks its motion during playback",
+        default=False,
+    )
 
 
 class FLOWX_OT_toggle_collider(Operator):
@@ -79,6 +85,11 @@ class FLOWX_OT_toggle_collider(Operator):
                     "No Flow-X fluid domain in scene; add one before tagging colliders.",
                 )
                 return {"CANCELLED"}
+            # A keyframed collider needs the per-frame rebuild to track its
+            # motion, so pre-flag it when the object is animated; the user can
+            # still turn it off (e.g. the animation is far outside the shot).
+            if obj.animation_data is not None and obj.animation_data.action is not None:
+                settings.is_animated = True
             _rebuild_grid(domain, obj)
             _warn_collisionless(self, context, domain, obj)
         else:
@@ -175,6 +186,40 @@ def ensure_grids(scene=None):
         grid = _grids.get(obj.name)
         if grid is None or grid.dims != dims:
             _rebuild_grid(domain, obj)
+
+
+def rebuild_animated_grids(scene=None):
+    """Rebuild the voxel grids of colliders flagged as animated, at the current frame.
+
+    An animated collider changes transform through the timeline rather than an
+    object edit, so the depsgraph-update rebuild path does not fire for it on
+    each frame - its grid would freeze at the last interactively-rebuilt
+    shape, and the fluid would collide with a stale collider. The solver calls
+    this once per simulated frame so the fluid collides with the collider as
+    it is on that frame.
+    """
+    scene = scene or bpy.context.scene
+    domain = find_domain(scene)
+    if domain is None:
+        return
+    objs = [
+        obj
+        for obj in scene.objects
+        if obj.type == "MESH"
+        and obj.flowx_collider.is_collider
+        and obj.flowx_collider.is_animated
+    ]
+    if not objs:
+        return
+    # The solver calls this from a frame_change_pre handler, which runs before
+    # the depsgraph has updated the base transforms for the new frame - force
+    # the evaluation so each collider's matrix_world is this frame's transform.
+    try:
+        bpy.context.view_layer.update()
+    except Exception:
+        pass
+    for obj in objs:
+        _rebuild_grid(domain, obj)
 
 
 def _rebuild_solver_grid(domain):

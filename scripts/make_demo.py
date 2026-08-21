@@ -94,6 +94,7 @@ def build_pool_with_ramp():
     ball = bpy.context.active_object
     ball.name = "Ball"
     _tag_collider(ball)
+    ball.flowx_collider.is_animated = True
     ball.keyframe_insert(data_path="location", frame=1)
     ball.location = (0.0, 0.35, 0.45)
     ball.keyframe_insert(data_path="location", frame=45)

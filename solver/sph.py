@@ -52,7 +52,7 @@ from bpy.app.handlers import persistent
 from bpy.types import Operator
 from mathutils import Vector
 
-from ..collision import ensure_grids, get_solver_grid
+from ..collision import ensure_grids, get_solver_grid, rebuild_animated_grids
 from ..domain import find_domain, is_alive, is_degenerate, world_bounds
 from . import cache, surface, viz
 from .gpu_util import (
@@ -692,6 +692,11 @@ def _on_frame_change(scene, _depsgraph):
         # Re-entering the frame the state already represents (a frame_set to
         # the current frame): there is nothing to advance and nothing wrong.
         return
+    # An animated collider's transform changes with the frame, not with an
+    # object edit, so its grid is not rebuilt by the depsgraph path; refresh
+    # it now, at this frame's transform, before re-seeding, a cache load, or
+    # the frame's physics reads it.
+    rebuild_animated_grids(scene)
     if frame <= _state["seed_frame"]:
         if not reseed(scene):
             stop_deferred()
