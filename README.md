@@ -9,7 +9,7 @@ baking, no Python required.
 
 ## Requirements
 
-- **Blender 4.2 LTS or newer** (Flow-X is an [extension](https://docs.blender.org/manual/en/latest/advanced/extensions/addons.html), not a legacy add-on)
+- **Blender 5.2 LTS or newer** (Flow-X is an [extension](https://docs.blender.org/manual/en/latest/advanced/extensions/addons.html), not a legacy add-on)
 - **A GPU** the simulation runs entirely on the GPU through Blender's `gpu`
   compute API (OpenGL / Metal / Vulkan). The surface mesh is extracted on the
   CPU each frame - a bounded cost, but the fastest thing to lower when
@@ -54,9 +54,10 @@ extension on every file save.
 4. **Play.** N-panel > Flow-X > Playback > **Play**.
 
 The solver steps one frame per timeline frame. Scrubbing **forward** steps
-the simulation; scrubbing **back** is impossible without a cache, so the
-solver holds its last frame and says so in the panel - press **Reset** (or
-return to the start frame) to re-seed and run again.
+the simulation. Scrubbing **back** loads the frame from the disk cache when
+[one is enabled](#caching); otherwise the solver holds its last frame and
+says so in the panel - press **Reset** (or return to the start frame) to
+re-seed and run again.
 
 ## Example scenes
 
@@ -85,6 +86,11 @@ play, done.
   implementation into the `<Domain>.FluidSurface` child mesh.
 - **Deterministic.** Seeding uses a fixed RNG seed and the substep size comes
   only from the scene's frame rate, so the same timeline replays identically.
+- **Cache.** With *Cache to Disk* enabled, each frame's positions and
+  velocities are appended to a binary file as the run goes, and a backward
+  scrub loads the frame from it instead of re-simulating. A settings hash and
+  a per-frame fingerprint of every collider's transform validate the file
+  before anything is loaded from it.
 
 ## Performance
 
@@ -99,10 +105,35 @@ most of the work:
 
 If ms/step is above the scene's frame budget, the panel says so.
 
+## Caching
+
+By default Flow-X simulates forward only: scrubbing back through the
+timeline holds the last simulated frame and says so in the panel. The
+Playback panel's **Cache to Disk** option changes that. When enabled, every
+simulated frame's particle state is written to a file as it runs, and
+scrubbing back loads the frame from disk instead of re-simulating. The cache
+also survives Blender restarts, and a forward jump lands directly on a frame
+the cache already holds.
+
+- **Location.** `<scene>.flowx_cache` next to the saved .blend file (the
+  system temp dir until the scene is saved), or any file at *Cache Path*.
+- **Size.** About 0.5 MB per frame at the 16k-particle budget; the panel
+  shows the frames covered and the running file size.
+- **Validity.** The file is keyed by a hash of everything that changes the
+  simulation - solver settings, domain bounds and resolution, collider
+  geometry, frame rate, this extension's version - plus a per-frame
+  fingerprint of each collider's world transform. Change any of those and the
+  next Reset starts a fresh file; until then the stale file warns instead of
+  showing old state and stops growing, so frames simulated under the new
+  settings never mix with the old run.
+- **Clear Cache** deletes the file. A running simulation stops writing until
+  the next Reset.
+
 ## Limitations (MVP)
 
 - One domain per scene.
-- No disk cache: playback is forward-only from the seed frame.
+- The disk cache is off by default; without it, playback is forward-only
+  from the seed frame.
 - The domain is static during a run: moving it mid-run leaves the surface
   mesh offset from the fluid until the next re-seed (Reset, or the playback
   loop). Colliders may move; the domain may not.
@@ -117,6 +148,7 @@ If ms/step is above the scene's frame budget, the panel says so.
 | Symptom | Fix |
 |---|---|
 | "Could not start the SPH solver" warning on Run | No GPU context or a shader compile failure. Run the *GPU Compute Test* from the domain panel to isolate GPU compute from the SPH math. |
+| Scrubbing back holds and warns | Enable *Cache to Disk* in the Playback panel and play forward, or press *Reset*. |
 | Fluid passes through a collider | Check its voxel count in the Object Properties tab: 0 means no faces or no overlap with the domain. Move it in and/or check the mesh is closed. |
 | Surface looks blocky | Raise *Surface Resolution* (cubic cost). |
 | ms/step too high | Raise *Smoothing Radius* (fewer particles) and/or lower *Surface Resolution*. |

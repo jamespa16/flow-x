@@ -1,6 +1,8 @@
 """Collider tagging and CPU-side voxelization (Phase 2)."""
 
+import hashlib
 import math
+import struct
 
 import bpy
 import gpu
@@ -21,6 +23,7 @@ _OVERLAY_COLOR = (1.0, 0.35, 0.1, 0.9)
 _OVERLAY_POINT_SIZE = 4.0
 
 _grids = {}
+_mesh_fingerprints = {}
 _draw_handle = None
 
 # Union of every tagged collider's occupancy, in the same domain-resolution
@@ -80,6 +83,7 @@ class FLOWX_OT_toggle_collider(Operator):
             _warn_collisionless(self, context, domain, obj)
         else:
             _grids.pop(obj.name, None)
+            _mesh_fingerprints.pop(obj.name, None)
             if domain is not None:
                 _rebuild_solver_grid(domain)
 
@@ -123,6 +127,19 @@ def occupied_count(obj_name):
     """Number of occupied voxels in obj_name's collider grid, or 0 if untracked."""
     grid = _grids.get(obj_name)
     return len(grid.points) if grid is not None else 0
+
+
+def mesh_fingerprint(obj_name):
+    """sha256 over a collider's evaluated local-space mesh, or None if untracked.
+
+    Computed at grid build time and stored alongside it, so asking is a dict
+    lookup. Unlike the voxel grid - world-space, and rebuilt on every
+    transform update, including an animated collider's motion each frame -
+    this is transform-invariant: it changes only when the mesh itself is
+    edited, so the disk cache can key collider geometry on it without an
+    animated collider's rigid motion looking like an edit.
+    """
+    return _mesh_fingerprints.get(obj_name)
 
 
 def get_solver_grid():
@@ -228,13 +245,26 @@ def _upload_to_gpu(occupancy, dims):
         return None
 
 
+def _compute_mesh_fingerprint(obj, depsgraph):
+    """sha256 over an object's evaluated mesh in local space (vertices + faces)."""
+    mesh = obj.evaluated_get(depsgraph).data
+    digest = hashlib.sha256()
+    for v in mesh.vertices:
+        digest.update(struct.pack("<3f", *v.co))
+    for p in mesh.polygons:
+        digest.update(struct.pack(f"<{len(p.vertices)}I", *p.vertices))
+    return digest.digest()
+
+
 def _rebuild_grid(domain, obj):
     origin, voxel_size, dims = _domain_grid_geometry(domain)
     if voxel_size <= 0.0:
         _grids.pop(obj.name, None)
+        _mesh_fingerprints.pop(obj.name, None)
         return
 
     depsgraph = bpy.context.evaluated_depsgraph_get()
+    _mesh_fingerprints[obj.name] = _compute_mesh_fingerprint(obj, depsgraph)
     try:
         bvh = BVHTree.FromObject(obj, depsgraph)
     except Exception as exc:
@@ -363,6 +393,7 @@ def unregister():
     if _on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_update)
     _grids.clear()
+    _mesh_fingerprints.clear()
     _solver_grid.update(texture=None, voxel_size=0.0, dims=(1, 1, 1))
     del Object.flowx_collider
     for cls in reversed(_classes):

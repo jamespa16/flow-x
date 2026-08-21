@@ -2,14 +2,14 @@ schema_version = "1.0.0"
 
 id = "flow_x"
 name = "Flow-X"
-version = "0.1.0"
+version = "0.2.0"
 tagline = "GPU-simulated SPH fluids with a live surface mesh"
 maintainer = "James Palmer <james.pa@outlook.com>"
 type = "add-on"
 
 tags = ["Physics"]
 
-blender_version_min = "4.2.0"
+blender_version_min = "5.2.0"
 
 license = [
   "SPDX:MIT",
@@ -18,5 +18,7 @@ license = [
 copyright = ["2026 James Palmer"]
 
 [permissions]
-# No file/network/clipboard access: the demo .blend files ship as sample
-# scenes the user opens, not files the extension reads at runtime.
+# File access is for the optional disk cache: per-frame particle state
+# written next to the .blend (or to a user-chosen path) so the timeline can
+# be scrubbed back without re-simulating. No other permissions are requested.
+files = "Write the optional per-frame disk cache next to the .blend file, so the timeline can be scrubbed back without re-simulating"
