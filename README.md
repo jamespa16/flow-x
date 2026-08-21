@@ -1,11 +1,11 @@
 # Flow-X
 
-GPU-simulated SPH fluids for Blender, rendered as a live liquid surface mesh.
+GPU-simulated PBF fluids for Blender, rendered as a live liquid surface mesh.
 
 Add a fluid domain, set a fill level, tag a few colliders, and hit play: a
-weakly-compressible SPH (WCSPH) fluid falls, splashes, and settles on the
-GPU, with a marching-cubes surface extracted every frame - no Mantaflow, no
-baking, no Python required.
+Position Based Fluids (PBF) simulation, with surface tension, falls,
+splashes, and settles on the GPU, with a marching-cubes surface extracted
+every frame - no Mantaflow, no baking, no Python required.
 
 ## Requirements
 
@@ -71,15 +71,19 @@ play, done.
 
 ## How it works (short version)
 
-- **Solver.** WCSPH: density, Tait pressure, pressure+viscosity forces, and
-  semi-implicit integration run as GPU compute dispatches, with substeps
-  sized by a CFL limit (so a stiff setup degrades to slow motion instead of
-  exploding).
-- **Neighbors.** A uniform grid rebuilt every substep; particles are bucketed
-  with a bitonic sort rather than a counting sort because image atomics don't
-  compile on Blender's Metal backend.
+- **Solver.** Position Based Fluids: a particle predicts forward under
+  gravity and a surface-tension cohesion force, then a fixed number of
+  Jacobi constraint-solve iterations project it onto a density constraint,
+  and its velocity is derived from how far that projection actually moved
+  it - unconditionally stable for the constraint itself, so substeps are
+  sized by a free-fall/diffusion limit rather than a stiffness-driven CFL
+  limit.
+- **Neighbors.** A uniform grid rebuilt once per substep (not per constraint
+  iteration); particles are bucketed with a bitonic sort rather than a
+  counting sort because image atomics don't compile on Blender's Metal
+  backend.
 - **Colliders.** CPU-voxelized into the domain's grid (BVH ray parity) and
-  uploaded as a 3D texture the integrate pass samples; rebuilt when a
+  uploaded as a 3D texture the finalize pass samples; rebuilt when a
   collider's transform or geometry changes. A keyframed collider is tagged
   with the *Animated Collider* option (Object Properties > Flow-X Collider),
   which rebuilds its grid every frame from its animation so the fluid tracks
