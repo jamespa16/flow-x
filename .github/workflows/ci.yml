@@ -5,11 +5,6 @@ on:
     branches: [main]
   pull_request:
 
-# Pinned to the LTS the dev machines run. blender-downloader resolves it to
-# the official linux-x64 tarball (https://download.blender.org/release/).
-env:
-  BLENDER_VERSION: "5.2.0"
-
 jobs:
   lint:
     runs-on: ubuntu-latest
@@ -23,52 +18,7 @@ jobs:
       - run: black --check .
 
       # The marching cubes module has no Blender imports, so its tests run
-      # here rather than in the smoke-test job's Blender session.
+      # here. The full Blender smoke test is deliberately not run on every
+      # push: it needs a Blender download and is the job of release.yml,
+      # which runs it on tag pushes and via workflow_dispatch.
       - run: python3 scripts/test_marching_cubes.py
-
-  smoke-test:
-    # Runs on the free hosted runner: blender-downloader fetches the pinned
-    # Blender build. Headless gpu.init() may or may not get a GL context
-    # (Mesa llvmpipe on Linux, Metal on macOS runners); when it does, the
-    # full solver, surface and demo-replay checks run on CPU. When it
-    # doesn't, the smoke test degrades to install/enable/dispatch checks.
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-      - run: pip install blender-downloader
-
-      - name: Cache the extracted Blender build
-        id: blender-cache
-        uses: actions/cache@v4
-        with:
-          path: ${{ runner.temp }}/blender-${{ env.BLENDER_VERSION }}
-          key: blender-${{ env.BLENDER_VERSION }}-linux-x64
-
-      - name: Download and extract Blender ${{ env.BLENDER_VERSION }}
-        if: steps.blender-cache.outputs.cache-hit != 'true'
-        run: |
-          # blender-downloader stats the output dir before creating it.
-          mkdir -p "${{ runner.temp }}/blender-${BLENDER_VERSION}"
-          blender-downloader "$BLENDER_VERSION" -q --extract --remove-compressed \
-            -d "${{ runner.temp }}/blender-${BLENDER_VERSION}"
-      - name: Put blender on PATH
-        run: |
-          echo "${{ runner.temp }}/blender-${BLENDER_VERSION}/blender-${BLENDER_VERSION}-linux-x64" >> "$GITHUB_PATH"
-          blender --version | head -1
-
-      # BLENDER_USER_RESOURCES points both steps at a throwaway config dir,
-      # which also makes dev_link.py's --blender-version argument moot.
-      # (The runner context is only available in step-level env, not the
-      # job level, so it lives on each step rather than the job.)
-      - name: Symlink extension into a throwaway Blender config dir
-        env:
-          BLENDER_USER_RESOURCES: ${{ runner.temp }}/blender-config
-        run: python3 scripts/dev_link.py
-
-      - name: Run headless smoke test
-        env:
-          BLENDER_USER_RESOURCES: ${{ runner.temp }}/blender-config
-        run: blender --background --python scripts/smoke_test.py

@@ -6,7 +6,8 @@ on:
       - "v*"
   workflow_dispatch:
 
-# Pinned to the LTS the dev machines run; must match ci.yml.
+# Pinned to the LTS the dev machines run. blender-downloader resolves it to
+# the official linux-x64 tarball (https://download.blender.org/release/).
 env:
   BLENDER_VERSION: "5.2.0"
 
@@ -14,6 +15,8 @@ jobs:
   package-and-publish:
     # Free hosted runner: blender-downloader fetches the pinned Blender
     # build, which is used to verify the packaged zip before publishing.
+    # Tag pushes publish the resulting release; manual workflow_dispatch
+    # runs are verification only (no release is created for a branch).
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,6 +24,16 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install blender-downloader
+
+      # The hosted image lacks the EGL/GL runtime: Blender dlopens libEGL
+      # at startup and aborts without it. libgl1-mesa-dri provides
+      # llvmpipe, which is what lets headless gpu.init() get a software
+      # GL context so the full solver path runs on the CPU-only runner.
+      - name: Install Blender's EGL/GL runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgles2 libgl1 libglx-mesa0 libgl1-mesa-dri
 
       - name: Cache the extracted Blender build
         id: blender-cache
@@ -55,6 +68,7 @@ jobs:
           blender --background --python scripts/smoke_test.py
 
       - name: Create the GitHub release with the zip
+        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
