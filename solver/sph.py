@@ -444,7 +444,7 @@ def _step(frame_dt, frame):
         positions = read_texture(_state["textures"]["positions_img"], config.particle_count)
     if cache.is_open():
         velocities = read_texture(_state["textures"]["velocities_img"], config.particle_count)
-        cache.write_frame(frame, positions, velocities)
+        cache.write_frame(frame, positions, velocities, _state["domain"])
 
     _update_surface(dt)
     _update_viz(positions)
@@ -625,6 +625,23 @@ def _apply_cached(positions, velocities, frame):
     viz.tag_viewports_redraw()
 
 
+def _load_cached(frame, scene, domain):
+    """Try to load a cached frame, closing the cache when it goes stale.
+
+    A file whose config hash, collider set or fingerprint walk no longer
+    matches the scene is stale for this run: it must stop serving loads and,
+    just as important, stop growing - frames simulated under the new state
+    must not be appended under the old header. The next Reset re-opens a
+    file that matches.
+    """
+    loaded = cache.try_load(frame, scene, domain)
+    if loaded is not None:
+        return loaded
+    if cache.warning() is not None:
+        cache.close()
+    return None
+
+
 def _pick_up_cache_end(scene, domain, frame):
     """Load the cache's furthest frame when it lies between here and `frame`.
 
@@ -638,7 +655,7 @@ def _pick_up_cache_end(scene, domain, frame):
     end = header["last_frame"]
     if not _state["last_frame"] < end < frame:
         return False
-    loaded = cache.try_load(end, scene, domain)
+    loaded = _load_cached(end, scene, domain)
     if loaded is None:
         return False
     _apply_cached(*loaded, end)
@@ -682,7 +699,7 @@ def _on_frame_change(scene, _depsgraph):
         viz.tag_viewports_redraw()
         return
 
-    loaded = cache.try_load(frame, scene, domain)
+    loaded = _load_cached(frame, scene, domain)
     if loaded is not None:
         _apply_cached(*loaded, frame)
         return
@@ -708,7 +725,11 @@ def _on_frame_change(scene, _depsgraph):
             )
             pending = MAX_CATCHUP_FRAMES
     else:
-        _state["warning"] = None
+        # Per-frame playback warnings clear when a frame is simulated, but a
+        # stale cache's explanation outlives the step until a Reset re-opens
+        # a matching file - a closed cache keeps it, an open or disabled one
+        # holds none.
+        _state["warning"] = None if cache.is_open() else cache.warning()
 
     frame_dt = _frame_dt(scene)
     target = _state["last_frame"] + pending

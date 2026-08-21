@@ -242,11 +242,31 @@ def _check_cache(sph):
     if positions() != loaded:
         raise RuntimeError("loading the same cached frame twice did not round-trip exactly")
 
-    # A settings change moves the config hash: re-seed starts a fresh file.
+    # A settings change moves the config hash. Until the next Reset the old
+    # file is stale: the first load attempt must close it - and frames
+    # simulated under the new state must not be appended under the old
+    # header.
     old_hash = cache.config_hash(domain, scene)
     settings.fluid_level = 75.0
     if cache.config_hash(domain, scene) == old_hash:
         raise RuntimeError("changing the fluid level did not change the config hash")
+    # The solver sits at start + 2 and the file holds start + 2..start + 3,
+    # so this lands inside the covered range and forces a (rejected) load.
+    scene.frame_set(start + 3)
+    info = cache.info()
+    if info["open"]:
+        raise RuntimeError("a stale cache must close when its hash no longer matches")
+    if not info["warning"]:
+        raise RuntimeError("a stale cache should leave its warning in the panel")
+    stale = cache._read_existing_header(path)
+    if stale is None or stale["last_frame"] != start + 3:
+        got = stale["last_frame"] if stale is not None else "no file"
+        raise RuntimeError(
+            f"the stale file must not grow under the new settings "
+            f"(last frame {got}, expected {start + 3})"
+        )
+
+    # The next Reset starts a fresh file.
     result = _get_operator("flowx.sph_reset")()
     if "FINISHED" not in result:
         raise RuntimeError(f"flowx.sph_reset after a settings change returned {result}")

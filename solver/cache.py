@@ -300,11 +300,14 @@ def open(scene, domain, particle_count):
         )
 
 
-def write_frame(frame, positions, velocities):
+def write_frame(frame, positions, velocities, domain):
     """Append one simulated frame (per-item 4-tuples, as read_texture returns).
 
     A no-op while the cache is closed; a failure closes the cache and records
-    a panel warning rather than interrupting the run.
+    a panel warning rather than interrupting the run. The config hash is
+    re-checked on every write, not trusted from the open: a settings edit
+    made after the last re-seed must not land in a file opened under the old
+    settings, whether or not a load was attempted in between.
     """
     file = _state["file"]
     header = _state["header"]
@@ -320,6 +323,12 @@ def write_frame(frame, positions, velocities):
         _fail("particle count changed - the cache file no longer matches the run")
         return
     if frame <= header["seed_frame"]:
+        return
+    if config_hash(domain, scene) != header["config_hash"]:
+        _fail(
+            "the simulation settings changed - the cache file no longer matches; "
+            "Reset re-opens a fresh one"
+        )
         return
     try:
         offset = header["header_size"] + (frame - header["seed_frame"] - 1) * header["frame_size"]

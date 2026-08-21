@@ -123,8 +123,9 @@ the cache already holds.
   simulation - solver settings, domain bounds and resolution, collider
   geometry, frame rate, this extension's version - plus a per-frame
   fingerprint of each collider's world transform. Change any of those and the
-  next Reset starts a fresh file; scrubbing into a file that no longer
-  matches the scene warns instead of showing stale state.
+  next Reset starts a fresh file; until then the stale file warns instead of
+  showing old state and stops growing, so frames simulated under the new
+  settings never mix with the old run.
 - **Clear Cache** deletes the file. A running simulation stops writing until
   the next Reset.
 
