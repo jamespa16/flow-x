@@ -7,9 +7,9 @@ without Blender:
 
     python3 scripts/package.py [source_dir] [out_dir]
 
-Defaults: source_dir = the repo root, out_dir = <repo>/dist. VCS metadata
-and dev junk are excluded; the demo .blend files are included on purpose -
-they ship with the release.
+Defaults: source_dir = the repo root, out_dir = <repo>/dist. VCS metadata,
+dev tooling (scripts/, lint config) and other dev junk are excluded; the
+demo .blend files are included on purpose - they ship with the release.
 """
 
 import os
@@ -20,8 +20,17 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-EXCLUDE_DIRS = {".git", ".github", ".qwen", "__pycache__", ".ruff_cache", ".venv", "dist"}
-EXCLUDE_FILES = {".DS_Store"}
+EXCLUDE_DIRS = {
+    ".git",
+    ".github",
+    ".qwen",
+    "__pycache__",
+    ".ruff_cache",
+    ".venv",
+    "dist",
+    "scripts",
+}
+EXCLUDE_FILES = {".DS_Store", ".gitignore", ".gitkeep", "pyproject.toml", "requirements-dev.txt"}
 EXCLUDE_SUFFIXES = {".pyc", ".blend1", ".blend2"}
 
 

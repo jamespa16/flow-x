@@ -93,10 +93,10 @@ class FLOWX_PT_domain(Panel):
 
         smoke_running = gpu_test.is_running()
         box = layout.box()
-        box.label(text="GPU Compute (Phase 3 smoke test)")
+        box.label(text="GPU Compute Test")
         box.operator(
             FLOWX_OT_solver_gpu_test_toggle.bl_idname,
-            text="Stop Smoke Test" if smoke_running else "Run Smoke Test",
+            text="Stop Compute Test" if smoke_running else "Run Compute Test",
             icon="PAUSE" if smoke_running else "PLAY",
             depress=smoke_running,
         )

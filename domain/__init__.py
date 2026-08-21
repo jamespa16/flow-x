@@ -245,6 +245,9 @@ class FLOWX_OT_domain_add(Operator):
         mesh = bpy.data.meshes.new("FluidDomain")
         verts = [(x * size.x / 2, y * size.y / 2, z * size.z / 2) for x, y, z in _CUBE_VERTS]
         mesh.from_pydata(verts, [], _CUBE_FACES)
+        # _CUBE_FACES winds every quad inward; flip so the domain's normals
+        # point outward like a normal mesh.
+        mesh.flip_normals()
         mesh.update()
 
         obj = bpy.data.objects.new("FluidDomain", mesh)

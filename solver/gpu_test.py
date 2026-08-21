@@ -133,10 +133,10 @@ def is_running():
 
 
 class FLOWX_OT_solver_gpu_test_toggle(Operator):
-    """Toggle the Phase 3 GPU compute round-trip smoke test (gravity only, point-cloud viz)"""
+    """Gravity-only compute round-trip test: isolates GPU compute from the SPH solver"""
 
     bl_idname = "flowx.solver_gpu_test_toggle"
-    bl_label = "Toggle GPU Compute Smoke Test"
+    bl_label = "Toggle GPU Compute Test"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod

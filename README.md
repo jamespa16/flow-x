@@ -116,7 +116,7 @@ If ms/step is above the scene's frame budget, the panel says so.
 
 | Symptom | Fix |
 |---|---|
-| "Could not start the SPH solver" warning on Run | No GPU context or a shader compile failure. Run the *GPU Compute* smoke test from the domain panel to isolate GPU compute from the SPH math. |
+| "Could not start the SPH solver" warning on Run | No GPU context or a shader compile failure. Run the *GPU Compute Test* from the domain panel to isolate GPU compute from the SPH math. |
 | Fluid passes through a collider | Check its voxel count in the Object Properties tab: 0 means no faces or no overlap with the domain. Move it in and/or check the mesh is closed. |
 | Surface looks blocky | Raise *Surface Resolution* (cubic cost). |
 | ms/step too high | Raise *Smoothing Radius* (fewer particles) and/or lower *Surface Resolution*. |

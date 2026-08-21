@@ -666,7 +666,11 @@ class FLOWX_OT_sph_toggle(Operator):
 
     bl_idname = "flowx.sph_toggle"
     bl_label = "Toggle SPH Simulation"
-    bl_options = {"REGISTER", "UNDO"}
+    # Deliberately not UNDO: the run's state is GPU-side and not part of
+    # Blender's undo stack, so undoing only the scene delta (the surface
+    # object) would leave a simulation that is still running but no longer
+    # visible. Stopping the run is its own undo.
+    bl_options = {"REGISTER"}
 
     @classmethod
     def poll(cls, context):
@@ -715,7 +719,9 @@ class FLOWX_OT_sph_reset(Operator):
 
     bl_idname = "flowx.sph_reset"
     bl_label = "Reset Simulation"
-    bl_options = {"REGISTER", "UNDO"}
+    # Not UNDO either: a re-seed discards the previous GPU state, which no
+    # undo of the scene-side mesh rebuild could bring back.
+    bl_options = {"REGISTER"}
 
     @classmethod
     def poll(cls, context):
