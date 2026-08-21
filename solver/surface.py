@@ -213,9 +213,12 @@ def update(config, textures, constants, collider):
     # Same block, but the kernel radius is the surface grid's, not the solver's.
     values["f_sph"] = (surface.kernel_radius, *constants["f_sph"][1:])
     # The grid starts one kernel radius before the domain's low corner (see
-    # resolve); the shader must splat from that true origin or the bled density
-    # at the walls is sampled from the wrong cells and the surface clips open.
-    values["f_lo"] = (surface.lo.x, surface.lo.y, surface.lo.z, constants["f_lo"][3])
+    # resolve), so the splat samples from that corner, carried in the slot the
+    # SPH passes use for the domain max / particle radius. f_lo must stay the
+    # domain origin: the shared prelude's cell_coord() and collider_coord()
+    # locate every sample through it, and shifting it by the margin would
+    # carve colliders and gather neighbours from the wrong cells.
+    values["f_hi"] = (surface.lo.x, surface.lo.y, surface.lo.z, 0.0)
 
     shader.bind()
     bind_push_constants(shader, values)
@@ -248,10 +251,14 @@ def _surface_object(domain):
     if obj is None or obj.type != "MESH":
         obj = bpy.data.objects.new(name, bpy.data.meshes.new(name))
         obj.parent = domain
-        # Extraction emits world-space vertices, so the parent's transform has
-        # to be cancelled out or it would be applied to them a second time.
-        obj.matrix_parent_inverse = domain.matrix_world.inverted()
         obj.data.materials.append(_water_material())
+
+    # Extraction emits world-space vertices, so the parent's transform has
+    # to be cancelled out or it would be applied to them a second time. This
+    # runs on every re-seed, not just creation, so a domain moved mid-run is
+    # re-anchored on the next Reset / playback loop instead of keeping the
+    # mesh where it used to be.
+    obj.matrix_parent_inverse = domain.matrix_world.inverted()
 
     collection = domain.users_collection[0] if domain.users_collection else None
     if collection is None:

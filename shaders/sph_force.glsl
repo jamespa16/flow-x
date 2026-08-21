@@ -71,7 +71,16 @@ void main()
           vec2 dj = imageLoad(density_img, tj).xy;
           vec3 vj = imageLoad(velocities_img, tj).xyz;
 
-          /* w_spiky_grad already carries the kernel's negative sign, so the
+          /* Deliberate non-textbook form: (pi + pj) / (2 * rho_j) rather than
+           * the momentum-conserving (pi/rho_i^2 + pj/rho_j^2). For a
+           * near-incompressible fluid rho_i ~= rho_j, so the two agree to
+           * within the compression noise this solver tolerates; this form is
+           * symmetric and reads one fewer density slot. The stability it does
+           * not give on its own comes from the XSPH term below, and the
+           * effective stiffness is absorbed into the `stiffness` parameter -
+           * don't "fix" this without re-tuning those.
+           *
+           * w_spiky_grad already carries the kernel's negative sign, so the
            * leading minus of the pressure-force term leaves a repulsion along
            * (pi - pj) whenever both pressures are positive. */
           f_pressure += -mass * (pressure_i + dj.y) / (2.0 * dj.x) *

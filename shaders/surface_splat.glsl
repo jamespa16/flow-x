@@ -17,6 +17,11 @@
  *               grids so a surface grid coarser than the fluid still gets a
  *               smooth field, and clamps it so the fixed cell search below
  *               stays exhaustive.
+ *   f_hi.xyz  = the surface grid's low corner (domain lo - kernel margin), in
+ *               the slot the SPH passes use for the domain max. This pass
+ *               never reads f_hi, and f_lo.xyz stays the domain origin: the
+ *               prelude's cell_coord() and collider_coord() locate samples
+ *               against the domain's spatial hash and collider grid through it.
  */
 
 /* The spatial hash's cells are at least one solver smoothing radius across, so
@@ -35,9 +40,11 @@ void main()
   ivec3 g = ivec3(s % samples.x, (s / samples.x) % samples.y, s / (samples.x * samples.y));
   float spacing = intBitsToFloat(i_surface.w);
 
-  /* Samples sit on lattice points starting at the domain's low corner, so the
-   * marching cubes cells between them tile the domain exactly. */
-  vec3 p = f_lo.xyz + vec3(g) * spacing;
+  /* Samples sit on lattice points starting at the surface grid's low corner
+   * (f_hi.xyz, one kernel radius before the domain's low corner), so the
+   * marching cubes cells between them tile the domain - and the kernel's
+   * bled support past every wall - exactly. */
+  vec3 p = f_hi.xyz + vec3(g) * spacing;
 
   float h = f_sph.x;
   float h2 = h * h;

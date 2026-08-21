@@ -103,6 +103,9 @@ If ms/step is above the scene's frame budget, the panel says so.
 
 - One domain per scene.
 - No disk cache: playback is forward-only from the seed frame.
+- The domain is static during a run: moving it mid-run leaves the surface
+  mesh offset from the fluid until the next re-seed (Reset, or the playback
+  loop). Colliders may move; the domain may not.
 - Colliders are static or simply-animated rigid meshes; no deforming/skinned
   colliders. Zero-face or out-of-domain colliders are tagged but warn.
 - A domain scaled to zero volume is refused, not simulated.

@@ -109,6 +109,15 @@ class FlowXDomainSettings(PropertyGroup):
         ),
         default=False,
     )
+    show_collider_overlay: BoolProperty(
+        name="Collider Overlay",
+        description=(
+            "Draw the tagged colliders' voxel grids as a point overlay. One point "
+            "per occupied voxel, so a domain-filling collider at high resolution is "
+            "tens of thousands of points every viewport frame"
+        ),
+        default=True,
+    )
     surface_resolution: IntProperty(
         name="Surface Resolution",
         description=(

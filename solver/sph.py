@@ -11,8 +11,10 @@ The sort is where this departs from the textbook GPU build. A counting sort
 needs ``imageAtomicAdd``, and image atomics do not compile on Blender's Metal
 backend, so the (cell key, particle index) pairs go through a bitonic sort
 instead - pure compare-exchange, no atomics, O(log^2 n) host-driven passes.
-Dispatch overhead measured at ~13 us, so the extra passes cost single-digit
-milliseconds per frame rather than anything structural.
+Dispatch overhead measured at ~13 us each, and with ~105 compare-exchange
+dispatches per substep the sort is the dominant per-step cost: single-digit
+milliseconds per substep, tens of milliseconds per frame at the default
+substep count (the panel's ms/step readout is where it lands).
 
 The integrate pass also does Phase 5's collision response: it samples the
 collider occupancy grid built in ``collision`` and pushes a particle out to

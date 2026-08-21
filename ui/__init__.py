@@ -12,6 +12,7 @@ from ..solver import (
     FLOWX_OT_sph_toggle,
     gpu_test,
     sph,
+    surface,
 )
 
 
@@ -85,6 +86,10 @@ class FLOWX_PT_domain(Panel):
         col = box.column(align=True)
         col.label(text=f"Min: ({lo.x:.2f}, {lo.y:.2f}, {lo.z:.2f})")
         col.label(text=f"Max: ({hi.x:.2f}, {hi.y:.2f}, {hi.z:.2f})")
+
+        box = layout.box()
+        box.label(text="Debug Overlays")
+        box.prop(settings, "show_collider_overlay")
 
         smoke_running = gpu_test.is_running()
         box = layout.box()
@@ -269,7 +274,12 @@ class FLOWX_PT_collider(Panel):
     @classmethod
     def poll(cls, context):
         obj = context.active_object
-        return obj is not None and obj.type == "MESH" and not obj.flowx_domain.is_domain
+        if obj is None or obj.type != "MESH" or obj.flowx_domain.is_domain:
+            return False
+        # The auto-generated '<Domain>.FluidSurface' child is not a collider
+        # candidate: it is the fluid's own surface, and tagging it would carve
+        # the fluid out of itself.
+        return not obj.name.endswith(surface.SURFACE_SUFFIX)
 
     def draw(self, context):
         layout = self.layout

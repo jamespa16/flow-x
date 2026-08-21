@@ -253,7 +253,20 @@ def _rebuild_grid(domain, obj):
     # ray to a ray, so the inside/outside parity of the hit count is exact.
     # (Skipping this is why a collider not sitting at the origin voxelized
     # to nothing: its world-space centers all landed outside the local tree.)
-    inv_matrix = obj.matrix_world.inverted()
+    try:
+        inv_matrix = obj.matrix_world.inverted()
+    except ValueError:
+        # A singular transform (an axis scaled to zero) has no inverse, and
+        # Blender raises on it rather than returning garbage. The mesh
+        # voxelizes to nothing, like one with no faces, and keeps its tag in
+        # case it is scaled back up - which re-triggers this rebuild.
+        print(
+            f"[flow-x] Cannot voxelize '{obj.name}': its transform is singular "
+            "(an axis is scaled to zero)."
+        )
+        _grids.pop(obj.name, None)
+        _rebuild_solver_grid(domain)
+        return
     direction = (inv_matrix.to_3x3() @ Vector((0.0, 0.0, 1.0))).normalized()
 
     obj_lo, obj_hi = world_bounds(obj)
@@ -304,6 +317,12 @@ def _on_depsgraph_update(scene, depsgraph):
 
 
 def _draw_collider_grids():
+    # The overlay's on/off is a domain setting: the grids exist in the
+    # domain's space, and the domain panel is where the user tunes the run.
+    # (Draw handlers only fire with a live viewport, so the context is valid.)
+    domain = find_domain(bpy.context.scene)
+    if domain is None or not domain.flowx_domain.show_collider_overlay:
+        return
     if not _grids:
         return
     shader = gpu.shader.from_builtin("UNIFORM_COLOR")

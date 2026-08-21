@@ -15,6 +15,8 @@ import sys
 from pathlib import Path
 
 import bpy
+from mathutils import Vector
+from mathutils.bvhtree import BVHTree
 
 ADDON_MODULE = "bl_ext.user_default.flow_x"
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -226,19 +228,117 @@ def _check_surface(sph, stats):
     if not mesh.materials:
         raise RuntimeError(f"{name} was built without a material")
 
-    lo, hi = sys.modules[ADDON_MODULE].domain.world_bounds(domain)
+    mod = sys.modules[ADDON_MODULE]
+    lo, hi = mod.domain.world_bounds(domain)
     matrix = obj.matrix_world
     tolerance = surface_stats["spacing"] * 2.0
-    for vertex in mesh.vertices:
-        point = matrix @ vertex.co
+    points = [matrix @ vertex.co for vertex in mesh.vertices]
+    for point in points:
         for axis in range(3):
             if not (lo[axis] - tolerance <= point[axis] <= hi[axis] + tolerance):
                 raise RuntimeError(f"surface vertex {tuple(point)} lies outside the domain")
+
+    _check_surface_collider_penetration(points, surface_stats["spacing"])
 
     print(
         f"[smoke_test] surface mesh: {len(mesh.vertices)} verts, "
         f"{len(mesh.polygons)} faces from {surface_stats['samples']} samples"
     )
+
+
+_AXIS_DIRECTIONS = (
+    (1, 0, 0),
+    (-1, 0, 0),
+    (0, 1, 0),
+    (0, -1, 0),
+    (0, 0, 1),
+    (0, 0, -1),
+)
+
+
+def _collider_bvh(obj, depsgraph):
+    """A world-space BVH of the collider's evaluated mesh.
+
+    BVHTree.FromObject builds in the object's *local* space (which is why the
+    voxelizer in collision transforms its query rays), and local distances
+    are not world distances under non-uniform scale. This test runs in world
+    space, so it builds the tree from the world-space polygons instead.
+    """
+    eval_obj = obj.evaluated_get(depsgraph)
+    mesh = eval_obj.to_mesh()
+    try:
+        verts = [eval_obj.matrix_world @ vert.co for vert in mesh.vertices]
+        # Materialized, not the lazy RNA proxies: to_mesh_clear() frees the
+        # mesh before FromPolygons would iterate them.
+        faces = [tuple(poly.vertices) for poly in mesh.polygons]
+    finally:
+        eval_obj.to_mesh_clear()
+    return BVHTree.FromPolygons(verts, faces)
+
+
+def _first_hit_parity(bvh, point, direction, max_bounces=8):
+    """(first hit distance or None, hit-count parity) for a ray from `point`.
+
+    Walks the hit chain like the voxelizer's inside/outside test
+    (collision._point_inside), so a closed collider reads as odd from inside
+    and even from outside.
+    """
+    origin = point
+    first = None
+    count = 0
+    for _ in range(max_bounces):
+        hit, _normal, _index, dist = bvh.ray_cast(origin, direction)
+        if hit is None:
+            break
+        if first is None:
+            first = dist
+        count += 1
+        origin = hit + direction * 1e-4
+    return first, count % 2
+
+
+def _check_surface_collider_penetration(points, spacing):
+    """No surface vertex may sit deep inside a collider's mesh.
+
+    The splat carves the collider's occupied voxels out of the field, so the
+    extracted surface pools against a collider rather than bleeding into it.
+    A vertex deeper inside than the carve's own discretization - the surface
+    sample spacing and the collider voxel size - means the carve sampled the
+    occupancy grid from the wrong origin (e.g. the surface grid's corner
+    instead of the domain's), shifting the carve by the kernel margin.
+
+    The test runs against the collider's actual mesh, not its world AABB: a
+    tilted collider's AABB is full of space where fluid legitimately rests on
+    its faces. A vertex is exempt while it is within one grid step of the
+    surface, because marching cubes interpolates the iso-crossing between a
+    zeroed and a live sample (which can land it up to a spacing inside the
+    face) and the voxel carve is stair-stepped by a voxel.
+    """
+    mod = sys.modules[ADDON_MODULE]
+    scene = bpy.context.scene
+    shrink = max(spacing, mod.collision.get_solver_grid()[1])
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    for obj in scene.objects:
+        if obj.type != "MESH" or not obj.flowx_collider.is_collider:
+            continue
+        bvh = _collider_bvh(obj, depsgraph)
+        c_lo, c_hi = mod.domain.world_bounds(obj)
+        for point in points:
+            if not (
+                c_lo.x < point.x < c_hi.x
+                and c_lo.y < point.y < c_hi.y
+                and c_lo.z < point.z < c_hi.z
+            ):
+                continue
+            results = [_first_hit_parity(bvh, point, Vector(d)) for d in _AXIS_DIRECTIONS]
+            if not any(parity for _first, parity in results):
+                continue
+            firsts = [first for first, _parity in results if first is not None]
+            if firsts and min(firsts) >= shrink:
+                raise RuntimeError(
+                    f"surface vertex {tuple(point)} lies deeper than {shrink:.3f} m "
+                    f"inside collider '{obj.name}' - the collider carve sampled the wrong origin"
+                )
 
 
 def _install_packaged_zip():
