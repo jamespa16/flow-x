@@ -369,14 +369,37 @@ def _allocate(config):
     }
 
 
+def _images_for_pass(body):
+    """The subset of _IMAGES a pass's own source actually reads or writes.
+
+    OpenGL dead-code-eliminates image slots a compiled pass never touches,
+    but Metal keeps every slot GPUShaderCreateInfo.image() declares - and
+    caps read-write textures at 8 per shader. Declaring the full 10-image
+    _IMAGES set (positions/velocities/lambda/predicted/delta/normal/keys/
+    cell_start/cell_end/collider) on every pass compiles fine on OpenGL and
+    fails on Metal.
+
+    collider_img always stays in: sph_common.glsl's collider_occupied() /
+    collider_coord() / collider_in_bounds() reference it by name, and that
+    prelude is concatenated onto every pass whether or not the pass itself
+    calls those functions - an image identifier a shader's source mentions
+    at all must be declared, dead-code elimination happens after linking,
+    not before. No pass reads more than 6 of the rest, so 6 + collider_img
+    stays under the 8-texture cap everywhere.
+    """
+    used = {name for _fmt, _type, name in _IMAGES if name != "collider_img" and name in body}
+    used.add("collider_img")
+    return tuple(image for image in _IMAGES if image[2] in used)
+
+
 def _compile_passes():
     prelude = shader_source("sph_common")
-    shaders = {
-        name: build_compute_shader(
-            [prelude, shader_source(name)], _IMAGES, _PUSH_CONSTANTS, LOCAL_GROUP_SIZE
+    shaders = {}
+    for name in _PASSES:
+        body = shader_source(name)
+        shaders[name] = build_compute_shader(
+            [prelude, body], _images_for_pass(body), _PUSH_CONSTANTS, LOCAL_GROUP_SIZE
         )
-        for name in _PASSES
-    }
     # The absent-slot sets only describe this particular compile.
     _state["missing"] = {name: set() for name in _PASSES}
     return shaders
