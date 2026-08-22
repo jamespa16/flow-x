@@ -33,6 +33,22 @@ _draw_handle = None
 _solver_grid = {"texture": None, "voxel_size": 0.0, "dims": (1, 1, 1)}
 
 
+def _reset_state():
+    """Drop all in-memory collider state.
+
+    The grids, fingerprints and solver grid are keyed by object name and hold
+    no reference to the scene, so they outlive the file they were built for.
+    Opening a new .blend does not re-run register(), so without this the
+    previous file's colliders would carry into the new one - and, because the
+    keys are names, a same-named object in the new file would inherit a
+    collider it was never tagged with. Called from the load_post handler and
+    from unregister.
+    """
+    _grids.clear()
+    _mesh_fingerprints.clear()
+    _solver_grid.update(texture=None, voxel_size=0.0, dims=(1, 1, 1))
+
+
 class ColliderGrid:
     """Voxelized occupancy for one collider, sized to the domain's grid."""
 
@@ -171,7 +187,10 @@ def ensure_grids(scene=None):
     colliders come back with their tag but no grid until one of them next
     changes transform or geometry. The solver would then sample an empty
     collider grid and the fluid would pass straight through, so this is
-    called at solver start to reconcile tags with grids.
+    called at solver start to reconcile tags with grids - in both
+    directions: it builds the missing grids and drops the stale ones (for
+    objects that were deleted or untagged), so the solver never samples a
+    collider that is no longer tagged in this scene.
     """
     scene = scene or bpy.context.scene
     domain = find_domain(scene)
@@ -180,9 +199,15 @@ def ensure_grids(scene=None):
     origin, voxel_size, dims = _domain_grid_geometry(domain)
     if voxel_size <= 0.0:
         return
-    for obj in scene.objects:
-        if obj.type != "MESH" or not obj.flowx_collider.is_collider:
-            continue
+    tagged = [obj for obj in scene.objects if obj.type == "MESH" and obj.flowx_collider.is_collider]
+    tagged_names = {obj.name for obj in tagged}
+    stale = [name for name in _grids if name not in tagged_names]
+    for name in stale:
+        _grids.pop(name, None)
+        _mesh_fingerprints.pop(name, None)
+    if stale:
+        _rebuild_solver_grid(domain)
+    for obj in tagged:
         grid = _grids.get(obj.name)
         if grid is None or grid.dims != dims:
             _rebuild_grid(domain, obj)
@@ -205,9 +230,7 @@ def rebuild_animated_grids(scene=None):
     objs = [
         obj
         for obj in scene.objects
-        if obj.type == "MESH"
-        and obj.flowx_collider.is_collider
-        and obj.flowx_collider.is_animated
+        if obj.type == "MESH" and obj.flowx_collider.is_collider and obj.flowx_collider.is_animated
     ]
     if not objs:
         return
@@ -375,11 +398,27 @@ def _tag_viewports_redraw():
 
 
 @persistent
+def _on_file_open(filepath):
+    """Drop the previous file's collider state when a new file is opened.
+
+    Must be @persistent: when Blender loads a file it resets its Python
+    state and clears every handler that is not marked persistent, so a plain
+    handler would be removed before it could ever observe the load.
+    """
+    _reset_state()
+
+
+@persistent
 def _on_depsgraph_update(scene, depsgraph):
     domain = None
     for update in depsgraph.updates:
         obj = update.id
         if not isinstance(obj, bpy.types.Object) or obj.name not in _grids:
+            continue
+        # A stale key (e.g. a same-named object from a file that is no longer
+        # open) must not be (re)built into a collider for an object the user
+        # never tagged; the prune in ensure_grids drops it at solver start.
+        if not obj.flowx_collider.is_collider:
             continue
         if not (update.is_updated_transform or update.is_updated_geometry):
             continue
@@ -423,7 +462,10 @@ def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
     Object.flowx_collider = PointerProperty(type=FlowXColliderSettings)
-    bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph_update)
+    if _on_file_open not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_on_file_open)
+    if _on_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph_update)
     global _draw_handle
     _draw_handle = bpy.types.SpaceView3D.draw_handler_add(
         _draw_collider_grids, (), "WINDOW", "POST_VIEW"
@@ -435,11 +477,11 @@ def unregister():
     if _draw_handle is not None:
         bpy.types.SpaceView3D.draw_handler_remove(_draw_handle, "WINDOW")
         _draw_handle = None
+    if _on_file_open in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_on_file_open)
     if _on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_update)
-    _grids.clear()
-    _mesh_fingerprints.clear()
-    _solver_grid.update(texture=None, voxel_size=0.0, dims=(1, 1, 1))
+    _reset_state()
     del Object.flowx_collider
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)

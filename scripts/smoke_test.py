@@ -584,29 +584,52 @@ def _run_demo(demo):
     _check_collider_grids()
 
 
+def _check_no_stale_collider_state(demo_name):
+    """Opening a file must not carry the previous file's colliders through.
+
+    The collision module keeps its voxel grids in memory, keyed by object
+    name; without a reset on file open the file being left keeps colliding in
+    the file being opened, and a same-named object in the new file inherits a
+    collider it was never tagged with.
+    """
+    collision = sys.modules[ADDON_MODULE].collision
+    stale_grids = list(collision._grids)
+    stale_fingerprints = list(collision._mesh_fingerprints)
+    _tex, voxel_size, dims = collision.get_solver_grid()
+    if stale_grids or stale_fingerprints or voxel_size != 0.0:
+        raise RuntimeError(
+            f"{demo_name}: collider state survived opening the file: "
+            f"grids={stale_grids} fingerprints={stale_fingerprints} "
+            f"solver_grid=voxel:{voxel_size} dims:{dims}"
+        )
+    print(f"[smoke_test] {demo_name}: no collider state carried over from the previous file")
+
+
 def _check_demo_scenes():
     """Phase 8: replay the shipped demo scenes the way a user would.
 
     The exit criterion is that a third party opens a demo, hits play, and
     gets the surface mesh - so open every file in demos/ and apply the same
-    solver and surface checks the empty-scene pass uses.
+    solver and surface checks the empty-scene pass uses. Opening a file must
+    also drop the previous file's collider state, so that check runs even
+    without a GPU, where the solver replay is skipped.
     """
-    if not _gpu_available:
-        print("[smoke_test] no GPU context; skipping demo scene replay")
-        return
-
     demos_dir = REPO_ROOT / "demos"
     demo_files = sorted(demos_dir.glob("*.blend"))
     if not demo_files:
         raise RuntimeError(f"no demo .blend files in {demos_dir}; run scripts/make_demo.py")
 
     for demo in demo_files:
-        print(f"[smoke_test] replaying demo {demo.name}")
         # Stop the previous run (the empty-scene pass, or the earlier demo)
         # before its scene is replaced: a running toggle would stop rather
         # than start, and the old scene's domain dies with the file.
         sys.modules[ADDON_MODULE].solver.sph.stop()
         bpy.ops.wm.open_mainfile(filepath=str(demo))
+        _check_no_stale_collider_state(demo.name)
+        if not _gpu_available:
+            print("[smoke_test] no GPU context; skipping demo scene replay")
+            return
+        print(f"[smoke_test] replaying demo {demo.name}")
         _run_demo(demo)
 
 
@@ -619,6 +642,14 @@ def main():
         bpy.ops.preferences.addon_enable(module=ADDON_MODULE)
     if ADDON_MODULE not in bpy.context.preferences.addons:
         raise RuntimeError(f"{ADDON_MODULE} did not appear in enabled addons after enable")
+    if ADDON_MODULE not in sys.modules:
+        # enable_on_install can record the extension as enabled before its
+        # import succeeds, leaving it enabled-but-unimported (no operators);
+        # a disable/enable cycle re-runs the import.
+        bpy.ops.preferences.addon_disable(module=ADDON_MODULE)
+        bpy.ops.preferences.addon_enable(module=ADDON_MODULE)
+        if ADDON_MODULE not in sys.modules:
+            raise RuntimeError(f"{ADDON_MODULE} is enabled but was never imported")
     print(f"[smoke_test] enabled {ADDON_MODULE}")
 
     for idname, kwargs in OPERATORS_TO_SMOKE_TEST:
