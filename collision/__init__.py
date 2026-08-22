@@ -26,10 +26,12 @@ _grids = {}
 _mesh_fingerprints = {}
 _draw_handle = None
 
-# Union of every tagged collider's occupancy, in the same domain-resolution
-# grid, kept ready for the Phase 5 solver to sample. Rebuilt whenever any
-# collider's own grid changes rather than read from `_grids` per frame, so a
-# multi-collider scene costs the solver one texture lookup, not several.
+# Union of every tagged collider's occupancy, in the domain's collider grid
+# (its resolution times the collider voxel multiplier - same grid as the
+# particles by default), kept ready for the Phase 5 solver to sample. Rebuilt
+# whenever any collider's own grid changes rather than read from `_grids` per
+# frame, so a multi-collider scene costs the solver one texture lookup, not
+# several.
 _solver_grid = {"texture": None, "voxel_size": 0.0, "dims": (1, 1, 1)}
 
 
@@ -266,13 +268,22 @@ def _rebuild_solver_grid(domain):
 
 
 def _domain_grid_geometry(domain):
-    """(origin, voxel_size, dims) for the domain's voxel grid, per its resolution."""
+    """(origin, voxel_size, dims) for the domain's collider voxel grid.
+
+    Sized to the domain's resolution times the collider voxel multiplier, so
+    colliders sit on the simulation's own particle grid by default - the
+    collider occupancy is only ever queried at particle positions, so a
+    finer grid would buy collision detail the fluid cannot express, and a
+    coarser one would let thin colliders vanish.
+    """
     lo, hi = world_bounds(domain)
     size = hi - lo
     longest = max(size.x, size.y, size.z)
     if longest <= 0.0:
         return lo, 0.0, (0, 0, 0)
-    voxel_size = longest / domain.flowx_domain.resolution
+    settings = domain.flowx_domain
+    grid_resolution = settings.resolution * settings.collider_voxel_multiplier
+    voxel_size = longest / grid_resolution
     dims = tuple(max(1, round(axis / voxel_size)) for axis in (size.x, size.y, size.z))
     return lo, voxel_size, dims
 

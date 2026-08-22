@@ -91,7 +91,10 @@ Blender's own headers, not at this code:
 - **Image atomics do not compile on Metal**, which is why the grid build uses a bitonic
   sort instead of a counting sort. Don't "optimize" it back.
 - **1D textures cannot be read back** (`GPUTexture.read()` reports zero length), so all
-  particle/grid state lives in 2D textures wrapped at `TEXTURE_WIDTH` (256).
+  particle/grid state lives in 2D textures wrapped at `TEXTURE_WIDTH` (256, or wider per
+  `texture_width()` once an array outgrows a 16384-tall row). Every 2D state texture
+  shares one width and the shaders address them all through the same `i_layout` lanes -
+  allocate new ones with the shared `config.tex_width` or the indexing silently scrambles.
 - **`GPUShaderCreateInfo.image()` needs explicit `qualifiers`** or Metal generates MSL
   that fails to compile.
 - **OpenGL drops push-constant/image slots a pass never reads**, so binding goes through

@@ -104,11 +104,17 @@ play, done.
 The panel shows particles, substeps, and ms/step (averaged). Two knobs do
 most of the work:
 
-- **Smoothing Radius** (domain panel) - particles are seeded half a radius
-  apart, so halving it roughly octuples the particle count; the solver
-  coarsens it automatically if you exceed its budget.
-- **Surface Resolution** (surface panel) - extraction cost grows with the
-  *cube* of this. Raise it for a final look, not while setting up the shot.
+- **Resolution** (domain panel) - particles are seeded one per voxel of this
+  lattice, so doubling it roughly octuples the particle count; the solver
+  coarsens the spacing automatically if you exceed the particle budget.
+- **Max Particles** (solver panel) - the budget itself, with no hard ceiling
+  (GPU memory is the limit). Raise it to hold a finer resolution at the cost
+  of frame time, which grows super-linearly - slow, but for an offline render
+  that trade is usually worth it.
+- **Surface Multiplier** (surface panel) - sizes the extraction grid as a
+  multiple of Resolution, so it tracks the sim automatically. Extraction cost
+  grows with the *cube* of the result; pull it below 1.0 for a cheap surface
+  under a high-res sim, raise it for a final look.
 
 If ms/step is above the scene's frame budget, the panel says so.
 
@@ -124,8 +130,8 @@ the cache already holds.
 
 - **Location.** `<scene>.flowx_cache` next to the saved .blend file (the
   system temp dir until the scene is saved), or any file at *Cache Path*.
-- **Size.** About 0.5 MB per frame at the 16k-particle budget; the panel
-  shows the frames covered and the running file size.
+- **Size.** About 0.5 MB per frame at the default 16k-particle budget; the
+  panel shows the frames covered and the running file size.
 - **Validity.** The file is keyed by a hash of everything that changes the
   simulation - solver settings, domain bounds and resolution, collider
   geometry, frame rate, this extension's version - plus a per-frame

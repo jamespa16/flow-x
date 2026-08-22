@@ -5,18 +5,20 @@ Once per frame, after the substeps have finished:
     density splat (GPU) -> read the grid back -> marching cubes (CPU)
                         -> rebuild <Domain>.FluidSurface via bmesh
 
-The splat grid's resolution is independent of the solver's, so the surface can
-be refined without touching the physics (and vice versa). Its cost is the one
-CPU round-trip in the whole pipeline, which is the tradeoff the roadmap signs
-up for: a GPU marching cubes needs histopyramid triangle compaction, and this
-ships an actual surface now.
+The splat grid's resolution tracks the solver's through the surface multiplier
+(so refining the physics refines the look), though the multiplier can be
+pulled below 1.0 to keep the extraction cheap under a high-res sim. Its cost
+is the one CPU round-trip in the whole pipeline, which is the tradeoff the
+roadmap signs up for: a GPU marching cubes needs histopyramid triangle
+compaction, and this ships an actual surface now.
 
-Perf: everything here scales with the *cube* of `surface_resolution`, and the
-marching cubes pass is Python. Measured on a 2m domain with 15k particles, the
-default resolution of 48 (125k samples) costs ~35 ms of extraction and ~2 ms of
-read-back on top of a ~35 ms solver step - so the surface roughly doubles the
-frame, and doubling the resolution would multiply its share by eight. Raise it
-for a final look, not while setting the shot up.
+Perf: everything here scales with the *cube* of the effective surface grid
+(Resolution x the surface multiplier), and the marching cubes pass is Python.
+Measured on a 2m domain with 15k particles, the default grid of 48 (125k
+samples) costs ~35 ms of extraction and ~2 ms of read-back on top of a ~35 ms
+solver step - so the surface roughly doubles the frame, and doubling the grid
+would multiply its share by eight. Raise it for a final look, not while
+setting the shot up.
 """
 
 import struct
@@ -110,7 +112,12 @@ def resolve(domain, config):
 
     surface = SurfaceConfig()
     surface.iso = settings.surface_iso
-    surface.spacing = max(longest / max(settings.surface_resolution, 1), 1e-6)
+    # Grid tracks the solver's lattice through the multiplier, like the
+    # collider grid does; the kernel clamp below absorbs the difference when
+    # the solver has coarsened itself under its particle budget.
+    surface.spacing = max(
+        longest / max(settings.resolution * settings.surface_multiplier, 1.0), 1e-6
+    )
 
     def _kernel_radius(spacing):
         # A grid coarser than the fluid needs a wider kernel or the field turns
@@ -164,7 +171,12 @@ def reseed(domain, config):
         return
     surface = resolve(domain, config)
     _state["config"] = surface
-    _state["texture"] = make_texture(surface.sample_count, channels=1, fmt="R32F")
+    # The splat indexes this grid through cell_texel() (see
+    # surface_splat.glsl), so it must carry the solver's shared texture width
+    # rather than its own natural one.
+    _state["texture"] = make_texture(
+        surface.sample_count, channels=1, fmt="R32F", width=config.tex_width
+    )
     _state["vertices"] = 0
     _state["triangles"] = 0
     _state["object"] = _surface_object(domain)

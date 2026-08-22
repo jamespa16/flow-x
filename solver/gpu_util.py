@@ -9,7 +9,9 @@ probing the module directly rather than from the docs:
   at our source.
 * 1D textures cannot be read back - ``GPUTexture.read()`` reports a
   zero-length first dimension for them. All particle/grid state therefore
-  lives in 2D textures, addressed as a flat array wrapped at ``TEXTURE_WIDTH``.
+  lives in 2D textures, addressed as a flat array wrapped at ``TEXTURE_WIDTH``
+  (or wider, per ``texture_width()``, once the array outgrows a
+  ``MAX_TEXTURE_SIZE``-tall row).
 * The OpenGL backend dead-code-eliminates push-constant uniforms and images
   that a compiled pass never reads, while Metal keeps every declared slot.
   A shared block therefore cannot be assumed present in every pass: bind it
@@ -21,13 +23,18 @@ the only mutable GPU state available.
 """
 
 import math
+from array import array
 from pathlib import Path
 
 import gpu
 
-# Flat arrays are wrapped into 2D textures at this width. 256 keeps the height
-# well inside any sane GL_MAX_TEXTURE_SIZE for the array lengths we use.
+# Flat arrays are wrapped into 2D textures at this width.
 TEXTURE_WIDTH = 256
+
+# The universal GL/Metal max texture dimension. Past TEXTURE_WIDTH rows of it
+# the only way to grow is a wider texture, so array length is bounded by GPU
+# memory rather than by the texture's dimensions.
+MAX_TEXTURE_SIZE = 16384
 
 _READ_WRITE = {"READ", "WRITE"}
 _SHADER_DIR = Path(__file__).resolve().parent.parent / "shaders"
@@ -38,33 +45,53 @@ def shader_source(name):
     return (_SHADER_DIR / f"{name}.glsl").read_text()
 
 
+def texture_width(count):
+    """Width of the 2D texture backing a flat array of `count` items.
+
+    TEXTURE_WIDTH, except when wrapping at it would make the texture taller
+    than MAX_TEXTURE_SIZE - then the width grows to keep the height in range.
+    """
+    if math.ceil(count / TEXTURE_WIDTH) > MAX_TEXTURE_SIZE:
+        return math.ceil(count / MAX_TEXTURE_SIZE)
+    return TEXTURE_WIDTH
+
+
 def texture_size(count):
     """(width, height) of the 2D texture backing a flat array of `count` items."""
-    return TEXTURE_WIDTH, max(1, math.ceil(count / TEXTURE_WIDTH))
+    width = texture_width(count)
+    return width, max(1, math.ceil(count / width))
 
 
-def make_texture(count, channels=4, values=None, fmt="RGBA32F"):
+def make_texture(count, channels=4, values=None, fmt="RGBA32F", width=None):
     """Allocate a 2D texture holding a flat array of `count` items.
 
     `values` is a flat sequence of `count * channels` floats; padding out to
     the texture's full width is handled here. Passing None leaves the contents
     undefined, which is fine for buffers a compute pass fully overwrites.
+    `width` overrides the natural width - the SPH state textures all share
+    one, so the shaders can address them all with a single wrap (see
+    solver/sph.py's _allocate). Values are uploaded through a compact float
+    array rather than a list of Python floats, which would peak in the
+    gigabytes for million-particle seeds.
     """
-    width, height = texture_size(count)
+    width = texture_width(count) if width is None else width
+    height = max(1, math.ceil(count / width))
     if values is None:
         return gpu.types.GPUTexture((width, height), format=fmt)
 
-    padded = list(values) + [0.0] * (width * height * channels - len(values))
+    padded = array("f", values)
+    padded.extend([0.0] * (width * height * channels - len(padded)))
     buffer = gpu.types.Buffer("FLOAT", [len(padded)], padded)
     return gpu.types.GPUTexture((width, height), format=fmt, data=buffer)
 
 
 def read_texture(texture, count, channels=4):
     """Read a 2D texture back as a flat list of `count` per-item tuples."""
+    width = texture.size[0]
     rows = texture.read().to_list()
     out = []
     for i in range(count):
-        texel = rows[i // TEXTURE_WIDTH][i % TEXTURE_WIDTH]
+        texel = rows[i // width][i % width]
         out.append(tuple(texel[:channels]) if channels > 1 else texel[0])
     return out
 

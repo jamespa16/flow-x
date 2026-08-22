@@ -80,6 +80,7 @@ class FLOWX_PT_domain(Panel):
 
         layout.prop(settings, "resolution")
         layout.prop(settings, "fluid_level")
+        layout.prop(settings, "collider_voxel_multiplier")
 
         lo, hi = world_bounds(obj)
         box = layout.box()
@@ -122,7 +123,6 @@ class FLOWX_PT_solver(Panel):
         settings = context.active_object.flowx_domain
 
         col = layout.column(align=True)
-        col.prop(settings, "smoothing_radius")
         col.prop(settings, "rest_density")
         col.prop(settings, "pbf_iterations")
         col.prop(settings, "pbf_relaxation")
@@ -130,6 +130,7 @@ class FLOWX_PT_solver(Panel):
         col.prop(settings, "surface_tension")
         col.prop(settings, "viscosity")
         col.prop(settings, "max_substeps")
+        col.prop(settings, "max_particles")
 
         running = sph.is_running()
         layout.operator(
@@ -150,7 +151,10 @@ class FLOWX_PT_solver(Panel):
         col.label(text=f"Grid: {dims} ({stats['cells']} cells)")
         # The solver coarsens its own spacing when a domain would blow the
         # particle budget, so show what it actually settled on.
-        if abs(stats["smoothing_radius"] - settings.smoothing_radius) > 1e-6:
+        lo, hi = world_bounds(context.active_object)
+        size = hi - lo
+        requested_radius = 2.0 * max(size.x, size.y, size.z) / max(settings.resolution, 1)
+        if stats["smoothing_radius"] > requested_radius * (1.0 + 1e-3):
             col.label(text=f"Effective radius: {stats['smoothing_radius']:.4f} m", icon="INFO")
 
 
@@ -241,7 +245,7 @@ class FLOWX_PT_playback(Panel):
                 col.label(
                     text=(
                         f"Slower than the scene's {_scene_fps(scene):.0f} fps - lower the "
-                        "surface resolution or raise the smoothing radius."
+                        "resolution or the surface multiplier."
                     ),
                     icon="INFO",
                 )
@@ -267,7 +271,7 @@ class FLOWX_PT_surface(Panel):
 
         col = layout.column(align=True)
         col.enabled = settings.show_surface
-        col.prop(settings, "surface_resolution")
+        col.prop(settings, "surface_multiplier")
         col.prop(settings, "surface_iso")
 
         layout.prop(settings, "show_particles")

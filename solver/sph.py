@@ -57,6 +57,7 @@ import math
 import random
 import struct
 import time
+from array import array
 from collections import deque
 
 import bpy
@@ -69,7 +70,6 @@ from ..collision import ensure_grids, get_solver_grid, rebuild_animated_grids
 from ..domain import find_domain, is_alive, is_degenerate, world_bounds
 from . import cache, surface, viz
 from .gpu_util import (
-    TEXTURE_WIDTH,
     bind_image,
     bind_push_constants,
     build_compute_shader,
@@ -77,6 +77,7 @@ from .gpu_util import (
     make_texture,
     read_texture,
     shader_source,
+    texture_width,
 )
 
 LOCAL_GROUP_SIZE = 64
@@ -84,10 +85,6 @@ GRAVITY = -9.81
 
 # Fraction of incoming normal velocity kept when a particle hits a domain wall.
 BOUNDARY_DAMPING = 0.35
-
-# Particle budget. Past this the seeder coarsens its spacing (and scales the
-# smoothing radius to match) rather than allocating unbounded GPU state.
-MAX_PARTICLES = 16384
 
 # Neighbor cells are searched 3x3x3, so cells must be at least one smoothing
 # radius across. These cap the other end: too fine a grid costs memory and
@@ -206,6 +203,7 @@ class SolverConfig:
         "lo",
         "hi",
         "fill_fraction",
+        "max_particles",
         "particle_count",
         "sorted_count",
         "cell_dims",
@@ -221,6 +219,7 @@ class SolverConfig:
         "viscosity",
         "max_substeps",
         "iterations",
+        "tex_width",
     )
 
     @property
@@ -267,20 +266,24 @@ def _resolve_config(domain):
     config.surface_tension = settings.surface_tension
     config.viscosity = settings.viscosity
     config.max_substeps = settings.max_substeps
+    config.max_particles = settings.max_particles
 
-    # Particles sit half a smoothing radius apart, which puts a comfortable
+    # One knob sizes the simulation: particles seed one per voxel of the
+    # domain's `resolution` lattice, and the SPH kernel follows the spacing -
+    # twice it, the classic radius/spacing ratio that puts a comfortable
     # number of neighbors inside the kernel's support without over-sampling.
-    config.smoothing_radius = settings.smoothing_radius
-    config.spacing = config.smoothing_radius * 0.5
+    longest = max(size.x, size.y, size.z)
+    config.spacing = longest / max(settings.resolution, 1)
+    config.smoothing_radius = config.spacing * 2.0
 
     fill_height = size.z * config.fill_fraction
     for _ in range(8):
         nx, ny, nz = _seed_counts(size, fill_height, config.spacing)
-        if nx * ny * nz <= MAX_PARTICLES:
+        if nx * ny * nz <= config.max_particles:
             break
         # Scale spacing and smoothing radius together so particle mass, kernel
         # support and rest density stay mutually consistent after coarsening.
-        config.spacing *= (nx * ny * nz / MAX_PARTICLES) ** (1 / 3)
+        config.spacing *= (nx * ny * nz / config.max_particles) ** (1 / 3)
         config.smoothing_radius = config.spacing * 2.0
 
     config.mass = config.rest_density * config.spacing**3
@@ -332,11 +335,11 @@ def _seed_positions(config):
     jitter = config.spacing * 0.1
     base = config.lo + Vector((config.spacing, config.spacing, config.spacing)) * 0.5
 
-    values = []
+    values = array("f")
     for k in range(nz):
         for j in range(ny):
             for i in range(nx):
-                if len(values) // 4 >= MAX_PARTICLES:
+                if len(values) // 4 >= config.max_particles:
                     return values
                 values.extend(
                     (
@@ -353,21 +356,27 @@ def _allocate(config):
     positions = _seed_positions(config)
     config.particle_count = len(positions) // 4
     config.sorted_count = max(2, 1 << (max(1, config.particle_count) - 1).bit_length())
-
-    zeros = [0.0] * (config.particle_count * 4)
+    # Every 2D state texture shares one width, sized for the longest of them
+    # (the sort keys): the shaders address all of them through
+    # particle_texel()/cell_texel(), whose divisor is a single i_layout lane,
+    # and the surface splat indexes its own grid through cell_texel() too -
+    # a mismatch between any two textures would silently scramble the data.
+    config.tex_width = texture_width(config.sorted_count)
+    zeros = array("f", [0.0]) * (config.particle_count * 4)
+    width = config.tex_width
     return {
-        "positions_img": make_texture(config.particle_count, values=positions),
-        "velocities_img": make_texture(config.particle_count, values=zeros),
-        "lambda_img": make_texture(config.particle_count, values=zeros),
+        "positions_img": make_texture(config.particle_count, values=positions, width=width),
+        "velocities_img": make_texture(config.particle_count, values=zeros, width=width),
+        "lambda_img": make_texture(config.particle_count, values=zeros, width=width),
         # Seeded from the same initial positions as positions_img: sph_normal
         # (once surface tension lands) and the first substep's grid build both
         # read predicted_img before sph_predict has ever run.
-        "predicted_img": make_texture(config.particle_count, values=positions),
-        "delta_img": make_texture(config.particle_count, values=zeros),
-        "normal_img": make_texture(config.particle_count, values=zeros),
-        "keys_img": make_texture(config.sorted_count),
-        "cell_start_img": make_texture(config.cell_count, channels=1, fmt="R32F"),
-        "cell_end_img": make_texture(config.cell_count, channels=1, fmt="R32F"),
+        "predicted_img": make_texture(config.particle_count, values=positions, width=width),
+        "delta_img": make_texture(config.particle_count, values=zeros, width=width),
+        "normal_img": make_texture(config.particle_count, values=zeros, width=width),
+        "keys_img": make_texture(config.sorted_count, width=width),
+        "cell_start_img": make_texture(config.cell_count, channels=1, fmt="R32F", width=width),
+        "cell_end_img": make_texture(config.cell_count, channels=1, fmt="R32F", width=width),
     }
 
 
@@ -442,7 +451,12 @@ def push_constant_values(config, dt, i_collider, sort_k=0, sort_j=0):
     scorr_k_bits = struct.unpack("<i", struct.pack("<f", config.scorr_strength))[0]
     tension_bits = struct.unpack("<i", struct.pack("<f", config.surface_tension))[0]
     return {
-        "i_layout": (config.particle_count, TEXTURE_WIDTH, TEXTURE_WIDTH, config.sorted_count),
+        "i_layout": (
+            config.particle_count,
+            config.tex_width,
+            config.tex_width,
+            config.sorted_count,
+        ),
         "i_grid": (*config.cell_dims, config.cell_count),
         # z/w carry sph_delta.glsl's s_corr strength and sph_predict.glsl's
         # surface-tension coefficient (both bit-packed as floats), not sort
@@ -709,12 +723,19 @@ def _apply_cached(positions, velocities, frame):
     brought to this frame before the handler ran.
     """
     config = _state["config"]
-    _state["textures"]["positions_img"] = make_texture(config.particle_count, values=positions)
-    _state["textures"]["velocities_img"] = make_texture(config.particle_count, values=velocities)
+    width = config.tex_width
+    _state["textures"]["positions_img"] = make_texture(
+        config.particle_count, values=positions, width=width
+    )
+    _state["textures"]["velocities_img"] = make_texture(
+        config.particle_count, values=velocities, width=width
+    )
     # The grid build below reads predicted_img, not positions_img (see
     # sph_grid_key.glsl) - a loaded frame has no "prediction" of its own, so
     # this just mirrors positions_img the way a fresh seed does in _allocate().
-    _state["textures"]["predicted_img"] = make_texture(config.particle_count, values=positions)
+    _state["textures"]["predicted_img"] = make_texture(
+        config.particle_count, values=positions, width=width
+    )
     # Also reset lambda_img rather than leaving whatever density the solver
     # last computed for a *different* particle configuration: if surface
     # tension is on, sph_normal reads lambda_img's density channel as a
@@ -725,7 +746,7 @@ def _apply_cached(positions, velocities, frame):
     # direction and the curvature ratio, unlike a stale, non-uniform density
     # left over from wherever the timeline was before this jump.
     _state["textures"]["lambda_img"] = make_texture(
-        config.particle_count, values=[0.0] * (config.particle_count * 4)
+        config.particle_count, values=array("f", [0.0]) * (config.particle_count * 4), width=width
     )
     _state["last_frame"] = frame
     _state["warning"] = None

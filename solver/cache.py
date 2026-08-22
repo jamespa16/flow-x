@@ -39,8 +39,9 @@ its state is the deterministic seed, and the handler re-seeds there anyway.
 
 Validity. The config hash covers everything that changes the physics: the
 extension version (code constants live in it), the frame rate, the domain's
-world bounds and resolution, every solver parameter, and per tagged collider
-its name, a transform-invariant mesh fingerprint (so only an actual edit to
+world bounds, resolution and collider voxel multiplier, every solver
+parameter, and per tagged collider its name, a transform-invariant mesh
+fingerprint (so only an actual edit to
 the geometry counts, not the collider simply moving), and a motion
 fingerprint - the active action's keyframes when the collider is animated,
 or its current world matrix when it isn't - so re-keying a collider's
@@ -170,16 +171,17 @@ def config_hash(domain, scene):
     )
     digest.update(
         struct.pack(
-            "<fffffffII",
+            "<fffffffIII",
             settings.fluid_level,
-            settings.smoothing_radius,
             settings.rest_density,
             settings.pbf_relaxation,
             settings.pbf_scorr_k,
             settings.viscosity,
             settings.surface_tension,
+            settings.collider_voxel_multiplier,
             settings.max_substeps,
             settings.pbf_iterations,
+            settings.max_particles,
         )
     )
     for name in collider_names(scene):

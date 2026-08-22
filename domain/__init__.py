@@ -36,7 +36,11 @@ class FlowXDomainSettings(PropertyGroup):
     )
     resolution: IntProperty(
         name="Resolution",
-        description="Voxel/particle grid resolution along the domain's longest axis",
+        description=(
+            "Particle grid resolution along the domain's longest axis: particles seed "
+            "one per voxel of this lattice (the solver coarsens it if that would blow "
+            "its particle budget), and colliders are voxelized on the same grid"
+        ),
         default=32,
         min=4,
         max=256,
@@ -49,22 +53,24 @@ class FlowXDomainSettings(PropertyGroup):
         max=100.0,
         subtype="PERCENTAGE",
     )
+    collider_voxel_multiplier: FloatProperty(
+        name="Collider Voxel Multiplier",
+        description=(
+            "Multiplies Resolution for collider voxelization only. 1.0 puts colliders "
+            "on the same grid as the particles - the finest collision detail the fluid "
+            "can express. 2.0 halves the voxel size for smoother collision on thin or "
+            "curved colliders; finer than that just costs memory. Below 1.0, thin "
+            "colliders stop registering entirely"
+        ),
+        default=1.0,
+        min=1.0,
+        max=2.0,
+        subtype="FACTOR",
+    )
 
     # Phase 4 solver parameters. Enough knobs to keep the physics out of the
     # source, not a tuning UI - that's post-MVP. Defaults are sized for a
     # roughly 2m domain in Blender's default metric units.
-    smoothing_radius: FloatProperty(
-        name="Smoothing Radius",
-        description=(
-            "SPH kernel support radius, in metres. Particles are seeded half a radius "
-            "apart, so halving this roughly octuples the particle count - the solver "
-            "coarsens it back if that exceeds its particle budget"
-        ),
-        default=0.1,
-        min=0.005,
-        max=2.0,
-        subtype="DISTANCE",
-    )
     rest_density: FloatProperty(
         name="Rest Density",
         description="Target density of the fluid at rest, in kg/m^3 (water is 1000)",
@@ -122,9 +128,10 @@ class FlowXDomainSettings(PropertyGroup):
         min=0.0,
         max=10.0,
     )
-    # Phase 6 surface reconstruction. The grid the surface is extracted from is
-    # deliberately independent of the solver's, so the look can be refined
-    # without disturbing physics that already behaves.
+    # Phase 6 surface reconstruction. The surface grid tracks the simulation's
+    # resolution through a multiplier, so refining the physics refines the look
+    # without a second knob to remember - but the multiplier can be pulled
+    # below 1.0 to keep the CPU extraction cheap under a high-res sim.
     show_surface: BoolProperty(
         name="Surface Mesh",
         description=(
@@ -151,17 +158,20 @@ class FlowXDomainSettings(PropertyGroup):
         ),
         default=True,
     )
-    surface_resolution: IntProperty(
-        name="Surface Resolution",
+    surface_multiplier: FloatProperty(
+        name="Surface Multiplier",
         description=(
-            "Sample grid resolution along the domain's longest axis, for surface "
-            "extraction only. Cost grows with the cube of this and the extraction "
-            "runs on the CPU, so raise it for a final look rather than while "
-            "setting the shot up"
+            "Multiplies Resolution for surface extraction only. 1.5 (the default) "
+            "keeps the sample grid finer than the particle lattice, so the field "
+            "stays smooth; below 1.0 the surface goes chunky in exchange for "
+            "extraction time under a high-resolution sim. Cost grows with the "
+            "cube of Resolution x this and the extraction runs on the CPU, so "
+            "raise it for a final look rather than while setting the shot up"
         ),
-        default=48,
-        min=8,
-        max=192,
+        default=1.5,
+        min=0.25,
+        max=4.0,
+        subtype="FACTOR",
     )
     surface_iso: FloatProperty(
         name="Surface Iso-Value",
@@ -184,6 +194,18 @@ class FlowXDomainSettings(PropertyGroup):
         default=24,
         min=1,
         max=200,
+    )
+    max_particles: IntProperty(
+        name="Max Particles",
+        description=(
+            "Upper bound on the SPH particle count. If the resolution lattice demands "
+            "more, the solver coarsens its spacing to fit (the solver panel shows the "
+            "effective radius when it does). There is no hard ceiling - GPU memory is "
+            "the limit - and frame time grows super-linearly as this rises, so very "
+            "large counts are for offline renders, not the viewport"
+        ),
+        default=16384,
+        min=1024,
     )
     # Post-MVP disk cache. Off by default: it writes a file into the user's
     # project on every simulated frame, which should be a choice, not a side
