@@ -68,7 +68,7 @@ from mathutils import Vector
 
 from ..collision import ensure_grids, get_solver_grid, rebuild_animated_grids
 from ..domain import find_domain, is_alive, is_degenerate, world_bounds
-from . import cache, surface, viz
+from . import cache, surface, viz, whitewater
 from .gpu_util import (
     bind_image,
     bind_push_constants,
@@ -555,10 +555,32 @@ def _step(frame_dt, frame):
         cache.write_frame(frame, positions, velocities, _state["domain"])
 
     _update_surface(dt)
+    _update_whitewater(frame_dt, frame)
     _update_viz(positions)
 
     _state["last_frame"] = frame
     _state["timings"].append((time.perf_counter() - started) * 1000.0)
+
+
+def _update_whitewater(frame_dt, frame):
+    """Score/sort/spawn/advect the whitewater pool, once per frame.
+
+    Uses the full frame_dt rather than the substep dt _update_surface() gets:
+    spawn rate and advection are both real-time rates, and whitewater has no
+    stake in the substep loop's internal stability limit the way the SPH
+    passes do.
+    """
+    if not whitewater.is_running():
+        return
+    collider = _collider_binding()
+    whitewater.update(
+        _state["config"],
+        _state["textures"],
+        push_constant_values(_state["config"], frame_dt, collider[1]),
+        collider,
+        frame_dt,
+        frame,
+    )
 
 
 def _update_surface(dt):
@@ -624,6 +646,14 @@ def _seed(domain):
     elif surface.is_running():
         surface.stop()
 
+    if domain.flowx_domain.show_whitewater:
+        if whitewater.is_running():
+            whitewater.reseed(domain, config)
+        else:
+            whitewater.start(domain, config)
+    elif whitewater.is_running():
+        whitewater.stop()
+
     _update_viz()
 
 
@@ -683,6 +713,7 @@ def stop():
         bpy.app.handlers.frame_change_pre.remove(_on_frame_change)
     cache.close()
     surface.stop()
+    whitewater.stop()
     _state.update({"running": False, "config": None, "domain": None, "shaders": {}, "textures": {}})
     _state["timings"].clear()
     _state["warning"] = None

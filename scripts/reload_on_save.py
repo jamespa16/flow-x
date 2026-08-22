@@ -10,6 +10,7 @@ scripts/dev_link.py.
 """
 
 import os
+import sys
 
 import bpy
 
@@ -31,11 +32,26 @@ def _source_mtime():
     return latest
 
 
+def _forget_modules():
+    """Drop the extension's modules from sys.modules so re-enabling re-imports.
+
+    Blender's disable/enable cycle never purges the old module objects, and
+    Python's import machinery hands back whatever is already in sys.modules -
+    so without this, enable "succeeds" while every function keeps running the
+    bytecode from before the edit. The disable ran unregister() first, so no
+    live handler or GPU state references the stale modules any more.
+    """
+    for name in list(sys.modules):
+        if name == ADDON_MODULE or name.startswith(ADDON_MODULE + "."):
+            del sys.modules[name]
+
+
 def _reload():
     global _last_mtime
     print(f"[flow-x] change detected, reloading {ADDON_MODULE}")
     try:
         bpy.ops.preferences.addon_disable(module=ADDON_MODULE)
+        _forget_modules()
         bpy.ops.preferences.addon_enable(module=ADDON_MODULE)
     except Exception as exc:
         print(f"[flow-x] reload failed: {exc}")

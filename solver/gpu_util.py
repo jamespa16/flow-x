@@ -87,7 +87,7 @@ def make_texture(count, channels=4, values=None, fmt="RGBA32F", width=None):
 
 def read_texture(texture, count, channels=4):
     """Read a 2D texture back as a flat list of `count` per-item tuples."""
-    width = texture.size[0]
+    width = texture.width
     rows = texture.read().to_list()
     out = []
     for i in range(count):

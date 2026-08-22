@@ -184,6 +184,115 @@ class FlowXDomainSettings(PropertyGroup):
         min=0.01,
         max=4.0,
     )
+    # Phase 8 whitewater: secondary spray/foam/bubble particles, driven off
+    # the PBF state each frame (see solver/whitewater.py). Off by default -
+    # it's an additive cost on top of the core solve.
+    show_whitewater: BoolProperty(
+        name="Whitewater",
+        description=(
+            "Spawn secondary spray/foam/bubble particles off the fluid surface each "
+            "frame, into a child object named '<Domain>.Whitewater'"
+        ),
+        default=False,
+    )
+    whitewater_capacity: IntProperty(
+        name="Whitewater Capacity",
+        description=(
+            "Fixed size of the whitewater particle pool. Once full, newly spawned "
+            "particles silently replace the oldest ones rather than growing the pool "
+            "further - this is the system's only 'kill' mechanism, so a low capacity "
+            "shortens effective particle lifetime under a high spawn rate"
+        ),
+        default=20000,
+        min=100,
+    )
+    whitewater_spawn_rate: FloatProperty(
+        name="Spawn Rate",
+        description="Whitewater particles spawned per second, at most",
+        default=400.0,
+        min=0.0,
+        max=100000.0,
+    )
+    whitewater_trapped_air_weight: FloatProperty(
+        name="Trapped Air Weight",
+        description="Contribution of turbulent, converging neighbor motion to the spawn score",
+        default=1.0,
+        min=0.0,
+        max=10.0,
+    )
+    whitewater_wave_crest_weight: FloatProperty(
+        name="Wave Crest Weight",
+        description="Contribution of surface particles riding outward over a crest",
+        default=1.0,
+        min=0.0,
+        max=10.0,
+    )
+    whitewater_kinetic_weight: FloatProperty(
+        name="Kinetic Energy Weight",
+        description="Contribution of raw particle speed to the spawn score",
+        default=1.0,
+        min=0.0,
+        max=10.0,
+    )
+    whitewater_kinetic_reference_speed: FloatProperty(
+        name="Reference Speed",
+        description="Speed, in m/s, that normalizes the kinetic-energy and wave-crest scores",
+        default=3.0,
+        min=0.01,
+        max=100.0,
+    )
+    whitewater_spray_speed_threshold: FloatProperty(
+        name="Spray Speed Threshold",
+        description="Above this speed a spawning particle becomes spray rather than foam",
+        default=1.5,
+        min=0.0,
+        max=100.0,
+    )
+    whitewater_bubble_trapped_threshold: FloatProperty(
+        name="Bubble Threshold",
+        description="Above this trapped-air sub-score a spawning particle becomes a bubble",
+        default=0.5,
+        min=0.0,
+        max=100.0,
+    )
+    whitewater_jitter_strength: FloatProperty(
+        name="Jitter Strength",
+        description="Random velocity added to a newly spawned particle, in m/s",
+        default=0.3,
+        min=0.0,
+        max=20.0,
+    )
+    whitewater_normal_offset: FloatProperty(
+        name="Spawn Offset",
+        description="Random positional offset applied to a newly spawned particle, in meters",
+        default=0.02,
+        min=0.0,
+        max=1.0,
+    )
+    whitewater_spray_life_min: FloatProperty(name="Spray Life Min", default=0.5, min=0.0, max=60.0)
+    whitewater_spray_life_max: FloatProperty(name="Spray Life Max", default=1.5, min=0.0, max=60.0)
+    whitewater_foam_life_min: FloatProperty(name="Foam Life Min", default=1.0, min=0.0, max=60.0)
+    whitewater_foam_life_max: FloatProperty(name="Foam Life Max", default=3.0, min=0.0, max=60.0)
+    whitewater_bubble_life_min: FloatProperty(
+        name="Bubble Life Min", default=0.5, min=0.0, max=60.0
+    )
+    whitewater_bubble_life_max: FloatProperty(
+        name="Bubble Life Max", default=2.0, min=0.0, max=60.0
+    )
+    whitewater_drag: FloatProperty(
+        name="Drag",
+        description="How quickly foam/bubbles are pulled toward the local fluid velocity",
+        default=2.0,
+        min=0.0,
+        max=50.0,
+    )
+    whitewater_buoyancy: FloatProperty(
+        name="Bubble Buoyancy",
+        description="Fraction of gravity cancelled for bubbles - 1.0 is neutral, above that rises",
+        default=1.3,
+        min=0.0,
+        max=3.0,
+    )
     max_substeps: IntProperty(
         name="Max Substeps",
         description=(

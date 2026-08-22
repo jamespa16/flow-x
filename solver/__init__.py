@@ -11,13 +11,15 @@
 * `surface` - Phase 6's density splat, extraction and FluidSurface mesh.
 * `cache` - the disk cache: per-frame particle-state snapshots that let the
   timeline be scrubbed back without re-simulating.
+* `whitewater` - Phase 8's secondary spray/foam/bubble particles, driven off
+  the PBF state each frame into a Whitewater point-cloud child object.
 
 The two run modes are mutually exclusive; starting either stops the other.
 """
 
 import bpy
 
-from . import cache, gpu_test, sph, surface, viz
+from . import cache, gpu_test, sph, surface, viz, whitewater
 from .cache import FLOWX_OT_cache_clear
 from .gpu_test import PARTICLE_COUNT, FLOWX_OT_solver_gpu_test_toggle
 from .sph import FLOWX_OT_sph_reset, FLOWX_OT_sph_toggle
@@ -32,6 +34,7 @@ __all__ = [
     "gpu_test",
     "sph",
     "surface",
+    "whitewater",
 ]
 
 _classes = (
@@ -51,6 +54,7 @@ def unregister():
     gpu_test.stop()
     sph.stop()
     surface.stop()
+    whitewater.stop()
     viz.disable()
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)

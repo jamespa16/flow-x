@@ -91,6 +91,12 @@ play, done.
 - **Surface.** Particles are splatted onto a scalar grid on the GPU, read
   back once per frame, and extracted with a self-contained marching-cubes
   implementation into the `<Domain>.FluidSurface` child mesh.
+- **Whitewater.** Each frame, every fluid particle is scored for how likely
+  it is to throw off secondary spray/foam/bubble (a real-time-budget version
+  of Ihmsen et al.'s trapped-air / wave-crest / kinetic-energy
+  classification), the top scorers are spawned into a fixed pool that is
+  advected with coarse per-kind motion, and the live pool is read back into
+  the `<Domain>.Whitewater` point-cloud child - off by default.
 - **Deterministic.** Seeding uses a fixed RNG seed and the substep size comes
   only from the scene's frame rate, so the same timeline replays identically.
 - **Cache.** With *Cache to Disk* enabled, each frame's positions and
@@ -115,6 +121,10 @@ most of the work:
   multiple of Resolution, so it tracks the sim automatically. Extraction cost
   grows with the *cube* of the result; pull it below 1.0 for a cheap surface
   under a high-res sim, raise it for a final look.
+- **Whitewater** (whitewater panel) - off by default; when on it adds a
+  per-frame score/sort/spawn/advect pass plus a point-cloud read-back on top
+  of the core solve, so it's an additive cost. *Capacity* bounds the pool and
+  *Spawn Rate* bounds how fast it fills.
 
 If ms/step is above the scene's frame budget, the panel says so.
 
@@ -153,7 +163,10 @@ the cache already holds.
 - Colliders are static or simply-animated rigid meshes; no deforming/skinned
   colliders. Zero-face or out-of-domain colliders are tagged but warn.
 - A domain scaled to zero volume is refused, not simulated.
-- The surface uses a flat water-ish material; no foam, spray, or refraction.
+- The surface uses a flat water-ish material; there is no refraction.
+  Whitewater spray/foam/bubble renders as a raw point cloud carrying `life`
+  and `kind` attributes - a real spray/foam look is a Geometry Nodes
+  modifier on top of those attributes, deliberately left for a follow-up.
 - A GPU context is required; there is no CPU fallback.
 
 ## Troubleshooting
@@ -172,7 +185,7 @@ the cache already holds.
 ```
 domain/       domain object, properties, add operator
 collision/    collider tagging + CPU voxelization
-solver/       gpu plumbing, WCSPH solver, marching cubes, surface
+solver/       gpu plumbing, PBF solver, marching cubes, surface, whitewater
 ui/           N-panel and Object Properties panels
 shaders/      GLSL compute passes
 scripts/      dev link, reload, smoke test, demo builder, packager

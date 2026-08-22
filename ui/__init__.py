@@ -14,6 +14,7 @@ from ..solver import (
     gpu_test,
     sph,
     surface,
+    whitewater,
 )
 
 
@@ -294,6 +295,71 @@ class FLOWX_PT_surface(Panel):
         col.label(text=f"Sample spacing: {surface_stats['spacing']:.4f} m")
 
 
+class FLOWX_PT_whitewater(Panel):
+    bl_label = "Whitewater"
+    bl_idname = "FLOWX_PT_whitewater"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "Flow-X"
+    bl_parent_id = "FLOWX_PT_domain"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    @classmethod
+    def poll(cls, context):
+        return FLOWX_PT_domain.poll(context)
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.active_object.flowx_domain
+
+        layout.prop(settings, "show_whitewater")
+
+        col = layout.column(align=True)
+        col.enabled = settings.show_whitewater
+        col.prop(settings, "whitewater_capacity")
+        col.prop(settings, "whitewater_spawn_rate")
+
+        box = col.box()
+        box.label(text="Spawn Potential")
+        potential = box.column(align=True)
+        potential.prop(settings, "whitewater_trapped_air_weight")
+        potential.prop(settings, "whitewater_wave_crest_weight")
+        potential.prop(settings, "whitewater_kinetic_weight")
+        potential.prop(settings, "whitewater_kinetic_reference_speed")
+
+        box = col.box()
+        box.label(text="Classification")
+        classify = box.column(align=True)
+        classify.prop(settings, "whitewater_spray_speed_threshold")
+        classify.prop(settings, "whitewater_bubble_trapped_threshold")
+
+        box = col.box()
+        box.label(text="Motion")
+        motion = box.column(align=True)
+        motion.prop(settings, "whitewater_jitter_strength")
+        motion.prop(settings, "whitewater_normal_offset")
+        motion.prop(settings, "whitewater_drag")
+        motion.prop(settings, "whitewater_buoyancy")
+
+        box = col.box()
+        box.label(text="Lifetime (seconds)")
+        life = box.column(align=True)
+        row = life.row(align=True)
+        row.prop(settings, "whitewater_spray_life_min", text="Spray")
+        row.prop(settings, "whitewater_spray_life_max", text="")
+        row = life.row(align=True)
+        row.prop(settings, "whitewater_foam_life_min", text="Foam")
+        row.prop(settings, "whitewater_foam_life_max", text="")
+        row = life.row(align=True)
+        row.prop(settings, "whitewater_bubble_life_min", text="Bubble")
+        row.prop(settings, "whitewater_bubble_life_max", text="")
+
+        stats = whitewater.stats()
+        if stats is not None:
+            stat_box = layout.box()
+            stat_box.label(text=f"Live: {stats['live']} / {stats['capacity']}")
+
+
 class FLOWX_PT_collider(Panel):
     bl_label = "Flow-X Collider"
     bl_idname = "FLOWX_PT_collider"
@@ -306,10 +372,10 @@ class FLOWX_PT_collider(Panel):
         obj = context.active_object
         if obj is None or obj.type != "MESH" or obj.flowx_domain.is_domain:
             return False
-        # The auto-generated '<Domain>.FluidSurface' child is not a collider
-        # candidate: it is the fluid's own surface, and tagging it would carve
-        # the fluid out of itself.
-        return not obj.name.endswith(surface.SURFACE_SUFFIX)
+        # The auto-generated '<Domain>.FluidSurface'/'<Domain>.Whitewater'
+        # children are not collider candidates: they're the fluid's own
+        # output, and tagging one would carve the fluid out of itself.
+        return not obj.name.endswith((surface.SURFACE_SUFFIX, whitewater.WHITEWATER_SUFFIX))
 
     def draw(self, context):
         layout = self.layout
@@ -336,6 +402,7 @@ _classes = (
     FLOWX_PT_solver,
     FLOWX_PT_playback,
     FLOWX_PT_surface,
+    FLOWX_PT_whitewater,
     FLOWX_PT_collider,
 )
 
