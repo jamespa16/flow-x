@@ -2,7 +2,7 @@
  *
  * sph_cell_range.glsl only writes cells that actually contain particles, so
  * the -1 sentinel written here is what marks a cell empty for the neighbor
- * loops in sph_density/sph_force.
+ * loops in sph_lambda/sph_delta/sph_normal/sph_xsph.
  */
 
 void main()

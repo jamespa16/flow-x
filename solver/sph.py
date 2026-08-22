@@ -690,6 +690,18 @@ def _apply_cached(positions, velocities, frame):
     # sph_grid_key.glsl) - a loaded frame has no "prediction" of its own, so
     # this just mirrors positions_img the way a fresh seed does in _allocate().
     _state["textures"]["predicted_img"] = make_texture(config.particle_count, values=positions)
+    # Also reset lambda_img rather than leaving whatever density the solver
+    # last computed for a *different* particle configuration: if surface
+    # tension is on, sph_normal reads lambda_img's density channel as a
+    # per-neighbor weight before sph_lambda ever runs against these loaded
+    # positions (see _substep's pass order). Zeroing it here mirrors
+    # _allocate()'s fresh seed, where every neighbor's density is the same
+    # clamped constant - that uniform weight cancels out of both the normal's
+    # direction and the curvature ratio, unlike a stale, non-uniform density
+    # left over from wherever the timeline was before this jump.
+    _state["textures"]["lambda_img"] = make_texture(
+        config.particle_count, values=[0.0] * (config.particle_count * 4)
+    )
     _state["last_frame"] = frame
     _state["warning"] = None
     _build_grid(0.0)
