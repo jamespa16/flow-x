@@ -1,10 +1,11 @@
-"""GPU compute plumbing and the WCSPH solver (Phases 3-7).
+"""GPU compute plumbing and the PBF solver (Phases 3-7).
 
 * `gpu_util` - shared shader/texture helpers and the GPU-API constraints they
   work around.
 * `viz` - the debug point-cloud overlay, shared by the run modes below.
 * `gpu_test` - Phase 3's compute round-trip smoke test (gravity only).
-* `sph` - Phase 4's WCSPH solver core, plus Phase 7's timeline handling.
+* `sph` - Phase 4's Position Based Fluids solver core, plus Phase 7's timeline
+  handling.
 * `marching_cubes` - Phase 6's iso-surface extraction, pure Python and free of
   Blender imports so it can be tested outside Blender.
 * `surface` - Phase 6's density splat, extraction and FluidSurface mesh.

@@ -9,12 +9,17 @@
  *
  *   i_layout   = (particle_count, particle_tex_width, cell_tex_width, sorted_count)
  *   i_grid     = (cells_x, cells_y, cells_z, cell_count)
- *   i_sort     = (bitonic_k, bitonic_j, unused, unused)
+ *   i_sort     = (bitonic_k, bitonic_j, floatBitsToInt(scorr_k), floatBitsToInt(surface_tension))
  *   f_lo       = (domain_min.xyz, cell_size)
  *   f_hi       = (domain_max.xyz, particle_radius)
- *   f_sph      = (smoothing_radius, particle_mass, rest_density, stiffness)
+ *   f_sph      = (smoothing_radius, particle_mass, rest_density, relaxation_epsilon)
  *   f_sim      = (viscosity, dt, gravity, boundary_damping)
  *   i_collider = (collider_dims.xyz, floatBitsToInt(collider_voxel_size))
+ *
+ * f_sph.w used to carry WCSPH's Tait-EOS stiffness; PBF has no equivalent
+ * term, so the slot now carries the CFM-style relaxation epsilon added to the
+ * lambda denominator (see sph_lambda.glsl) - same slot, new meaning, to stay
+ * inside the 128-byte push-constant budget documented above.
  */
 
 #define PI 3.14159265358979323846
@@ -83,6 +88,22 @@ float w_poly6(float r2, float h2, float coef)
   }
   float d = h2 - r2;
   return coef * d * d * d;
+}
+
+/* Gradient of the Poly6 kernel along the separation direction. Poly6 is C2
+ * (its gradient vanishes smoothly at both r=0 and r=h), which is what makes
+ * it usable for a surface normal - unlike Spiky's gradient, which blows up as
+ * r -> 0 and is only ever evaluated for particle *pairs* (r > 1e-6 guarded by
+ * callers), Poly6's gradient is well-behaved for a single particle's own
+ * neighborhood sum. coef is poly6_coef(h) - the density kernel's own
+ * normalization, reused here rather than a second one. */
+vec3 w_poly6_grad(vec3 d, float r2, float h2, float coef)
+{
+  if (r2 >= h2) {
+    return vec3(0.0);
+  }
+  float t = h2 - r2;
+  return coef * -6.0 * t * t * d;
 }
 
 /* Magnitude of the Spiky gradient along the separation direction. Already

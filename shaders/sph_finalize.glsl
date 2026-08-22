@@ -1,14 +1,13 @@
-/* SPH pass 3: semi-implicit Euler integration, Phase 5 collider push-out, then
- * a clamp to the domain box.
+/* PBF pass: apply XSPH's correction, then Phase 5's collider push-out, then
+ * the domain-box clamp - the collision/boundary handling body is ported
+ * verbatim from WCSPH's sph_integrate.glsl, which this pass replaces.
  *
- * The collider search only runs for a particle that actually lands inside an
- * occupied voxel - rare, since it means a particle got through a whole
- * substep of SPH pressure force without being pushed back already - so a
- * small brute-force box scan for the nearest free voxel is cheap in the
- * aggregate despite being O(n^3) in the search radius. MAX_COLLIDER_SEARCH
- * bounds how deep a penetration it can recover from in one substep; deeper
- * than that and the particle is left in place for this substep - SPH surface
- * pressure will push it toward a free voxel over the next few instead.
+ * PBF's per-substep position change is bounded by the constraint loop's
+ * kernel-support corrections rather than an unclamped velocity integration
+ * (that clamp now happens earlier, in sph_predict.glsl, since the
+ * constraint loop's correctness depends on a complete neighbor grid), so a
+ * collider penetration reaching here is no likelier than it was under WCSPH -
+ * MAX_COLLIDER_SEARCH's recovery window is unchanged.
  */
 
 #define MAX_COLLIDER_SEARCH 2
@@ -21,22 +20,8 @@ void main()
   }
 
   ivec2 t = particle_texel(i);
-  float dt = f_sim.y;
-  float h = f_sph.x;
-
-  vec3 v = imageLoad(velocities_img, t).xyz + imageLoad(forces_img, t).xyz * dt;
-
-  /* A particle must not cross more than a fraction of a smoothing radius in
-   * one substep, or it tunnels past the neighbors that would have pushed back
-   * and the simulation blows up. Clamping speed is a cruder guard than
-   * shrinking dt, but it keeps a bad parameter set recoverable. */
-  float v_max = 0.4 * h / max(dt, 1e-6);
-  float speed = length(v);
-  if (speed > v_max) {
-    v *= v_max / speed;
-  }
-
-  vec3 p = imageLoad(positions_img, t).xyz + v * dt;
+  vec3 v = imageLoad(velocities_img, t).xyz + imageLoad(delta_img, t).xyz;
+  vec3 p = imageLoad(predicted_img, t).xyz;
 
   float radius = f_hi.w;
   float damping = f_sim.w;
@@ -71,8 +56,6 @@ void main()
       vec3 push_dir = (dist > 1e-6) ? (nearest_free - p) / dist : vec3(0.0, 0.0, 1.0);
       p += push_dir * (dist + radius);
 
-      /* Reflect and damp only the velocity component driving the particle
-       * into the collider, same as the wall clamp below does per-axis. */
       float vn = dot(v, push_dir);
       if (vn < 0.0) {
         v -= vn * (1.0 + damping) * push_dir;

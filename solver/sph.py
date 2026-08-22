@@ -1,25 +1,38 @@
-"""Phase 4: the WCSPH solver core.
+"""Phase 4: the PBF solver core.
 
 Each substep runs as a chain of compute dispatches over GPU-resident particle
 state, with no CPU round-trip except the position read-back that feeds the
 debug point-cloud viz:
 
-    grid keys -> bitonic sort -> cell clear -> cell ranges
-              -> density/pressure -> forces -> integrate
+    predict (gravity + surface tension) -> grid keys -> bitonic sort ->
+    cell clear -> cell ranges -> [lambda -> delta -> apply delta] x iterations
+    -> velocity -> XSPH -> finalize (collision + domain clamp)
 
-The sort is where this departs from the textbook GPU build. A counting sort
-needs ``imageAtomicAdd``, and image atomics do not compile on Blender's Metal
-backend, so the (cell key, particle index) pairs go through a bitonic sort
-instead - pure compare-exchange, no atomics, O(log^2 n) host-driven passes.
-Dispatch overhead measured at ~13 us each, and with ~105 compare-exchange
-dispatches per substep the sort is the dominant per-step cost: single-digit
-milliseconds per substep, tens of milliseconds per frame at the default
-substep count (the panel's ms/step readout is where it lands).
+This is Position Based Fluids (Macklin & Muller 2013), not WCSPH: there is no
+pressure force and no equation-of-state stiffness. A particle is predicted
+forward under gravity alone, then a fixed number of Jacobi constraint-solve
+iterations project its predicted position so the local density matches rest
+density, and its velocity is derived from how far that projection actually
+moved it. The density constraint is unconditionally stable on its own, which
+is what lets this run larger, fixed substeps than WCSPH's CFL-limited ones
+ever could - the substep budget here is bounded only by how far gravity can
+carry a particle before the neighbor grid it predicted into goes stale, and by
+XSPH's own explicit diffusion limit (see ``SolverConfig.substep_dt``).
 
-The integrate pass also does Phase 5's collision response: it samples the
-collider occupancy grid built in ``collision`` and pushes a particle out to
-the nearest free voxel, with a velocity reflection/damping term along the
-push direction (see ``shaders/sph_integrate.glsl``).
+The grid build is where this departs from the textbook GPU build. A counting
+sort needs ``imageAtomicAdd``, and image atomics do not compile on Blender's
+Metal backend, so the (cell key, particle index) pairs go through a bitonic
+sort instead - pure compare-exchange, no atomics, O(log^2 n) host-driven
+passes. Dispatch overhead measured at ~13 us each, and with ~105
+compare-exchange dispatches it is the dominant per-substep cost, which is why
+it runs once per substep rather than once per constraint-solve iteration: the
+neighbor list only drifts by one iteration's small position correction, not
+enough to be worth rebuilding 3-4x over.
+
+Finalize also does Phase 5's collision response: it samples the collider
+occupancy grid built in ``collision`` and pushes a particle out to the nearest
+free voxel, with a velocity reflection/damping term along the push direction
+(see ``shaders/sph_finalize.glsl``), the same as the WCSPH integrator did.
 
 Phase 6 hangs one more dispatch off the end of each *frame* (not each
 substep): ``surface`` splats the particles onto a scalar grid and extracts a
@@ -90,8 +103,11 @@ MAX_CATCHUP_FRAMES = 30
 # Frames of wall-clock timing averaged for the panel's ms/frame readout.
 TIMING_WINDOW = 30
 
-# Courant-style limit on the substep: a particle must not cross a meaningful
-# fraction of a smoothing radius before the pressure field can respond.
+# Limit on the substep, in the same Courant-ish spirit WCSPH used: a particle
+# must not free-fall or diffuse more than a meaningful fraction of a
+# smoothing radius before the constraint loop or XSPH can respond. PBF's
+# density constraint itself needs no such limit - it is a projection, not an
+# explicit spring - so unlike WCSPH there is no speed-of-sound term here.
 CFL_FACTOR = 0.25
 
 # Every SPH pass declares this same push-constant block so shaders/sph_common.glsl
@@ -111,22 +127,47 @@ _PUSH_CONSTANTS = (
 _IMAGES = (
     ("RGBA32F", "FLOAT_2D", "positions_img"),
     ("RGBA32F", "FLOAT_2D", "velocities_img"),
-    ("RGBA32F", "FLOAT_2D", "density_img"),
-    ("RGBA32F", "FLOAT_2D", "forces_img"),
+    # Holds (density, lambda) during the constraint loop - the same slot
+    # WCSPH used for (density, pressure); renaming it would touch every pass
+    # for no behavioral change, so only its packing's meaning has moved.
+    ("RGBA32F", "FLOAT_2D", "lambda_img"),
+    # This substep's predicted (pre-constraint, then constraint-corrected)
+    # position. WCSPH used this texture for acceleration; PBF has no force
+    # accumulation step, so it now holds position throughout the substep.
+    ("RGBA32F", "FLOAT_2D", "predicted_img"),
+    # Scratch accumulator for whichever pass currently needs a place to write
+    # a per-particle correction without racing readers of predicted_img or
+    # velocities_img: sph_delta's position correction, then later in the same
+    # substep sph_xsph's velocity correction.
+    ("RGBA32F", "FLOAT_2D", "delta_img"),
+    # xyz = surface-tension color-field gradient (normal), w = curvature. Only
+    # meaningful when surface_tension > 0, in which case sph_normal.glsl
+    # writes it fresh every substep before sph_predict.glsl reads it; the
+    # array is always allocated even when the pass is skipped.
+    ("RGBA32F", "FLOAT_2D", "normal_img"),
     ("RGBA32F", "FLOAT_2D", "keys_img"),
     ("R32F", "FLOAT_2D", "cell_start_img"),
     ("R32F", "FLOAT_2D", "cell_end_img"),
     ("R32F", "FLOAT_3D", "collider_img"),
 )
 
+# PBF constraint-solve iterations per substep. A fixed count rather than a
+# convergence check: the density constraint is a projection, not a stiff
+# spring, so a handful of Jacobi passes gets close enough without needing to
+# detect convergence on the GPU.
 _PASSES = (
+    "sph_normal",
+    "sph_predict",
     "sph_grid_key",
     "sph_sort",
     "sph_cell_clear",
     "sph_cell_range",
-    "sph_density",
-    "sph_force",
-    "sph_integrate",
+    "sph_lambda",
+    "sph_delta",
+    "sph_apply_delta",
+    "sph_velocity",
+    "sph_xsph",
+    "sph_finalize",
 )
 
 _state = {
@@ -172,34 +213,38 @@ class SolverConfig:
         "spacing",
         "mass",
         "rest_density",
-        "stiffness",
+        "relaxation",
+        "scorr_strength",
+        "surface_tension",
         "viscosity",
         "max_substeps",
+        "iterations",
     )
 
     @property
     def particle_radius(self):
         return self.spacing * 0.5
 
-    @property
-    def sound_speed(self):
-        """Tait EOS speed of sound: c^2 = dp/drho at rest density, gamma = 7."""
-        return math.sqrt(7.0 * self.stiffness / max(self.rest_density, 1e-6))
-
     def substep_dt(self, frame_dt):
-        """(substeps, dt) covering `frame_dt` without exceeding the CFL limit.
+        """(substeps, dt) covering `frame_dt` without exceeding the diffusion/
+        free-fall limit.
 
-        When the CFL limit needs more substeps than the budget allows, the
-        solver advances less than a full frame of simulated time rather than
-        going unstable - i.e. it degrades to slow motion, visibly.
+        PBF's density constraint is a projection, unconditionally stable on
+        its own - unlike WCSPH there is no speed-of-sound/stiffness term
+        bounding it. What remains is bounding how far a particle can predict
+        forward under gravity alone before the constraint loop's neighbor
+        grid (built from that prediction) goes stale, and XSPH's own explicit
+        diffusion limit, both ported from WCSPH unchanged. When the budget
+        needs more substeps than allowed, the solver advances less than a
+        full frame of simulated time rather than going unstable - i.e. it
+        degrades to slow motion, visibly.
         """
-        cfl_dt = CFL_FACTOR * self.smoothing_radius / max(self.sound_speed, 1e-6)
         gravity_dt = CFL_FACTOR * math.sqrt(self.smoothing_radius / abs(GRAVITY))
         # Diffusion limit: an explicit viscosity term goes unstable once it can
         # transport momentum more than a smoothing radius in one substep.
         kinematic = self.viscosity / max(self.rest_density, 1e-6)
         viscous_dt = 0.125 * self.smoothing_radius**2 / max(kinematic, 1e-12)
-        limit = min(cfl_dt, gravity_dt, viscous_dt)
+        limit = min(gravity_dt, viscous_dt)
         steps = min(max(1, math.ceil(frame_dt / limit)), self.max_substeps)
         return steps, min(frame_dt / steps, limit)
 
@@ -214,7 +259,10 @@ def _resolve_config(domain):
     config.hi = hi
     config.fill_fraction = settings.fluid_level / 100.0
     config.rest_density = settings.rest_density
-    config.stiffness = settings.stiffness
+    config.relaxation = settings.pbf_relaxation
+    config.iterations = settings.pbf_iterations
+    config.scorr_strength = settings.pbf_scorr_k
+    config.surface_tension = settings.surface_tension
     config.viscosity = settings.viscosity
     config.max_substeps = settings.max_substeps
 
@@ -308,8 +356,13 @@ def _allocate(config):
     return {
         "positions_img": make_texture(config.particle_count, values=positions),
         "velocities_img": make_texture(config.particle_count, values=zeros),
-        "density_img": make_texture(config.particle_count, values=zeros),
-        "forces_img": make_texture(config.particle_count, values=zeros),
+        "lambda_img": make_texture(config.particle_count, values=zeros),
+        # Seeded from the same initial positions as positions_img: sph_normal
+        # (once surface tension lands) and the first substep's grid build both
+        # read predicted_img before sph_predict has ever run.
+        "predicted_img": make_texture(config.particle_count, values=positions),
+        "delta_img": make_texture(config.particle_count, values=zeros),
+        "normal_img": make_texture(config.particle_count, values=zeros),
         "keys_img": make_texture(config.sorted_count),
         "cell_start_img": make_texture(config.cell_count, channels=1, fmt="R32F"),
         "cell_end_img": make_texture(config.cell_count, channels=1, fmt="R32F"),
@@ -361,17 +414,24 @@ def push_constant_values(config, dt, i_collider, sort_k=0, sort_j=0):
     shaders/sph_common.glsl prelude, overriding only the slots it repurposes,
     so it is built here rather than inline in _bind().
     """
+    scorr_k_bits = struct.unpack("<i", struct.pack("<f", config.scorr_strength))[0]
+    tension_bits = struct.unpack("<i", struct.pack("<f", config.surface_tension))[0]
     return {
         "i_layout": (config.particle_count, TEXTURE_WIDTH, TEXTURE_WIDTH, config.sorted_count),
         "i_grid": (*config.cell_dims, config.cell_count),
-        "i_sort": (sort_k, sort_j, 0, 0),
+        # z/w carry sph_delta.glsl's s_corr strength and sph_predict.glsl's
+        # surface-tension coefficient (both bit-packed as floats), not sort
+        # parameters - sph_sort is the only pass that reads x/y, and it never
+        # reads z/w, so these ride for free in otherwise-unused lanes rather
+        # than needing a second push-constant block.
+        "i_sort": (sort_k, sort_j, scorr_k_bits, tension_bits),
         "f_lo": (*config.lo, config.cell_size),
         "f_hi": (*config.hi, config.particle_radius),
         "f_sph": (
             config.smoothing_radius,
             config.mass,
             config.rest_density,
-            config.stiffness,
+            config.relaxation,
         ),
         "f_sim": (config.viscosity, dt, GRAVITY, BOUNDARY_DAMPING),
         "i_collider": i_collider,
@@ -417,8 +477,17 @@ def _build_grid(dt):
 
 def _substep(dt):
     config = _state["config"]
+    # sph_predict.glsl treats sigma <= 0 as a no-op, so skip the normal/
+    # curvature pass's neighbor loop entirely when surface tension is off
+    # (the shipped default) rather than paying for a dispatch nothing reads.
+    if config.surface_tension > 0.0:
+        dispatch_1d(_bind("sph_normal", dt), config.particle_count, LOCAL_GROUP_SIZE)
+    dispatch_1d(_bind("sph_predict", dt), config.particle_count, LOCAL_GROUP_SIZE)
     _build_grid(dt)
-    for name in ("sph_density", "sph_force", "sph_integrate"):
+    for _ in range(config.iterations):
+        for name in ("sph_lambda", "sph_delta", "sph_apply_delta"):
+            dispatch_1d(_bind(name, dt), config.particle_count, LOCAL_GROUP_SIZE)
+    for name in ("sph_velocity", "sph_xsph", "sph_finalize"):
         dispatch_1d(_bind(name, dt), config.particle_count, LOCAL_GROUP_SIZE)
 
 
@@ -617,6 +686,22 @@ def _apply_cached(positions, velocities, frame):
     config = _state["config"]
     _state["textures"]["positions_img"] = make_texture(config.particle_count, values=positions)
     _state["textures"]["velocities_img"] = make_texture(config.particle_count, values=velocities)
+    # The grid build below reads predicted_img, not positions_img (see
+    # sph_grid_key.glsl) - a loaded frame has no "prediction" of its own, so
+    # this just mirrors positions_img the way a fresh seed does in _allocate().
+    _state["textures"]["predicted_img"] = make_texture(config.particle_count, values=positions)
+    # Also reset lambda_img rather than leaving whatever density the solver
+    # last computed for a *different* particle configuration: if surface
+    # tension is on, sph_normal reads lambda_img's density channel as a
+    # per-neighbor weight before sph_lambda ever runs against these loaded
+    # positions (see _substep's pass order). Zeroing it here mirrors
+    # _allocate()'s fresh seed, where every neighbor's density is the same
+    # clamped constant - that uniform weight cancels out of both the normal's
+    # direction and the curvature ratio, unlike a stale, non-uniform density
+    # left over from wherever the timeline was before this jump.
+    _state["textures"]["lambda_img"] = make_texture(
+        config.particle_count, values=[0.0] * (config.particle_count * 4)
+    )
     _state["last_frame"] = frame
     _state["warning"] = None
     _build_grid(0.0)

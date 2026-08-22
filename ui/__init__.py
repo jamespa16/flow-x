@@ -124,7 +124,10 @@ class FLOWX_PT_solver(Panel):
         col = layout.column(align=True)
         col.prop(settings, "smoothing_radius")
         col.prop(settings, "rest_density")
-        col.prop(settings, "stiffness")
+        col.prop(settings, "pbf_iterations")
+        col.prop(settings, "pbf_relaxation")
+        col.prop(settings, "pbf_scorr_k")
+        col.prop(settings, "surface_tension")
         col.prop(settings, "viscosity")
         col.prop(settings, "max_substeps")
 

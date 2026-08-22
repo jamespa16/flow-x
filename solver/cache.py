@@ -170,13 +170,16 @@ def config_hash(domain, scene):
     )
     digest.update(
         struct.pack(
-            "<fffffI",
+            "<fffffffII",
             settings.fluid_level,
             settings.smoothing_radius,
             settings.rest_density,
-            settings.stiffness,
+            settings.pbf_relaxation,
+            settings.pbf_scorr_k,
             settings.viscosity,
+            settings.surface_tension,
             settings.max_substeps,
+            settings.pbf_iterations,
         )
     )
     for name in collider_names(scene):

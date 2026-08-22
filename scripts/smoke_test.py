@@ -97,10 +97,41 @@ def _check_solver():
     print(f"[smoke_test] stepped SPH solver 3 frames: {stats}")
 
     _check_particles(sph, stats)
+    _check_pbf_convergence(sph, stats)
     _check_surface(sph, stats)
     _check_collider_grids()
     _check_playback(sph)
     _check_cache(sph)
+
+
+def _check_pbf_convergence(sph, stats):
+    """PBF's actual promise: the density constraint should hold near rest.
+
+    WCSPH never had this property to check - its pressure was a spring
+    reacting to density error, not a projection onto it. lambda_img.x holds
+    each particle's density as of its last constraint-solve iteration (see
+    sph_lambda.glsl); after a few frames of settling under gravity alone
+    (no collider/wall contact forcing local compression), the mean should sit
+    close to rest_density if the constraint loop is doing its job.
+    """
+    mod = sys.modules[ADDON_MODULE]
+    gpu_util = mod.solver.gpu_util
+    config = sph._state["config"]
+    densities = gpu_util.read_texture(
+        sph._state["textures"]["lambda_img"], config.particle_count, channels=1
+    )
+    mean_density = sum(densities) / len(densities)
+    rest_density = config.rest_density
+    error = abs(mean_density - rest_density) / rest_density
+    print(
+        f"[smoke_test] PBF mean density {mean_density:.1f} vs rest "
+        f"{rest_density:.1f} ({error * 100:.1f}% error)"
+    )
+    if error > 0.15:
+        raise RuntimeError(
+            f"PBF density constraint not converging: {error * 100:.1f}% mean error "
+            f"after {stats['frame']} frames"
+        )
 
 
 def _check_playback(sph):

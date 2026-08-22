@@ -20,7 +20,7 @@ void main()
 
   float key = float(i_grid.w);
   if (i < particle_count()) {
-    vec3 p = imageLoad(positions_img, particle_texel(i)).xyz;
+    vec3 p = imageLoad(predicted_img, particle_texel(i)).xyz;
     key = float(cell_index(cell_coord(p)));
   }
 
