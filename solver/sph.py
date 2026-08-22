@@ -73,6 +73,7 @@ from .gpu_util import (
     bind_image,
     bind_push_constants,
     build_compute_shader,
+    context_available,
     dispatch_1d,
     make_texture,
     read_texture,
@@ -186,8 +187,23 @@ _state = {
     # asks for something the solver cannot honestly deliver.
     "seed_frame": 0,
     "last_frame": 0,
+    # The frame the GPU textures actually represent. Normally equal to
+    # last_frame, but the CPU render path advances last_frame without touching
+    # the GPU, so after a render the two can diverge and a forward step must
+    # re-sync the GPU state before simulating from it.
+    "gpu_frame": 0,
     "warning": None,
     "timings": deque(maxlen=TIMING_WINDOW),
+    # Bake Cache bookkeeping: `baking` gates the timer that steps the timeline
+    # forward one frame per tick, and `bake_target` is the frame it stops at
+    # (the scene's end frame).
+    "baking": False,
+    "bake_target": None,
+    # True while a render is running, set by the render_pre/render_post
+    # handlers. render_pre fires before the first frame's frame_change_pre, so
+    # - unlike the compute context, which Blender only drops partway into that
+    # first frame - every rendered frame sees this and takes the CPU path.
+    "rendering": False,
 }
 
 
@@ -550,15 +566,28 @@ def _step(frame_dt, frame):
     positions = None
     if cache.is_open() or _state["domain"].flowx_domain.show_particles:
         positions = read_texture(_state["textures"]["positions_img"], config.particle_count)
+    velocities = None
     if cache.is_open():
         velocities = read_texture(_state["textures"]["velocities_img"], config.particle_count)
-        cache.write_frame(frame, positions, velocities, _state["domain"])
 
     _update_surface(dt)
     _update_whitewater(frame_dt, frame)
+    # The cache write comes after the surface and whitewater are extracted so
+    # it stores this frame's own mesh, not the previous frame's - the render
+    # path replays exactly what was written here.
+    if cache.is_open():
+        cache.write_frame(
+            frame,
+            positions,
+            velocities,
+            _state["domain"],
+            surface.last_mesh(),
+            whitewater.last_points(),
+        )
     _update_viz(positions)
 
     _state["last_frame"] = frame
+    _state["gpu_frame"] = frame
     _state["timings"].append((time.perf_counter() - started) * 1000.0)
 
 
@@ -661,6 +690,8 @@ def _reset_clock(scene):
     """Pin the run's timeline to `scene` and drop the previous run's stats."""
     _state["seed_frame"] = scene.frame_start
     _state["last_frame"] = scene.frame_current
+    # Just re-seeded, so the GPU state is the seed at the current frame.
+    _state["gpu_frame"] = scene.frame_current
     _state["warning"] = None
     _state["substeps"] = 0
     _state["timings"].clear()
@@ -677,10 +708,15 @@ def _start(domain):
     _seed(domain)
     _reset_clock(bpy.context.scene)
     cache.open(bpy.context.scene, domain, _state["config"].particle_count)
+    # The seed surface was extracted in _seed; store it in the mesh cache so a
+    # render has the first frame's surface to replay (the particle file skips
+    # the seed frame, but the mesh file keeps it).
+    cache.write_seed_mesh(domain, bpy.context.scene, surface.last_mesh(), whitewater.last_points())
 
     viz.enable()
     if _on_frame_change not in bpy.app.handlers.frame_change_pre:
         bpy.app.handlers.frame_change_pre.append(_on_frame_change)
+    _register_render_handlers()
     viz.tag_viewports_redraw()
 
 
@@ -702,15 +738,20 @@ def reseed(scene=None):
     _reset_clock(scene)
     # Re-open the cache so a mid-run edit to any hashed setting - or to the
     # toggle itself - decides the file's fate on this re-seed: reuse while the
-    # hash still matches, start fresh when it has moved.
+    # hash still matches, start fresh when it has moved. The re-extracted seed
+    # surface is re-stored in the mesh cache so a render has the first frame.
     cache.open(scene, domain, _state["config"].particle_count)
+    cache.write_seed_mesh(domain, scene, surface.last_mesh(), whitewater.last_points())
     viz.tag_viewports_redraw()
     return True
 
 
 def stop():
+    cancel_bake()
     if _on_frame_change in bpy.app.handlers.frame_change_pre:
         bpy.app.handlers.frame_change_pre.remove(_on_frame_change)
+    _unregister_render_handlers()
+    _state["rendering"] = False
     cache.close()
     surface.stop()
     whitewater.stop()
@@ -736,6 +777,66 @@ def stop_deferred():
     viz.disable()
     if not bpy.app.timers.is_registered(_deferred_stop):
         bpy.app.timers.register(_deferred_stop, first_interval=0.1)
+
+
+def start_bake(scene=None, domain=None):
+    """Bake the disk cache from the scene's start frame to its end frame.
+
+    Enables caching, starts the solver if it isn't running, re-seeds at the
+    start frame, and then steps the timeline forward one frame per timer tick
+    so every frame is simulated on the GPU and written to the cache -
+    particles and the extracted surface. The surface is what a later render
+    replays on the CPU. Returns True if the bake started.
+    """
+    scene = scene or bpy.context.scene
+    domain = domain or find_domain(scene)
+    if domain is None or is_degenerate(domain):
+        return False
+    # Caching must be on for the bake to accumulate a file; force it so the
+    # user doesn't have to remember, and the render path has something to read.
+    domain.flowx_domain.cache_enabled = True
+    if not _state["running"]:
+        _start(domain)
+    # Force a clean re-seed at the start frame so the bake covers the whole
+    # range from the seed, opens the cache, and records the seed frame's
+    # surface - explicitly, rather than hoping a frame_set trips the re-seed
+    # path (it short-circuits when the clock already sits on the start frame).
+    scene.frame_set(scene.frame_start)
+    reseed(scene)
+    _state["baking"] = True
+    _state["bake_target"] = scene.frame_end
+    if not bpy.app.timers.is_registered(_bake_tick):
+        bpy.app.timers.register(_bake_tick, first_interval=0.05)
+    return True
+
+
+def cancel_bake():
+    """Stop a running bake. The simulation is left running, ready to render."""
+    _state["baking"] = False
+    if bpy.app.timers.is_registered(_bake_tick):
+        bpy.app.timers.unregister(_bake_tick)
+
+
+def is_baking():
+    return _state["baking"]
+
+
+def _bake_tick():
+    """Step one frame of the bake per timer tick, until the scene's end frame."""
+    if not _state["baking"] or not _state["running"]:
+        _state["baking"] = False
+        return None
+    scene = bpy.context.scene
+    frame = scene.frame_current
+    if frame >= _state["bake_target"]:
+        _state["baking"] = False
+        return None
+    # frame_set triggers _on_frame_change, which simulates this frame (the GPU
+    # is available in the viewport) and writes it - particles and surface - to
+    # the cache. Returning 0.0 reschedules the next tick as soon as possible;
+    # the tick boundary is what keeps the UI responsive and the bake cancellable.
+    scene.frame_set(frame + 1)
+    return 0.0
 
 
 def _frame_dt(scene):
@@ -780,10 +881,40 @@ def _apply_cached(positions, velocities, frame):
         config.particle_count, values=array("f", [0.0]) * (config.particle_count * 4), width=width
     )
     _state["last_frame"] = frame
+    _state["gpu_frame"] = frame
     _state["warning"] = None
     _build_grid(0.0)
     _update_surface(0.0)
     _update_viz()
+    viz.tag_viewports_redraw()
+
+
+def _install_cached_mesh(frame, scene, domain):
+    """CPU render path: install a frame's baked surface without the GPU.
+
+    During a render the compute context is owned by the render, so the sim
+    cannot step and the usual cache-load path (which re-derives the surface on
+    the GPU) cannot run either. If the disk cache holds this frame's extracted
+    surface (from a prior bake), rebuild the surface and whitewater child
+    objects from it with plain bmesh and skip every GPU pass. A frame the bake
+    did not cover warns rather than silently freezing the surface.
+    """
+    if not cache.is_open():
+        _state["warning"] = (
+            "Rendering needs a baked cache: the simulation cannot run on the GPU "
+            "while a render owns it. Bake the cache first (Playback > Bake "
+            "Cache), then render."
+        )
+        return
+    mesh = cache.load_mesh(frame, scene, domain)
+    if mesh is None:
+        _state["warning"] = cache.warning()
+        return
+    vertices, triangles, ww_points = mesh
+    surface.install_mesh(domain, vertices, triangles)
+    whitewater.install_points(domain, ww_points)
+    _state["last_frame"] = frame
+    _state["warning"] = None
     viz.tag_viewports_redraw()
 
 
@@ -824,6 +955,44 @@ def _pick_up_cache_end(scene, domain, frame):
     return True
 
 
+def _in_render():
+    """Whether a render is running and owns the GPU.
+
+    A backup signal for the rendering flag: true for most of a render, though
+    like the compute context it lags on the very first frame.
+    """
+    try:
+        return bpy.app.is_job_running("render", "render")
+    except Exception:
+        return False
+
+
+@persistent
+def _on_render_pre(scene, _depsgraph):
+    """Mark the run as rendering. Fires before the first frame's handler."""
+    _state["rendering"] = True
+
+
+@persistent
+def _on_render_post(scene, _depsgraph):
+    """Clear the rendering mark after a frame (or a still) has rendered."""
+    _state["rendering"] = False
+
+
+def _register_render_handlers():
+    if _on_render_pre not in bpy.app.handlers.render_pre:
+        bpy.app.handlers.render_pre.append(_on_render_pre)
+    if _on_render_post not in bpy.app.handlers.render_post:
+        bpy.app.handlers.render_post.append(_on_render_post)
+
+
+def _unregister_render_handlers():
+    if _on_render_pre in bpy.app.handlers.render_pre:
+        bpy.app.handlers.render_pre.remove(_on_render_pre)
+    if _on_render_post in bpy.app.handlers.render_post:
+        bpy.app.handlers.render_post.remove(_on_render_post)
+
+
 @persistent
 def _on_frame_change(scene, _depsgraph):
     """Step the solver to `scene.frame_current`, or say why it can't.
@@ -850,6 +1019,18 @@ def _on_frame_change(scene, _depsgraph):
         return
 
     frame = scene.frame_current
+    # While a render owns the GPU the sim cannot step: the compute context is
+    # dropped (and the cache-load path below is GPU-bound too), so replay the
+    # frame's baked surface on the CPU instead - no GPU work at all. The
+    # rendering flag (set in render_pre, which fires before this handler even
+    # on the first frame) is the reliable signal; _in_render() and the compute
+    # context probe are backups, since Blender only drops the context partway
+    # into the first frame. Checked before the frame==last_frame short-circuit:
+    # every rendered frame must install its cached surface even if the clock
+    # already sits on it.
+    if _state["rendering"] or _in_render() or not context_available():
+        _install_cached_mesh(frame, scene, domain)
+        return
     if frame == _state["last_frame"]:
         # Re-entering the frame the state already represents (a frame_set to
         # the current frame): there is nothing to advance and nothing wrong.
@@ -898,6 +1079,16 @@ def _on_frame_change(scene, _depsgraph):
         # holds none.
         _state["warning"] = None if cache.is_open() else cache.warning()
 
+    # If the GPU state is behind the logical clock - a CPU render advanced
+    # last_frame without touching the GPU - re-sync it from the cache before
+    # stepping, so we don't simulate forward from a stale frame.
+    if _state["gpu_frame"] != _state["last_frame"]:
+        reloaded = _load_cached(_state["last_frame"], scene, domain)
+        if reloaded is not None:
+            _apply_cached(*reloaded, _state["last_frame"])
+        elif not reseed(scene):
+            stop_deferred()
+            return
     frame_dt = _frame_dt(scene)
     target = _state["last_frame"] + pending
     while _state["last_frame"] < target:
@@ -1021,5 +1212,33 @@ class FLOWX_OT_sph_reset(Operator):
         self.report(
             {"INFO"},
             f"Flow-X simulation re-seeded ({_state['config'].particle_count} particles)",
+        )
+        return {"FINISHED"}
+
+
+class FLOWX_OT_sph_bake(Operator):
+    """Bake the disk cache (particles and surface) from the start frame to the end"""
+
+    bl_idname = "flowx.sph_bake"
+    bl_label = "Bake Cache"
+    # Not UNDO: the bake writes files outside Blender's undo stack and advances
+    # the timeline over many ticks - there is no single undo to capture it.
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        return find_domain(context.scene) is not None
+
+    def execute(self, context):
+        if is_baking():
+            cancel_bake()
+            self.report({"INFO"}, "Flow-X bake stopped - the cache is ready to render.")
+            return {"FINISHED"}
+        if not start_bake(context.scene, find_domain(context.scene)):
+            self.report({"WARNING"}, "Could not start the bake - no valid domain.")
+            return {"CANCELLED"}
+        self.report(
+            {"INFO"},
+            f"Flow-X baking the cache to frame {context.scene.frame_end} " "(Stop Baking cancels).",
         )
         return {"FINISHED"}

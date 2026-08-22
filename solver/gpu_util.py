@@ -62,6 +62,24 @@ def texture_size(count):
     return width, max(1, math.ceil(count / width))
 
 
+def context_available():
+    """Whether a GPU compute context is active right now.
+
+    While a render owns the GPU, Blender drops the compute context, so even a
+    trivial texture allocation raises 'No active GPU context found'. Probing
+    with a 1x1 texture lets the solver tell 'viewport / interactive' (compute
+    available, step the sim) from 'mid-render' (compute unavailable, replay
+    the disk cache on the CPU instead). The throwaway texture is not stored,
+    so refcounting releases it - no explicit free() to call, which the API
+    does not guarantee.
+    """
+    try:
+        gpu.types.GPUTexture((1, 1, 1), format="R32F")
+        return True
+    except Exception:
+        return False
+
+
 def make_texture(count, channels=4, values=None, fmt="RGBA32F", width=None):
     """Allocate a 2D texture holding a flat array of `count` items.
 

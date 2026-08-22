@@ -37,6 +37,17 @@ Each frame (fixed size):
 tail from a crash is ignored on load. The seed frame itself is never stored:
 its state is the deterministic seed, and the handler re-seeds there anyway.
 
+Paired surface-mesh file. Next to the particle file sits
+`<base>.flowx_cache.mesh`, an append-only log (no header) of the extracted
+surface and whitewater for every frame, seed frame included. Mesh records are
+variable-sized, so unlike the particle file they are addressed through an
+in-memory {frame: offset} index built by scanning the file on open, and a torn
+tail is detected and truncated the same way. This file exists for the CPU
+render path: while a render owns the GPU the sim cannot step, so the surface
+is replayed from here (load_mesh) instead of re-extracted. It is validated
+through the particle file's header - the config hash now covers the surface
+and whitewater settings, so a look change invalidates the pair.
+
 Validity. The config hash covers everything that changes the physics: the
 extension version (code constants live in it), the frame rate, the domain's
 world bounds, resolution and collider voxel multiplier, every solver
@@ -82,6 +93,13 @@ _state = {
     "file": None,
     "path": None,
     "header": None,
+    # The paired surface-mesh cache: an append-only log of per-frame extracted
+    # meshes (variable size, so no arithmetic offsets - a {frame: offset} index
+    # is built by scanning the file on open). It carries no header of its own;
+    # it is validated through the particle file's header next door.
+    "mesh_file": None,
+    "mesh_path": None,
+    "mesh_index": None,
     "warning": None,
 }
 
@@ -184,6 +202,39 @@ def config_hash(domain, scene):
             settings.max_particles,
         )
     )
+    # The surface and whitewater settings do not change the physics (the
+    # particle cache is valid regardless), but they change the *extracted*
+    # surface and whitewater the mesh cache stores - so a look change must
+    # invalidate the mesh file too, or a render would replay a stale surface.
+    # Both files share this one hash, so toggling either re-bakes the pair.
+    s = settings
+    digest.update(
+        struct.pack(
+            "<fffI" + "f" * 18,
+            float(s.show_surface),
+            s.surface_multiplier,
+            s.surface_iso,
+            int(s.whitewater_capacity),
+            float(s.show_whitewater),
+            s.whitewater_spawn_rate,
+            s.whitewater_trapped_air_weight,
+            s.whitewater_wave_crest_weight,
+            s.whitewater_kinetic_weight,
+            s.whitewater_kinetic_reference_speed,
+            s.whitewater_spray_speed_threshold,
+            s.whitewater_bubble_trapped_threshold,
+            s.whitewater_jitter_strength,
+            s.whitewater_normal_offset,
+            s.whitewater_spray_life_min,
+            s.whitewater_spray_life_max,
+            s.whitewater_foam_life_min,
+            s.whitewater_foam_life_max,
+            s.whitewater_bubble_life_min,
+            s.whitewater_bubble_life_max,
+            s.whitewater_drag,
+            s.whitewater_buoyancy,
+        )
+    )
     for name in collider_names(scene):
         digest.update(name.encode("utf-8"))
         mesh_fp = mesh_fingerprint(name)
@@ -200,6 +251,17 @@ def cache_path(domain, scene):
     if bpy.data.filepath:
         return Path(bpy.data.filepath).with_suffix(".flowx_cache")
     return Path(tempfile.gettempdir()) / "flow-x" / f"{scene.name}.flowx_cache"
+
+
+def _mesh_path(particle_path):
+    """The paired surface-mesh cache, next to the particle file.
+
+    `<base>.flowx_cache` holds the particle snapshots; `<base>.flowx_cache.mesh`
+    holds the extracted surface + whitewater for the CPU render path. Appending
+    `.mesh` to the full name (rather than swapping the suffix) keeps the pair
+    together regardless of what the particle file is called.
+    """
+    return particle_path.parent / (particle_path.name + ".mesh")
 
 
 def _pack_header(header):
@@ -332,14 +394,114 @@ def open(scene, domain, particle_count):
             file.write(packed)
             file.flush()
         _state.update(file=file, path=str(path), header=header)
+        _open_mesh_file(path)
     except OSError as exc:
         _state["warning"] = (
             f"The cache file could not be opened ({exc}) - the run continues " "without a cache"
         )
 
 
-def write_frame(frame, positions, velocities, domain):
+def _open_mesh_file(particle_path):
+    """Open (or remember the path of) the paired surface-mesh cache.
+
+    An existing file is opened read+append and its {frame: offset} index is
+    built by scanning the records; a file that does not exist yet is only
+    remembered, so the first bake creates it rather than a read-only run
+    leaving an empty file behind.
+    """
+    mesh_path = _mesh_path(particle_path)
+    _state["mesh_path"] = str(mesh_path)
+    _state["mesh_file"] = None
+    _state["mesh_index"] = None
+    if mesh_path.exists():
+        _state["mesh_file"] = mesh_path.open("a+b")
+        _state["mesh_index"] = _scan_mesh_index(_state["mesh_file"])
+
+
+def _scan_mesh_index(file):
+    """The {frame: byte offset} of every complete record in the mesh file.
+
+    Mesh records are variable-sized, so there are no arithmetic offsets: walk
+    the file, reading each record's 16-byte header (frame, then the vert, tri
+    and whitewater counts) to compute its length and skip to the next. A
+    partial record at the end - a torn tail from a crash mid-write - is
+    detected when the file ends before a record's declared size and is
+    truncated away, so a restart resumes from the last complete frame.
+    """
+    index = {}
+    file.seek(0)
+    size = file.seek(0, 2)
+    file.seek(0)
+    offset = 0
+    last_good = 0
+    while offset + 16 <= size:
+        file.seek(offset)
+        head = file.read(16)
+        if len(head) < 16:
+            break
+        frame, vn, tn, wn = struct.unpack("<4i", head)
+        if vn < 0 or tn < 0 or wn < 0:
+            break  # corrupt header - stop at the last good record
+        record = 16 + vn * 12 + tn * 12 + wn * 20
+        if offset + record > size:
+            break  # torn tail
+        index[frame] = offset
+        last_good = offset + record
+        offset += record
+    if last_good < size:
+        file.seek(last_good)
+        file.truncate()
+    return index
+
+
+def _append_mesh(frame, mesh, ww):
+    """Append one frame's extracted surface to the mesh cache (or skip it).
+
+    A no-op when the cache is closed, there is no mesh to store, or the frame
+    is already recorded - a deterministic re-run produces the identical mesh,
+    so re-simulating a cached frame must not append a duplicate. The first
+    call creates the file if open() only remembered its path.
+    """
+    if mesh is None or _state["mesh_path"] is None:
+        return
+    if _state["mesh_file"] is None:
+        try:
+            _state["mesh_file"] = Path(_state["mesh_path"]).open("a+b")
+            _state["mesh_index"] = _scan_mesh_index(_state["mesh_file"])
+        except OSError:
+            return
+    index = _state["mesh_index"]
+    if index is None or frame in index:
+        return
+    vertices, triangles = mesh
+    ww = ww or []
+    mesh_file = _state["mesh_file"]
+    try:
+        mesh_file.seek(0, 2)
+        offset = mesh_file.tell()
+        vn, tn, wn = len(vertices), len(triangles), len(ww)
+        mesh_file.write(struct.pack("<4i", frame, vn, tn, wn))
+        if vn:
+            mesh_file.write(struct.pack(f"<{vn * 3}f", *[c for v in vertices for c in v]))
+        if tn:
+            mesh_file.write(struct.pack(f"<{tn * 3}I", *[c for t in triangles for c in t]))
+        if wn:
+            mesh_file.write(struct.pack(f"<{wn * 5}f", *[c for p in ww for c in p]))
+        mesh_file.flush()
+        index[frame] = offset
+    except OSError:
+        # A mesh write failure must not kill the run: the particle cache is the
+        # primary one, and a missing frame only warns at render time.
+        pass
+
+
+def write_frame(frame, positions, velocities, domain, mesh=None, ww=None):
     """Append one simulated frame (per-item 4-tuples, as read_texture returns).
+
+    `mesh` is the frame's (vertices, triangles) and `ww` its whitewater
+    points, stored in the paired mesh file for the CPU render path - they are
+    written after the surface and whitewater have been extracted for this
+    frame, so the caller must pass the frame's own, not a previous frame's.
 
     A no-op while the cache is closed; a failure closes the cache and records
     a panel warning rather than interrupting the run. The config hash is
@@ -379,6 +541,23 @@ def write_frame(frame, positions, velocities, domain):
         file.flush()
     except OSError as exc:
         _fail(f"writing the cache failed ({exc}) - the run continues without a cache")
+    _append_mesh(frame, mesh, ww)
+
+
+def write_seed_mesh(domain, scene, mesh, ww):
+    """Write the seed frame's surface to the mesh cache.
+
+    The particle file never stores the seed frame (its state is the
+    deterministic seed, re-derived on load), but the render path still needs
+    the seed frame's extracted surface - it is the first rendered frame - so
+    it is stored in the mesh file alone. Called right after open(), once the
+    seed surface has been extracted.
+    """
+    if _state["file"] is None or _state["header"] is None:
+        return
+    if config_hash(domain, scene) != _state["header"]["config_hash"]:
+        return
+    _append_mesh(_state["header"]["seed_frame"], mesh, ww)
 
 
 def try_load(frame, scene, domain):
@@ -423,29 +602,93 @@ def try_load(frame, scene, domain):
     return positions, velocities
 
 
+def load_mesh(frame, scene, domain):
+    """(vertices, triangles, whitewater) for a baked frame, or None + warning.
+
+    The CPU render path: during a render the compute context is owned by the
+    render, so the frame's surface is replayed from the mesh file instead of
+    being re-extracted on the GPU. The frame must be in the file's index and
+    the scene must still hash to the particle file's config hash - which now
+    covers the surface and whitewater settings the stored mesh depends on.
+    """
+    index = _state["mesh_index"]
+    file = _state["mesh_file"]
+    header = _state["header"]
+    if index is None or file is None:
+        _state["warning"] = (
+            "No baked surface cache - bake the cache (Playback > Bake Cache) " "before rendering."
+        )
+        return None
+    if header is not None and config_hash(domain, scene) != header["config_hash"]:
+        _state["warning"] = (
+            "The baked cache no longer matches the settings - bake again to " "update it."
+        )
+        return None
+    if frame not in index:
+        _state["warning"] = (
+            f"Frame {frame} is not in the baked surface cache - render a range "
+            "the bake covered, or bake further."
+        )
+        return None
+    try:
+        file.seek(index[frame])
+        _frame, vn, tn, wn = struct.unpack("<4i", file.read(16))
+        flat = list(struct.unpack(f"<{vn * 3}f", file.read(vn * 12))) if vn else []
+        vertices = [flat[i : i + 3] for i in range(0, len(flat), 3)]
+        flat = list(struct.unpack(f"<{tn * 3}I", file.read(tn * 12))) if tn else []
+        triangles = [flat[i : i + 3] for i in range(0, len(flat), 3)]
+        flat = list(struct.unpack(f"<{wn * 5}f", file.read(wn * 20))) if wn else []
+        ww = [flat[i : i + 5] for i in range(0, len(flat), 5)]
+    except (OSError, struct.error):
+        _state["warning"] = "The baked surface cache could not be read."
+        return None
+    _state["warning"] = None
+    return vertices, triangles, ww
+
+
 def close():
-    """Flush and drop the open file. A recorded warning is kept for the panel."""
+    """Flush and drop the open files. A recorded warning is kept for the panel."""
     file = _state["file"]
     if file is not None:
         try:
             file.close()
         except OSError:
             pass
-    _state.update(file=None, path=None, header=None)
+    mesh_file = _state["mesh_file"]
+    if mesh_file is not None:
+        try:
+            mesh_file.close()
+        except OSError:
+            pass
+    _state.update(
+        file=None,
+        path=None,
+        header=None,
+        mesh_file=None,
+        mesh_path=None,
+        mesh_index=None,
+    )
 
 
 def clear(domain, scene):
-    """Delete the cache file. Returns (ok, message) for the operator's report."""
+    """Delete the cache files (particles and the paired surface mesh).
+
+    Returns (ok, message) for the operator's report.
+    """
     close()
     _state["warning"] = None
     path = cache_path(domain, scene)
-    try:
-        if not path.exists():
-            return False, f"No cache file to delete at {path}."
-        path.unlink()
-    except OSError as exc:
-        return False, f"The cache file could not be deleted ({exc})."
-    return True, f"Deleted {path}."
+    deleted = []
+    for p in (path, _mesh_path(path)):
+        try:
+            if p.exists():
+                p.unlink()
+                deleted.append(str(p))
+        except OSError as exc:
+            return False, f"The cache file could not be deleted ({exc})."
+    if not deleted:
+        return False, f"No cache file to delete at {path}."
+    return True, f"Deleted {', '.join(deleted)}."
 
 
 def is_open():
@@ -470,14 +713,27 @@ def info():
             size = Path(path).stat().st_size
         except OSError:
             pass
+    mesh_size = None
+    mesh_path = _state["mesh_path"]
+    if mesh_path is not None:
+        try:
+            mesh_size = Path(mesh_path).stat().st_size
+        except OSError:
+            pass
     frames = None
     if header is not None and header["last_frame"] > header["seed_frame"]:
         frames = (header["seed_frame"] + 1, header["last_frame"])
+    # The mesh file's coverage includes the seed frame (the particle file's
+    # does not), so report it from the index rather than the header.
+    index = _state["mesh_index"]
+    mesh_frames = (min(index), max(index)) if index else None
     return {
         "open": _state["file"] is not None,
         "path": path,
         "frames": frames,
         "size": size,
+        "mesh_frames": mesh_frames,
+        "mesh_size": mesh_size,
         "warning": _state["warning"],
     }
 

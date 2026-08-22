@@ -22,11 +22,12 @@ import bpy
 from . import cache, gpu_test, sph, surface, viz, whitewater
 from .cache import FLOWX_OT_cache_clear
 from .gpu_test import PARTICLE_COUNT, FLOWX_OT_solver_gpu_test_toggle
-from .sph import FLOWX_OT_sph_reset, FLOWX_OT_sph_toggle
+from .sph import FLOWX_OT_sph_bake, FLOWX_OT_sph_reset, FLOWX_OT_sph_toggle
 
 __all__ = [
     "FLOWX_OT_cache_clear",
     "FLOWX_OT_solver_gpu_test_toggle",
+    "FLOWX_OT_sph_bake",
     "FLOWX_OT_sph_reset",
     "FLOWX_OT_sph_toggle",
     "PARTICLE_COUNT",
@@ -41,6 +42,7 @@ _classes = (
     FLOWX_OT_solver_gpu_test_toggle,
     FLOWX_OT_sph_toggle,
     FLOWX_OT_sph_reset,
+    FLOWX_OT_sph_bake,
     FLOWX_OT_cache_clear,
 )
 

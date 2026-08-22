@@ -9,6 +9,7 @@ from ..solver import (
     PARTICLE_COUNT,
     FLOWX_OT_cache_clear,
     FLOWX_OT_solver_gpu_test_toggle,
+    FLOWX_OT_sph_bake,
     FLOWX_OT_sph_reset,
     FLOWX_OT_sph_toggle,
     gpu_test,
@@ -226,9 +227,25 @@ class FLOWX_PT_playback(Panel):
             col.label(
                 text="Off until enabled - then scrubbing back loads frames instead of re-running."
             )
+        if cache["mesh_frames"] is not None:
+            mfirst, mlast = cache["mesh_frames"]
+            msize = (cache["mesh_size"] or 0) / 1048576.0
+            col.label(text=f"Surface baked {mfirst}-{mlast} ({msize:.1f} MB)")
+        elif cache["frames"] is None:
+            col.label(text="No baked surface yet - renders freeze without it. Bake to record one.")
         if cache["warning"]:
             for line in _wrap(cache["warning"], 44):
                 col.label(text=line, icon="ERROR")
+        # The render can't step the sim on the GPU (the render owns it), so it
+        # replays a baked surface. Bake records the whole range first; the
+        # button doubles as the cancel while it runs.
+        baking = sph.is_baking()
+        col.operator(
+            FLOWX_OT_sph_bake.bl_idname,
+            text="Stop Baking" if baking else "Bake Cache",
+            icon="PAUSE" if baking else "FILE_TICK",
+            depress=baking,
+        )
         col.operator(FLOWX_OT_cache_clear.bl_idname, text="Clear Cache", icon="TRASH")
 
         box = layout.box()

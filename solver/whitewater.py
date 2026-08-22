@@ -121,6 +121,9 @@ _state = {
     "object": None,
     "cursor": 0,
     "live": 0,
+    # The last installed (x, y, z, life, kind) points, kept so the disk cache
+    # can store a frame's whitewater and the CPU render path can replay it.
+    "last_points": None,
 }
 
 
@@ -229,6 +232,10 @@ def reseed(domain, fluid_config):
     _state["cursor"] = 0
     _state["live"] = 0
     _state["object"] = _whitewater_object(domain)
+    # The pool is zeroed, so the honest display is no points - clear whatever
+    # a previous run left in the object and record an empty live set (which is
+    # also what the seed frame's cache record stores).
+    _set_points(_state["object"], [])
 
 
 def stop():
@@ -400,15 +407,16 @@ def _whitewater_object(domain):
     return obj
 
 
-def _rebuild_points(obj, positions, vel_kind):
-    """Replace the object's geometry with the pool's currently-live points."""
+def _set_points(obj, alive):
+    """Replace the object's geometry from a list of (x, y, z, life, kind) points.
+
+    Shared by the GPU read-back path (_rebuild_points) and the CPU render path
+    (install_mesh): both end with a list of live points and need the same
+    bmesh rebuild plus life/kind attributes.
+    """
     mesh = obj.data
-    alive = [
-        (p[0], p[1], p[2], p[3], vk[3])
-        for p, vk in zip(positions, vel_kind, strict=True)
-        if p[3] > 0.0
-    ]
     _state["live"] = len(alive)
+    _state["last_points"] = alive
 
     if not alive:
         mesh.clear_geometry()
@@ -431,3 +439,28 @@ def _rebuild_points(obj, positions, vel_kind):
     for i, (_x, _y, _z, life, kind) in enumerate(alive):
         life_attr.data[i].value = life
         kind_attr.data[i].value = int(kind)
+
+
+def _rebuild_points(obj, positions, vel_kind):
+    """Replace the object's geometry with the pool's currently-live points."""
+    alive = [
+        (p[0], p[1], p[2], p[3], vk[3])
+        for p, vk in zip(positions, vel_kind, strict=True)
+        if p[3] > 0.0
+    ]
+    _set_points(obj, alive)
+
+
+def install_points(domain, points):
+    """Rebuild the whitewater object from cached points, with no GPU.
+
+    The CPU render path: `points` are the (x, y, z, life, kind) tuples replayed
+    from the disk cache, and `domain` only locates the child object.
+    """
+    obj = _whitewater_object(domain)
+    _set_points(obj, points)
+
+
+def last_points():
+    """The (x, y, z, life, kind) points last installed, or None if never built."""
+    return _state["last_points"]

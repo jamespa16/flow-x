@@ -98,12 +98,17 @@ play, done.
   advected with coarse per-kind motion, and the live pool is read back into
   the `<Domain>.Whitewater` point-cloud child - off by default.
 - **Deterministic.** Seeding uses a fixed RNG seed and the substep size comes
-  only from the scene's frame rate, so the same timeline replays identically.
+  only from the scene's frame rate, so the same timeline replays to the same
+  particle state (bit-for-bit, which is what the cache relies on).
 - **Cache.** With *Cache to Disk* enabled, each frame's positions and
   velocities are appended to a binary file as the run goes, and a backward
-  scrub loads the frame from it instead of re-simulating. A settings hash and
-  a per-frame fingerprint of every collider's transform validate the file
-  before anything is loaded from it.
+  scrub loads the frame from it instead of re-simulating. A paired surface
+  file stores the extracted mesh for the render path. A settings hash and a
+  per-frame fingerprint of every collider's transform validate the file before
+  anything is loaded from it.
+- **Render.** A render owns the GPU, so the sim can't step during one. Each
+  rendered frame instead replays its cached surface and whitewater on the CPU
+  (see [Rendering](#rendering)).
 
 ## Performance
 
@@ -139,18 +144,42 @@ also survives Blender restarts, and a forward jump lands directly on a frame
 the cache already holds.
 
 - **Location.** `<scene>.flowx_cache` next to the saved .blend file (the
-  system temp dir until the scene is saved), or any file at *Cache Path*.
-- **Size.** About 0.5 MB per frame at the default 16k-particle budget; the
-  panel shows the frames covered and the running file size.
+  system temp dir until the scene is saved), or any file at *Cache Path*. A
+  paired `<scene>.flowx_cache.mesh` holds the extracted surface and whitewater
+  for the [render path](#rendering).
+- **Size.** About 0.5 MB per frame for the particles at the default 16k
+  budget; the surface file is larger (it stores the extracted mesh). The panel
+  shows the frames covered and the running size of each.
 - **Validity.** The file is keyed by a hash of everything that changes the
-  simulation - solver settings, domain bounds and resolution, collider
-  geometry, frame rate, this extension's version - plus a per-frame
-  fingerprint of each collider's world transform. Change any of those and the
-  next Reset starts a fresh file; until then the stale file warns instead of
-  showing old state and stops growing, so frames simulated under the new
-  settings never mix with the old run.
-- **Clear Cache** deletes the file. A running simulation stops writing until
+  simulation *or the extracted surface* - solver settings, domain bounds and
+  resolution, collider geometry, frame rate, the surface and whitewater
+  settings, this extension's version - plus a per-frame fingerprint of each
+  collider's world transform. Change any of those and the next Reset starts a
+  fresh file; until then the stale file warns instead of showing old state and
+  stops growing, so frames simulated under the new settings never mix with the
+  old run.
+- **Clear Cache** deletes both files. A running simulation stops writing until
   the next Reset.
+
+## Rendering
+
+Blender's render owns the GPU, so the simulation cannot step while a render
+runs (the compute context is dropped). Flow-X handles this by replaying the
+baked surface instead of re-simulating it:
+
+1. **Bake.** In the Playback panel, click **Bake Cache**. It re-seeds at the
+   start frame and steps the whole frame range forward, writing every frame's
+   particle state *and* extracted surface to the cache. The button becomes
+   **Stop Baking** while it runs, so a long bake is cancellable.
+2. **Render.** Leave the simulation running, then render the animation (or any
+   range the bake covered). Each rendered frame replays its cached surface and
+   whitewater on the CPU - no GPU compute - so the fluid animates correctly in
+   the render rather than freezing on the seed frame.
+
+A frame the bake did not cover warns in the panel instead of silently freezing
+the surface. Because the surface and whitewater settings are part of the cache
+hash, changing them invalidates the bake - re-bake before rendering the new
+look.
 
 ## Limitations (MVP)
 
@@ -167,7 +196,13 @@ the cache already holds.
   Whitewater spray/foam/bubble renders as a raw point cloud carrying `life`
   and `kind` attributes - a real spray/foam look is a Geometry Nodes
   modifier on top of those attributes, deliberately left for a follow-up.
-- A GPU context is required; there is no CPU fallback.
+- Rendering needs a [baked cache](#rendering); the simulation can't run on the
+  GPU while a render owns it. The surface mesh is re-extracted on the GPU each
+  frame, and that extraction is not bit-for-bit deterministic, so a freshly
+  extracted frame can differ slightly from its baked twin - the render path
+  avoids this by replaying the baked mesh instead.
+- A GPU context is required to simulate; there is no CPU solver. The render
+  path is the one CPU-only part (it replays a baked cache).
 
 ## Troubleshooting
 

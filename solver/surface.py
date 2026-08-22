@@ -87,6 +87,10 @@ _state = {
     "missing": set(),
     "vertices": 0,
     "triangles": 0,
+    # The last extracted (vertices, triangles), kept so the disk cache can
+    # store the frame's surface and the CPU render path can reinstall it.
+    "last_vertices": None,
+    "last_triangles": None,
 }
 
 
@@ -210,6 +214,34 @@ def stats():
     }
 
 
+def last_mesh():
+    """The (vertices, triangles) last extracted, or None before the first.
+
+    The vertices are 3-tuples and the triangles 3-tuples of vertex indices -
+    exactly the shapes _rebuild_mesh() consumes, so the disk cache can round-
+    trip a frame's surface through them without re-extraction.
+    """
+    if _state["last_vertices"] is None:
+        return None
+    return _state["last_vertices"], _state["last_triangles"]
+
+
+def install_mesh(domain, vertices, triangles):
+    """Rebuild the surface object from an extracted mesh, with no GPU.
+
+    The CPU render path: during a render the compute context is owned by the
+    render, so the frame's surface is replayed from the disk cache by writing
+    straight into the child object's mesh. `domain` only locates the child -
+    the mesh data came from the cache, not from a splat.
+    """
+    obj = _surface_object(domain)
+    _rebuild_mesh(obj, vertices, triangles)
+    _state["vertices"] = len(vertices)
+    _state["triangles"] = len(triangles)
+    _state["last_vertices"] = vertices
+    _state["last_triangles"] = triangles
+
+
 def update(config, textures, constants, collider):
     """Splat, extract and rebuild the surface mesh for the current frame.
 
@@ -257,6 +289,8 @@ def update(config, textures, constants, collider):
 
     _state["vertices"] = len(vertices)
     _state["triangles"] = len(triangles)
+    _state["last_vertices"] = vertices
+    _state["last_triangles"] = triangles
 
     obj = _state["object"]
     if is_alive(obj):
