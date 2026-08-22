@@ -9,6 +9,28 @@
  * for why it rides in an otherwise-unused bitonic-sort lane) is user-tunable.
  * i_sort.z holds floatBitsToInt(scorr_k); 0 disables the term entirely.
  *
+ * Two things here are *not* transcribed from the paper's equations as written,
+ * because the paper works in a normalization (mass = 1, rest density as a
+ * number density) this solver does not:
+ *
+ *   - The `mass` factor on the kernel gradient. grad_pk(C_i) carries the same
+ *     mass/rest_density that sph_lambda.glsl's density sum does, so dropping
+ *     it here does not merely rescale the step - it makes delta dimensionally
+ *     wrong (length/mass rather than length) and over-relaxes every Jacobi
+ *     iteration by 1/mass, which at the shipped defaults is 8x. The loop then
+ *     oscillates instead of converging.
+ *
+ *   - The (inv_denom_i + inv_denom_j) factor on s_corr. lambda has units of
+ *     length^2 here and runs ~1e-4 at the shipped defaults, so the paper's
+ *     bare k = 0.1 added to (lambda_i + lambda_j) is not the small nudge it is
+ *     in the paper - it is ~9x the density term, and the constraint stops
+ *     mattering. Dividing by the same denominator lambda was built from puts
+ *     s_corr back in lambda's units, which makes the term exactly "as if C_i
+ *     carried an extra artificial surplus of k*(W/W_q)^n" - its actual intent -
+ *     and restores k as a dimensionless 0..1 knob. Applying each particle's
+ *     own inv_denom keeps the pair bracket symmetric, so the delta stays
+ *     antisymmetric in i<->j and momentum is still conserved.
+ *
  * Writes to delta_img rather than predicted_img directly: this pass reads
  * every neighbor's predicted position, so nothing here may write predicted_img
  * until every invocation that still needs to read it has finished - the same
@@ -27,10 +49,13 @@ void main()
   }
 
   vec3 pi = imageLoad(predicted_img, particle_texel(i)).xyz;
-  float lambda_i = imageLoad(lambda_img, particle_texel(i)).y;
+  vec4 li = imageLoad(lambda_img, particle_texel(i));
+  float lambda_i = li.y;
+  float inv_denom_i = li.z;
 
   float h = f_sph.x;
   float h2 = h * h;
+  float mass = f_sph.y;
   float rest_density = f_sph.z;
   float spiky = spiky_grad_coef(h);
   float poly6 = poly6_coef(h);
@@ -67,15 +92,16 @@ void main()
             continue;
           }
           float r = sqrt(r2);
-          float lambda_j = imageLoad(lambda_img, particle_texel(j)).y;
+          vec4 lj = imageLoad(lambda_img, particle_texel(j));
+          float lambda_j = lj.y;
 
           float s_corr = 0.0;
           if (scorr_k > 0.0 && w_q > 1e-9) {
             float ratio = w_poly6(r2, h2, poly6) / w_q;
-            s_corr = -scorr_k * pow(max(ratio, 0.0), SCORR_N);
+            s_corr = -scorr_k * pow(max(ratio, 0.0), SCORR_N) * (inv_denom_i + lj.z);
           }
 
-          delta += (lambda_i + lambda_j + s_corr) * w_spiky_grad(r, h, spiky) * (d / r);
+          delta += (lambda_i + lambda_j + s_corr) * mass * w_spiky_grad(r, h, spiky) * (d / r);
         }
       }
     }

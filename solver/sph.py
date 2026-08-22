@@ -127,9 +127,11 @@ _PUSH_CONSTANTS = (
 _IMAGES = (
     ("RGBA32F", "FLOAT_2D", "positions_img"),
     ("RGBA32F", "FLOAT_2D", "velocities_img"),
-    # Holds (density, lambda) during the constraint loop - the same slot
-    # WCSPH used for (density, pressure); renaming it would touch every pass
-    # for no behavioral change, so only its packing's meaning has moved.
+    # Holds (density, lambda, 1/lambda-denominator) during the constraint
+    # loop - the same slot WCSPH used for (density, pressure); renaming it
+    # would touch every pass for no behavioral change, so only its packing's
+    # meaning has moved. The third channel is what lets sph_delta.glsl scale
+    # s_corr into lambda's units without a second neighbor loop.
     ("RGBA32F", "FLOAT_2D", "lambda_img"),
     # This substep's predicted (pre-constraint, then constraint-corrected)
     # position. WCSPH used this texture for acceleration; PBF has no force

@@ -71,7 +71,12 @@ void main()
 
   float constraint = max(density, 1e-6) / rest_density - 1.0;
   float denom = (dot(grad_self, grad_self) + grad_norm2_sum) / (rest_density * rest_density) + epsilon;
-  float lambda = -constraint / max(denom, 1e-9);
+  float inv_denom = 1.0 / max(denom, 1e-9);
+  float lambda = -constraint * inv_denom;
 
-  imageStore(lambda_img, particle_texel(i), vec4(max(density, 1e-6), lambda, 0.0, 0.0));
+  /* z carries 1/denom so sph_delta.glsl can express s_corr in lambda's own
+   * units - see that file. It is this pass's denominator, not a new quantity,
+   * so it is published here rather than recomputed there over the same
+   * neighbor loop. */
+  imageStore(lambda_img, particle_texel(i), vec4(max(density, 1e-6), lambda, inv_denom, 0.0));
 }
