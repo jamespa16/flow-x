@@ -107,7 +107,7 @@ Explicitly **out of scope for MVP**: photoreal surface shading (foam, whitecaps,
 - GPU-side marching cubes (histopyramid / atomic-counter triangle compaction), replacing the CPU readback path once it becomes the bottleneck.
 - Surface shading beyond a flat default material: foam/whitecaps, refraction, spray particles.
 - ~~Bake-to-disk caching so scrubbing/rendering doesn't require re-simulating from frame 0.~~ Shipped in v0.2.0: a per-frame write-through cache (`solver/cache.py`, Playback > Cache in the N-panel) that validates each loaded frame against a settings hash and per-frame collider-matrix fingerprints.
-- PCISPH or Position-Based Fluids for stiffer, more incompressible behavior at lower iteration counts.
+- ~~PCISPH or Position-Based Fluids for stiffer, more incompressible behavior at lower iteration counts.~~ PBF shipped; see `ROADMAP_APIC.md` for the APIC follow-on.
 - Multi-domain and domain-to-domain interaction.
 - Moving/deforming/skinned colliders (currently limited to rigid transform updates).
 - ~~Native compute backend (Vulkan/CUDA) if `gpu`-module compute proves to be a performance ceiling.~~ Done for Metal in unreleased v0.3 (own device via `native/`); CUDA backend still to do.

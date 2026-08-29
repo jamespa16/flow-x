@@ -83,6 +83,7 @@ class MetalEngine:
     """Device, compiled kernels, buffers and the frame's command queue."""
 
     name = "metal"
+    method = "pbf"
 
     def __init__(self, backend):
         self.backend = backend

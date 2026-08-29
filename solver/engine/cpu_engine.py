@@ -107,6 +107,7 @@ class CpuEngine:
     """Particle state as numpy arrays, and the passes that advance it."""
 
     name = "cpu"
+    method = "pbf"
 
     def __init__(self):
         self.params = ParamBlock()

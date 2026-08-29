@@ -311,6 +311,30 @@ class FlowXDomainSettings(PropertyGroup):
         min=1,
         max=200,
     )
+    solver_method: EnumProperty(
+        name="Solver Method",
+        description=(
+            "Which fluid solver to use. PBF (Position Based Fluids) is the default. "
+            "APIC (Affine Particle-In-Cell) conserves angular momentum and handles "
+            "collisions through the grid, but is still under development and falls "
+            "back to PBF when unavailable"
+        ),
+        items=(
+            (
+                "PBF",
+                "PBF",
+                "Position Based Fluids (Macklin & Müller 2013). "
+                "Constraint-projected density, XSPH viscosity",
+            ),
+            (
+                "APIC",
+                "APIC",
+                "Affine Particle-In-Cell (Jiang et al. 2015). "
+                "Grid-based transfer, conserves angular momentum. Not yet implemented",
+            ),
+        ),
+        default="PBF",
+    )
     engine: EnumProperty(
         name="Engine",
         description=(

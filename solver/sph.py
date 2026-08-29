@@ -135,6 +135,11 @@ _state = {
     # re-sync the GPU state before simulating from it.
     "gpu_frame": 0,
     "warning": None,
+    # Set when the engine factory substituted another method for the one the
+    # domain asked for (e.g. APIC before its engine exists). Unlike `warning`
+    # it is not overwritten by per-frame timeline warnings: it describes the
+    # run, not this frame.
+    "fallback": None,
     "timings": deque(maxlen=TIMING_WINDOW),
     # Bake Cache bookkeeping: `baking` gates the timer that steps the timeline
     # forward one frame per tick, and `bake_target` is the frame it stops at
@@ -158,6 +163,7 @@ class SolverConfig:
     """
 
     __slots__ = (
+        "solver_method",
         "lo",
         "hi",
         "fill_fraction",
@@ -213,6 +219,7 @@ def _resolve_config(domain):
     size = hi - lo
 
     config = SolverConfig()
+    config.solver_method = settings.solver_method.lower()
     config.lo = lo
     config.hi = hi
     config.fill_fraction = settings.fluid_level / 100.0
@@ -538,10 +545,12 @@ def _start(domain):
     # ones so the first substep collides correctly.
     ensure_grids(bpy.context.scene)
     preferred = domain.flowx_domain.engine
-    engine = engines.create(None if preferred == "AUTO" else preferred.lower())
+    method = domain.flowx_domain.solver_method.lower()
+    engine = engines.create(None if preferred == "AUTO" else preferred.lower(), method)
     if engine is None:
         raise RuntimeError(engines.unavailable_reason())
     _state["engine"] = engine
+    _state["fallback"] = engines.fallback_note()
     _state["domain"] = domain
     _state["running"] = True
     _seed(domain)
@@ -597,7 +606,9 @@ def stop():
     engine = _state["engine"]
     if engine is not None:
         engine.release()
-    _state.update({"running": False, "config": None, "domain": None, "engine": None})
+    _state.update(
+        {"running": False, "config": None, "domain": None, "engine": None, "fallback": None}
+    )
     _state["timings"].clear()
     _state["warning"] = None
     viz.disable()
@@ -980,6 +991,8 @@ def stats():
         return None
     timings = _state["timings"]
     return {
+        "method": getattr(_state["engine"], "method", None),
+        "method_note": _state["fallback"],
         "particles": config.particle_count,
         "cells": config.cell_count,
         "cell_dims": config.cell_dims,

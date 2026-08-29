@@ -181,6 +181,13 @@ def config_hash(domain, scene):
     # to, which is the honest answer - a machine that loses its GPU is a
     # different physical situation, and re-baking there is correct.
     digest.update(settings.engine.encode())
+    # The solver method changes the physics outright, but the property postdates
+    # every cache baked before it existed: hashing "PBF" would invalidate all of
+    # them to describe exactly what they already were. So only a non-default
+    # method contributes bytes - old PBF caches stay valid, and switching to
+    # anything else is a different config.
+    if settings.solver_method != "PBF":
+        digest.update(settings.solver_method.encode())
     digest.update(
         struct.pack(
             "<f3f3fI",
