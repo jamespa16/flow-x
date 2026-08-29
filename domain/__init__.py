@@ -1,7 +1,14 @@
 """Fluid Domain object: bounds, resolution, fluid level (Phase 1)."""
 
 import bpy
-from bpy.props import BoolProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
+from bpy.props import (
+    BoolProperty,
+    EnumProperty,
+    FloatProperty,
+    IntProperty,
+    PointerProperty,
+    StringProperty,
+)
 from bpy.types import Object, Operator, PropertyGroup
 from mathutils import Vector
 
@@ -303,6 +310,25 @@ class FlowXDomainSettings(PropertyGroup):
         default=24,
         min=1,
         max=200,
+    )
+    engine: EnumProperty(
+        name="Engine",
+        description=(
+            "Which compute engine runs the simulation. Auto prefers the GPU and falls "
+            "back to the CPU when no device is available. The two do not produce "
+            "identical results, so switching invalidates a baked cache"
+        ),
+        items=(
+            ("AUTO", "Auto", "Use the GPU if one is available, otherwise the CPU"),
+            ("METAL", "Metal (GPU)", "Apple GPU compute. Requires the Flow-X Metal helper"),
+            (
+                "CPU",
+                "CPU (numpy)",
+                "Vectorized numpy solver. Much slower, but needs no GPU - the fallback, "
+                "and the reference the GPU engine is checked against",
+            ),
+        ),
+        default="AUTO",
     )
     max_particles: IntProperty(
         name="Max Particles",

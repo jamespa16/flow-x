@@ -174,6 +174,13 @@ def config_hash(domain, scene):
     settings = domain.flowx_domain
     lo, hi = world_bounds(domain)
     digest = hashlib.sha256()
+    # The engine is part of the physics, not just a performance choice: the GPU
+    # and CPU engines enumerate neighbours slightly differently and their
+    # results diverge over a run, so a cache baked by one must not be replayed
+    # by the other. "Auto" hashes as itself rather than as whatever it resolved
+    # to, which is the honest answer - a machine that loses its GPU is a
+    # different physical situation, and re-baking there is correct.
+    digest.update(settings.engine.encode())
     digest.update(
         struct.pack(
             "<f3f3fI",

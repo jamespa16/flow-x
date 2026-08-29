@@ -21,25 +21,12 @@ would multiply its share by eight. Raise it for a final look, not while
 setting the shot up.
 """
 
-import struct
-
 import bmesh
 import bpy
 from mathutils import Vector
 
 from ..domain import is_alive
 from . import marching_cubes
-from .gpu_util import (
-    bind_image,
-    bind_push_constants,
-    build_compute_shader,
-    dispatch_1d,
-    make_texture,
-    read_scalar_texture,
-    shader_source,
-)
-
-LOCAL_GROUP_SIZE = 64
 
 # Suffix on the domain's name, so the surface object is findable and obviously
 # owned by its domain rather than looking like something the user made.
@@ -50,41 +37,18 @@ MATERIAL_NAME = "FlowXWater"
 # unbounded time in the CPU-side extraction below.
 MAX_SAMPLES = 1 << 20
 
-# Must match SURFACE_CELL_RADIUS in shaders/surface_splat.glsl: the kernel is
+# Must match SURFACE_CELL_RADIUS in kernels/surface_splat.metal: the kernel is
 # clamped so that many spatial-hash cells still cover its full support.
 SURFACE_CELL_RADIUS = 2
 
-_IMAGES = (
-    ("RGBA32F", "FLOAT_2D", "positions_img"),
-    ("RGBA32F", "FLOAT_2D", "keys_img"),
-    ("R32F", "FLOAT_2D", "cell_start_img"),
-    ("R32F", "FLOAT_2D", "cell_end_img"),
-    ("R32F", "FLOAT_3D", "collider_img"),
-    ("R32F", "FLOAT_2D", "surface_img"),
-)
-
-# The SPH block with its two unused-here slots repurposed; see the header of
-# shaders/surface_splat.glsl. Order and total size must still match, because
-# sph_common.glsl is compiled against it.
-_PUSH_CONSTANTS = (
-    ("IVEC4", "i_layout"),
-    ("IVEC4", "i_grid"),
-    ("IVEC4", "i_surface"),
-    ("VEC4", "f_lo"),
-    ("VEC4", "f_hi"),
-    ("VEC4", "f_sph"),
-    ("VEC4", "f_sim"),
-    ("IVEC4", "i_collider"),
-)
-
 _state = {
-    "shader": None,
-    "texture": None,
+    "running": False,
+    # The scalar field the splat writes, one float per lattice point.
+    # The engine this run is bound to, kept so extract() can read the field
+    # back without sph.py having to hand it over a second time.
+    "engine": None,
     "config": None,
     "object": None,
-    # Names this compiled shader has no slot for (the OpenGL backend
-    # eliminates slots a pass never reads - see gpu_util.bind_image).
-    "missing": set(),
     "vertices": 0,
     "triangles": 0,
     # The last extracted (vertices, triangles), kept so the disk cache can
@@ -151,52 +115,47 @@ def resolve(domain, config):
     return surface
 
 
-def start(domain, config):
-    """Compile the splat pass and allocate its grid. Safe to call repeatedly."""
-    _state["shader"] = build_compute_shader(
-        [shader_source("sph_common"), shader_source("surface_splat")],
-        _IMAGES,
-        _PUSH_CONSTANTS,
-        LOCAL_GROUP_SIZE,
-    )
-    # The absent-slot set only describes this particular compile.
-    _state["missing"] = set()
-    reseed(domain, config)
+def start(engine, domain, config):
+    """Allocate the splat grid. Safe to call repeatedly.
 
-
-def reseed(domain, config):
-    """Re-resolve the grid for a re-seeded solver, keeping the compiled shader.
-
-    The splat shader depends only on its binding layout, so a re-seed - which
-    happens on every playback loop - only has to resize the grid to whatever
-    the domain's surface settings now ask for.
+    There is no per-pass compile step any more: the engine compiles one library
+    holding every kernel, this one included, when the solver starts.
     """
-    if _state["shader"] is None:
+    _state["running"] = True
+    reseed(engine, domain, config)
+
+
+def reseed(engine, domain, config):
+    """Re-resolve the grid for a re-seeded solver.
+
+    Runs on every playback loop, so it only resizes the grid to whatever the
+    domain's surface settings now ask for.
+    """
+    if not _state["running"]:
         return
     surface = resolve(domain, config)
     _state["config"] = surface
-    # The splat indexes this grid through cell_texel() (see
-    # surface_splat.glsl), so it must carry the solver's shared texture width
-    # rather than its own natural one.
-    _state["texture"] = make_texture(
-        surface.sample_count, channels=1, fmt="R32F", width=config.tex_width
-    )
+    _state["engine"] = engine
+    # A flat float per lattice point. The old texture had to borrow the
+    # solver's shared texture width, because the splat addressed it through the
+    # same 2D wrap the particle state used; the field is just indexed now.
+    engine.alloc_surface(surface.sample_count)
     _state["vertices"] = 0
     _state["triangles"] = 0
     _state["object"] = _surface_object(domain)
 
 
 def stop():
-    """Drop the GPU state. The surface object is left in the scene as-is.
+    """Drop the device state. The surface object is left in the scene as-is.
 
     Deleting it would throw away the last extracted frame, which is usually the
     thing the user just hit stop to look at.
     """
-    _state.update({"shader": None, "texture": None, "config": None, "object": None})
+    _state.update({"running": False, "engine": None, "config": None, "object": None})
 
 
 def is_running():
-    return _state["shader"] is not None
+    return _state["running"]
 
 
 def stats():
@@ -242,47 +201,30 @@ def install_mesh(domain, vertices, triangles):
     _state["last_triangles"] = triangles
 
 
-def update(config, textures, constants, collider):
-    """Splat, extract and rebuild the surface mesh for the current frame.
+def record(engine, config, dt):
+    """Ask the engine to splat the field. On a GPU engine nothing runs yet.
 
-    `constants` is the SPH push-constant block sph.py already assembled for
-    this step; only the two slots this pass repurposes are overridden.
+    Split from extract() because the splat is engine work that belongs in the
+    same submission as the substeps, while the extraction below is CPU work on
+    what that submission produced.
     """
     surface = _state["config"]
-    shader = _state["shader"]
-    if shader is None or surface is None:
+    if surface is None:
+        return
+    engine.splat_surface(surface)
+
+
+def extract():
+    """Read the splatted field back and rebuild the mesh from it.
+
+    Must follow the engine's flush: it reads what the recorded splat wrote.
+    """
+    surface = _state["config"]
+    engine = _state["engine"]
+    if surface is None or engine is None:
         return
 
-    collider_texture, i_collider = collider
-    spacing_bits = struct.unpack("<i", struct.pack("<f", surface.spacing))[0]
-
-    values = dict(constants)
-    values.pop("i_sort")
-    values["i_surface"] = (*surface.dims, spacing_bits)
-    values["i_collider"] = i_collider
-    # Same block, but the kernel radius is the surface grid's, not the solver's.
-    values["f_sph"] = (surface.kernel_radius, *constants["f_sph"][1:])
-    # The grid starts one kernel radius before the domain's low corner (see
-    # resolve), so the splat samples from that corner, carried in the slot the
-    # SPH passes use for the domain max / particle radius. f_lo must stay the
-    # domain origin: the shared prelude's cell_coord() and collider_coord()
-    # locate every sample through it, and shifting it by the margin would
-    # carve colliders and gather neighbours from the wrong cells.
-    values["f_hi"] = (surface.lo.x, surface.lo.y, surface.lo.z, 0.0)
-
-    missing = _state["missing"]
-    shader.bind()
-    bind_push_constants(shader, values, missing)
-    for _fmt, _type, name in _IMAGES:
-        if name == "surface_img":
-            bind_image(shader, name, _state["texture"], missing)
-        elif name == "collider_img":
-            bind_image(shader, name, collider_texture, missing)
-        else:
-            bind_image(shader, name, textures[name], missing)
-    dispatch_1d(shader, surface.sample_count, LOCAL_GROUP_SIZE)
-
-    field = read_scalar_texture(_state["texture"], surface.sample_count)
+    field = engine.read_surface(surface.sample_count)
     vertices, triangles = marching_cubes.extract(
         field, surface.dims, surface.lo, surface.spacing, surface.iso
     )

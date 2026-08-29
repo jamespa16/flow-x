@@ -3,6 +3,7 @@
 import hashlib
 import math
 import struct
+from array import array
 
 import bpy
 import gpu
@@ -32,7 +33,7 @@ _draw_handle = None
 # whenever any collider's own grid changes rather than read from `_grids` per
 # frame, so a multi-collider scene costs the solver one texture lookup, not
 # several.
-_solver_grid = {"texture": None, "voxel_size": 0.0, "dims": (1, 1, 1)}
+_solver_grid = {"buffer": None, "occupancy": None, "voxel_size": 0.0, "dims": (1, 1, 1)}
 
 
 def _reset_state():
@@ -48,19 +49,18 @@ def _reset_state():
     """
     _grids.clear()
     _mesh_fingerprints.clear()
-    _solver_grid.update(texture=None, voxel_size=0.0, dims=(1, 1, 1))
+    _solver_grid.update(buffer=None, occupancy=None, voxel_size=0.0, dims=(1, 1, 1))
 
 
 class ColliderGrid:
     """Voxelized occupancy for one collider, sized to the domain's grid."""
 
-    __slots__ = ("dims", "occupancy", "points", "gpu_buf")
+    __slots__ = ("dims", "occupancy", "points")
 
-    def __init__(self, dims, occupancy, points, gpu_buf):
+    def __init__(self, dims, occupancy, points):
         self.dims = dims
         self.occupancy = occupancy
         self.points = points
-        self.gpu_buf = gpu_buf
 
 
 class FlowXColliderSettings(PropertyGroup):
@@ -172,13 +172,23 @@ def mesh_fingerprint(obj_name):
 
 
 def get_solver_grid():
-    """(texture, voxel_size, dims) for the SPH solver's collider sampling.
+    """(buffer, voxel_size, dims) for the SPH solver's collider sampling.
 
-    `texture` is None when there are no tagged colliders, or when the upload
-    failed (e.g. no GL context in a headless run) - the solver treats that the
-    same way, as "nothing to collide with".
+    `buffer` is a device buffer, and is None when there are no tagged
+    colliders or when the upload failed (no usable device, say). The solver
+    treats both the same way, as "nothing to collide with" - see
+    get_solver_occupancy() for the host-side copy the CPU engine reads.
     """
-    return _solver_grid["texture"], _solver_grid["voxel_size"], _solver_grid["dims"]
+    return _solver_grid["buffer"], _solver_grid["voxel_size"], _solver_grid["dims"]
+
+
+def get_solver_occupancy():
+    """The merged occupancy grid as raw bytes, for engines with no device.
+
+    The same union get_solver_grid() uploads; the CPU engine indexes it
+    directly rather than through a device buffer.
+    """
+    return _solver_grid["occupancy"]
 
 
 def ensure_grids(scene=None):
@@ -249,7 +259,7 @@ def rebuild_animated_grids(scene=None):
 
 def _rebuild_solver_grid(domain):
     if not _grids:
-        _solver_grid.update(texture=None, voxel_size=0.0, dims=(1, 1, 1))
+        _solver_grid.update(buffer=None, occupancy=None, voxel_size=0.0, dims=(1, 1, 1))
         return
 
     origin, voxel_size, dims = _domain_grid_geometry(domain)
@@ -264,7 +274,15 @@ def _rebuild_solver_grid(domain):
             if occupied:
                 union[idx] = 1
 
-    _solver_grid.update(texture=_upload_to_gpu(union, dims), voxel_size=voxel_size, dims=dims)
+    # Both forms are kept: a GPU engine binds the device buffer, the CPU engine
+    # reads the raw occupancy. The upload is best-effort, so on a machine with
+    # no device the occupancy is still there for the CPU path.
+    _solver_grid.update(
+        buffer=_upload_to_device(union, dims),
+        occupancy=union,
+        voxel_size=voxel_size,
+        dims=dims,
+    )
 
 
 def _domain_grid_geometry(domain):
@@ -307,20 +325,31 @@ def _point_inside(bvh, point, direction, epsilon=1e-4):
     return count % 2 == 1
 
 
-def _upload_to_gpu(occupancy, dims):
-    # Blender's Python GPU API has no read-write storage buffer type (confirmed
-    # while standing up the Phase 3 compute round-trip) - only uniform buffers,
-    # samplers and images are bindable. So the occupancy grid uploads as a 3D
-    # R32F image instead of a nonexistent GPUStorageBuf; a compute shader can
-    # later sample it with imageLoad(...).r > 0.5.
+def _upload_to_device(occupancy, dims):
+    """Upload the occupancy grid as a flat float buffer, or None if it can't.
+
+    It used to go up as a 3D R32F image, because Blender's GPU API had no
+    read-write storage buffer type at all and images were the only mutable
+    device state available. The solver owns its device now, so this is an
+    ordinary buffer and the kernels index it with the z-major arithmetic in
+    kernels/sph_common.h.
+
+    Imported here rather than at module scope: solver/ imports this package, so
+    a top-level import back into it would be circular.
+
+    Best-effort - a machine with no usable device still gets the CPU-side
+    debug overlay, and the solver treats None as "nothing to collide with".
+    """
+    from ..solver.backend import select
+
     try:
-        values = [float(v) for v in occupancy]
-        buf = gpu.types.Buffer("FLOAT", [len(values)], values)
-        return gpu.types.GPUTexture(dims, format="R32F", data=buf)
+        backend = select()
+        if backend is None:
+            return None
+        data = array("f", (float(v) for v in occupancy))
+        return backend.buffer(dims[0] * dims[1] * dims[2] * 4, data)
     except Exception as exc:
-        # Best-effort so the CPU-side debug overlay keeps working regardless of
-        # platform/context quirks (e.g. no GL context in --background runs).
-        print(f"[flow-x] Skipping GPU collider texture upload: {exc}")
+        print(f"[flow-x] Skipping collider grid upload: {exc}")
         return None
 
 
@@ -396,8 +425,9 @@ def _rebuild_grid(domain, obj):
                     occupancy[(k * ny + j) * nx + i] = 1
                     points.append(Vector((x, y, z)))
 
-    gpu_buf = _upload_to_gpu(occupancy, dims)
-    _grids[obj.name] = ColliderGrid(dims, occupancy, points, gpu_buf)
+    # Only the merged solver grid is ever bound; a per-object upload would be
+    # allocated and never read.
+    _grids[obj.name] = ColliderGrid(dims, occupancy, points)
     _rebuild_solver_grid(domain)
 
 

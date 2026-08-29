@@ -1,9 +1,9 @@
-"""GPU compute plumbing and the PBF solver (Phases 3-7).
+"""The PBF solver and the compute plumbing under it.
 
-* `gpu_util` - shared shader/texture helpers and the GPU-API constraints they
-  work around.
-* `viz` - the debug point-cloud overlay, shared by the run modes below.
-* `gpu_test` - Phase 3's compute round-trip smoke test (gravity only).
+* `backend` - the device abstraction: buffers, compiled kernels, a command
+  queue. Generic, and free of Blender imports.
+* `engine` - the simulation engines that sit on a backend and know what SPH is.
+* `viz` - the debug point-cloud overlay.
 * `sph` - Phase 4's Position Based Fluids solver core, plus Phase 7's timeline
   handling.
 * `marching_cubes` - Phase 6's iso-surface extraction, pure Python and free of
@@ -14,32 +14,31 @@
 * `whitewater` - Phase 8's secondary spray/foam/bubble particles, driven off
   the PBF state each frame into a Whitewater point-cloud child object.
 
-The two run modes are mutually exclusive; starting either stops the other.
+The Phase 3 gravity-only compute round-trip that used to live here as
+`gpu_test` is now scripts/test_backend.py, which answers the same question -
+"can we drive the GPU on this machine at all" - without needing Blender.
 """
 
 import bpy
 
-from . import cache, gpu_test, sph, surface, viz, whitewater
+from . import backend, cache, engine, sph, surface, viz, whitewater
 from .cache import FLOWX_OT_cache_clear
-from .gpu_test import PARTICLE_COUNT, FLOWX_OT_solver_gpu_test_toggle
 from .sph import FLOWX_OT_sph_bake, FLOWX_OT_sph_reset, FLOWX_OT_sph_toggle
 
 __all__ = [
     "FLOWX_OT_cache_clear",
-    "FLOWX_OT_solver_gpu_test_toggle",
     "FLOWX_OT_sph_bake",
     "FLOWX_OT_sph_reset",
     "FLOWX_OT_sph_toggle",
-    "PARTICLE_COUNT",
+    "backend",
     "cache",
-    "gpu_test",
+    "engine",
     "sph",
     "surface",
     "whitewater",
 ]
 
 _classes = (
-    FLOWX_OT_solver_gpu_test_toggle,
     FLOWX_OT_sph_toggle,
     FLOWX_OT_sph_reset,
     FLOWX_OT_sph_bake,
@@ -53,7 +52,6 @@ def register():
 
 
 def unregister():
-    gpu_test.stop()
     sph.stop()
     surface.stop()
     whitewater.stop()

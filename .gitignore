@@ -2,6 +2,8 @@ __pycache__/
 *.pyc
 .venv/
 dist/
+# Built by scripts/build_native.py; platform-specific, so never committed.
+bin/
 *.blend1
 *.blend2
 *.flowx_cache

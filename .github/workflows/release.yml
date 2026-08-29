@@ -17,7 +17,30 @@ env:
   BLENDER_VERSION: "5.2.0"
 
 jobs:
+  # The Metal helper is what the GPU engine dispatches through, and it can only
+  # be built on macOS. The release job runs on Linux (that is where a headless
+  # Blender is cheap to fetch), so the dylib is built here and handed over as an
+  # artifact. Without it the zip would still install and run - it would just
+  # fall back to the CPU engine on every machine, which is not a release.
+  build-metal-helper:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy
+      - run: python3 scripts/build_native.py
+      - run: python3 scripts/test_backend.py
+      - run: python3 scripts/test_cpu_engine.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flowx-metal-helper
+          path: bin/libflowx_metal.dylib
+          if-no-files-found: error
+
   package-and-publish:
+    needs: build-metal-helper
     # Free hosted runner: blender-downloader fetches the pinned Blender
     # build, which is used to verify the packaged zip before publishing.
     # Tag pushes publish the resulting release; manual workflow_dispatch
@@ -29,6 +52,14 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install blender-downloader
+
+      # Into bin/, which is gitignored and which package.py picks up as-is.
+      - uses: actions/download-artifact@v4
+        with:
+          name: flowx-metal-helper
+          path: bin
+      - name: Confirm the helper made it into the tree
+        run: test -f bin/libflowx_metal.dylib
 
       # The hosted image lacks the EGL/GL runtime: Blender dlopens libEGL
       # at startup and aborts without it. libgl1-mesa-dri provides
@@ -62,9 +93,9 @@ jobs:
       - name: Package the extension zip
         run: python3 scripts/package.py "$GITHUB_WORKSPACE" "$RUNNER_TEMP/dist"
 
-      # The zip is installed into a fresh Blender config with no dev symlink,
-      # then the full smoke test runs against it - i.e. the exact third-party
-      # path the MVP exit criterion describes, including the demo scenes.
+      - name: Confirm the Metal helper is in the zip
+        run: unzip -l "$RUNNER_TEMP"/dist/*.zip | grep -q 'bin/libflowx_metal.dylib'
+
       - name: Install the zip in a fresh Blender and smoke test it
         env:
           BLENDER_USER_RESOURCES: ${{ runner.temp }}/release-blender-config

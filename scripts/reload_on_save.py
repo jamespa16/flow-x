@@ -16,7 +16,7 @@ import bpy
 
 ADDON_MODULE = "bl_ext.user_default.flow_x"
 WATCH_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-WATCH_EXTENSIONS = (".py", ".glsl")
+WATCH_EXTENSIONS = (".py", ".metal", ".h")
 POLL_SECONDS = 1.0
 
 _last_mtime = 0.0

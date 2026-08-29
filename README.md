@@ -10,10 +10,15 @@ every frame - no Mantaflow, no baking, no Python required.
 ## Requirements
 
 - **Blender 5.2 LTS or newer** (Flow-X is an [extension](https://docs.blender.org/manual/en/latest/advanced/extensions/addons.html), not a legacy add-on)
-- **A GPU** the simulation runs entirely on the GPU through Blender's `gpu`
-  compute API (OpenGL / Metal / Vulkan). The surface mesh is extracted on the
-  CPU each frame - a bounded cost, but the fastest thing to lower when
-  things get slow is `Surface Resolution`, not the physics.
+- **A GPU, for the fast path.** On Apple silicon the simulation runs on the
+  GPU through Flow-X's own Metal helper, independent of Blender's `gpu`
+  module. Without a usable GPU it falls back to a numpy CPU solver: the same
+  physics, roughly ten times slower, which is fine for small sims and for
+  checking a setup before committing to it. The `Engine` dropdown in the SPH
+  Solver panel picks between them, and the panel says which one is running.
+  The surface mesh is extracted on the CPU either way - a bounded cost, but
+  the fastest thing to lower when things get slow is `Surface Resolution`, not
+  the physics.
 - A mesh collider should be a closed (manifold) mesh; the inside/outside
   test is a ray-parity count, so open meshes can voxelize to the wrong
   side.
@@ -79,11 +84,12 @@ play, done.
   sized by a free-fall/diffusion limit rather than a stiffness-driven CFL
   limit.
 - **Neighbors.** A uniform grid rebuilt once per substep (not per constraint
-  iteration); particles are bucketed with a bitonic sort rather than a
-  counting sort because image atomics don't compile on Blender's Metal
-  backend.
+  iteration); particles are bucketed with a bitonic sort. That was originally
+  forced - Blender's Metal backend could not compile an image atomic, so a
+  counting sort was impossible - and is now simply what is there, since Flow-X
+  runs its own Metal kernels where atomics work.
 - **Colliders.** CPU-voxelized into the domain's grid (BVH ray parity) and
-  uploaded as a 3D texture the finalize pass samples; rebuilt when a
+  uploaded as an occupancy buffer the finalize pass samples; rebuilt when a
   collider's transform or geometry changes. A keyframed collider is tagged
   with the *Animated Collider* option (Object Properties > Flow-X Collider),
   which rebuilds its grid every frame from its animation so the fluid tracks
@@ -106,8 +112,8 @@ play, done.
   file stores the extracted mesh for the render path. A settings hash and a
   per-frame fingerprint of every collider's transform validate the file before
   anything is loaded from it.
-- **Render.** A render owns the GPU, so the sim can't step during one. Each
-  rendered frame instead replays its cached surface and whitewater on the CPU
+- **Render.** Each rendered frame replays its cached surface and whitewater
+  rather than re-extracting it, so a render matches the frames that were baked
   (see [Rendering](#rendering)).
 
 ## Performance
@@ -196,19 +202,23 @@ look.
   Whitewater spray/foam/bubble renders as a raw point cloud carrying `life`
   and `kind` attributes - a real spray/foam look is a Geometry Nodes
   modifier on top of those attributes, deliberately left for a follow-up.
-- Rendering needs a [baked cache](#rendering); the simulation can't run on the
-  GPU while a render owns it. The surface mesh is re-extracted on the GPU each
-  frame, and that extraction is not bit-for-bit deterministic, so a freshly
-  extracted frame can differ slightly from its baked twin - the render path
-  avoids this by replaying the baked mesh instead.
-- A GPU context is required to simulate; there is no CPU solver. The render
-  path is the one CPU-only part (it replays a baked cache).
+- Rendering needs a [baked cache](#rendering). Re-extracting a surface is not
+  bit-for-bit deterministic, so a freshly extracted frame can differ slightly
+  from its baked twin - the render path avoids that by replaying the baked
+  mesh.
+- The GPU and CPU engines do not produce identical results, so switching
+  engines invalidates a baked cache and it re-bakes.
+- The Metal helper is a compiled dylib. A release downloaded from the internet
+  carries a quarantine flag, and macOS will refuse to load it until it is
+  signed and notarized; when that happens Flow-X falls back to the CPU engine
+  and says so in the panel rather than failing to start.
 
 ## Troubleshooting
 
 | Symptom | Fix |
 |---|---|
-| "Could not start the SPH solver" warning on Run | No GPU context or a shader compile failure. Run the *GPU Compute Test* from the domain panel to isolate GPU compute from the SPH math. |
+| "Could not start the SPH solver" warning on Run | No usable engine at all. Run `python3 scripts/test_backend.py` to check GPU compute independently of the SPH math, and `python3 scripts/test_cpu_engine.py` for the fallback. Neither needs Blender. |
+| Panel says `Engine: cpu` when you expected the GPU | The Metal helper is missing or would not load. Build it with `python3 scripts/build_native.py`; if it is a downloaded release, see the note under Limitations. |
 | Scrubbing back holds and warns | Enable *Cache to Disk* in the Playback panel and play forward, or press *Reset*. |
 | Fluid passes through a collider | Check its voxel count in the Object Properties tab: 0 means no faces or no overlap with the domain. Move it in and/or check the mesh is closed. |
 | Surface looks blocky | Raise *Surface Resolution* (cubic cost). |
@@ -220,10 +230,14 @@ look.
 ```
 domain/       domain object, properties, add operator
 collision/    collider tagging + CPU voxelization
-solver/       gpu plumbing, PBF solver, marching cubes, surface, whitewater
+solver/       PBF solver, marching cubes, surface, whitewater, timeline
+solver/backend/  device abstraction (buffers, kernels, a queue)
+solver/engine/   the Metal and numpy simulation engines
 ui/           N-panel and Object Properties panels
-shaders/      GLSL compute passes
-scripts/      dev link, reload, smoke test, demo builder, packager
+kernels/      Metal compute kernels + the shared portable prelude
+native/       the Metal helper dylib's Objective-C++ source
+bin/          the built helper (gitignored; scripts/build_native.py)
+scripts/      build, dev link, reload, tests, demo builder, packager
 demos/        shipped example scenes
 ```
 

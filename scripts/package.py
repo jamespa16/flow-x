@@ -8,8 +8,14 @@ without Blender:
     python3 scripts/package.py [source_dir] [out_dir]
 
 Defaults: source_dir = the repo root, out_dir = <repo>/dist. VCS metadata,
-dev tooling (scripts/, lint config) and other dev junk are excluded; the
-demo .blend files are included on purpose - they ship with the release.
+dev tooling (scripts/, native/, lint config) and other dev junk are excluded;
+the demo .blend files are included on purpose - they ship with the release.
+
+Two things must be in the zip for the GPU engine to work: kernels/ (the MSL
+sources, compiled at runtime) and bin/libflowx_metal.dylib (build it first with
+scripts/build_native.py). Without the dylib the add-on still installs and runs
+- it falls back to the numpy CPU engine - which is why the manifest declares no
+platform restriction.
 """
 
 import os
@@ -29,6 +35,9 @@ EXCLUDE_DIRS = {
     ".venv",
     "dist",
     "scripts",
+    # The Metal helper's source. Its *build output*, bin/, does ship - built by
+    # scripts/build_native.py - but the .mm and .h are dev-only.
+    "native",
 }
 EXCLUDE_FILES = {".DS_Store", ".gitignore", ".gitkeep", "pyproject.toml", "requirements-dev.txt"}
 EXCLUDE_SUFFIXES = {".pyc", ".blend1", ".blend2"}

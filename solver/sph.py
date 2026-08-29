@@ -20,19 +20,23 @@ carry a particle before the neighbor grid it predicted into goes stale, and by
 XSPH's own explicit diffusion limit (see ``SolverConfig.substep_dt``).
 
 The grid build is where this departs from the textbook GPU build. A counting
-sort needs ``imageAtomicAdd``, and image atomics do not compile on Blender's
-Metal backend, so the (cell key, particle index) pairs go through a bitonic
-sort instead - pure compare-exchange, no atomics, O(log^2 n) host-driven
-passes. Dispatch overhead measured at ~13 us each, and with ~105
-compare-exchange dispatches it is the dominant per-substep cost, which is why
-it runs once per substep rather than once per constraint-solve iteration: the
-neighbor list only drifts by one iteration's small position correction, not
-enough to be worth rebuilding 3-4x over.
+sort needs an atomic add, and under Blender's ``gpu`` module - which this
+solver used to dispatch through - image atomics did not compile on the Metal
+backend at all. So the (cell key, particle index) pairs go through a bitonic
+sort instead: pure compare-exchange, no atomics, O(log^2 n) host-driven passes,
+about 105 of them per substep. Flow-X owns its own Metal device now and atomics
+work, so the counting sort is available and simply not written yet; the bitonic
+sort is kept until something re-bakes the reference runs deliberately.
+
+The device work itself lives in ``solver/engine``: this module resolves the
+config, drives the timeline and owns the cache, and asks an engine to advance
+the fluid. A whole frame is recorded into one command queue and submitted once,
+which is why the read-backs below all follow a single ``flush()``.
 
 Finalize also does Phase 5's collision response: it samples the collider
 occupancy grid built in ``collision`` and pushes a particle out to the nearest
 free voxel, with a velocity reflection/damping term along the push direction
-(see ``shaders/sph_finalize.glsl``), the same as the WCSPH integrator did.
+(see ``kernels/sph_finalize.metal``), the same as the WCSPH integrator did.
 
 Phase 6 hangs one more dispatch off the end of each *frame* (not each
 substep): ``surface`` splats the particles onto a scalar grid and extracts a
@@ -55,33 +59,25 @@ fingerprint walk catches animation edits the config hash cannot see.
 
 import math
 import random
-import struct
 import time
 from array import array
 from collections import deque
 
 import bpy
-import gpu
 from bpy.app.handlers import persistent
 from bpy.types import Operator
 from mathutils import Vector
 
-from ..collision import ensure_grids, get_solver_grid, rebuild_animated_grids
+from ..collision import (
+    ensure_grids,
+    get_solver_grid,
+    get_solver_occupancy,
+    rebuild_animated_grids,
+)
 from ..domain import find_domain, is_alive, is_degenerate, world_bounds
 from . import cache, surface, viz, whitewater
-from .gpu_util import (
-    bind_image,
-    bind_push_constants,
-    build_compute_shader,
-    context_available,
-    dispatch_1d,
-    make_texture,
-    read_texture,
-    shader_source,
-    texture_width,
-)
+from . import engine as engines
 
-LOCAL_GROUP_SIZE = 64
 GRAVITY = -9.81
 
 # Fraction of incoming normal velocity kept when a particle hits a domain wall.
@@ -108,78 +104,24 @@ TIMING_WINDOW = 30
 # explicit spring - so unlike WCSPH there is no speed-of-sound term here.
 CFL_FACTOR = 0.25
 
-# Every SPH pass declares this same push-constant block so shaders/sph_common.glsl
-# can provide shared helpers. 128 bytes total, right at the budget - see that
-# file before adding to it.
-_PUSH_CONSTANTS = (
-    ("IVEC4", "i_layout"),
-    ("IVEC4", "i_grid"),
-    ("IVEC4", "i_sort"),
-    ("VEC4", "f_lo"),
-    ("VEC4", "f_hi"),
-    ("VEC4", "f_sph"),
-    ("VEC4", "f_sim"),
-    ("IVEC4", "i_collider"),
-)
-
-_IMAGES = (
-    ("RGBA32F", "FLOAT_2D", "positions_img"),
-    ("RGBA32F", "FLOAT_2D", "velocities_img"),
-    # Holds (density, lambda, 1/lambda-denominator) during the constraint
-    # loop - the same slot WCSPH used for (density, pressure); renaming it
-    # would touch every pass for no behavioral change, so only its packing's
-    # meaning has moved. The third channel is what lets sph_delta.glsl scale
-    # s_corr into lambda's units without a second neighbor loop.
-    ("RGBA32F", "FLOAT_2D", "lambda_img"),
-    # This substep's predicted (pre-constraint, then constraint-corrected)
-    # position. WCSPH used this texture for acceleration; PBF has no force
-    # accumulation step, so it now holds position throughout the substep.
-    ("RGBA32F", "FLOAT_2D", "predicted_img"),
-    # Scratch accumulator for whichever pass currently needs a place to write
-    # a per-particle correction without racing readers of predicted_img or
-    # velocities_img: sph_delta's position correction, then later in the same
-    # substep sph_xsph's velocity correction.
-    ("RGBA32F", "FLOAT_2D", "delta_img"),
-    # xyz = surface-tension color-field gradient (normal), w = curvature. Only
-    # meaningful when surface_tension > 0, in which case sph_normal.glsl
-    # writes it fresh every substep before sph_predict.glsl reads it; the
-    # array is always allocated even when the pass is skipped.
-    ("RGBA32F", "FLOAT_2D", "normal_img"),
-    ("RGBA32F", "FLOAT_2D", "keys_img"),
-    ("R32F", "FLOAT_2D", "cell_start_img"),
-    ("R32F", "FLOAT_2D", "cell_end_img"),
-    ("R32F", "FLOAT_3D", "collider_img"),
-)
-
-# PBF constraint-solve iterations per substep. A fixed count rather than a
+# The per-substep pass chain lives in solver/engine/metal_engine.py now,
+# alongside the buffer table it dispatches against: it is device bookkeeping,
+# not timeline logic, and this module is the timeline.
+#
+# PBF constraint-solve iterations per substep are a fixed count rather than a
 # convergence check: the density constraint is a projection, not a stiff
 # spring, so a handful of Jacobi passes gets close enough without needing to
 # detect convergence on the GPU.
-_PASSES = (
-    "sph_normal",
-    "sph_predict",
-    "sph_grid_key",
-    "sph_sort",
-    "sph_cell_clear",
-    "sph_cell_range",
-    "sph_lambda",
-    "sph_delta",
-    "sph_apply_delta",
-    "sph_velocity",
-    "sph_xsph",
-    "sph_finalize",
-)
+
 
 _state = {
     "running": False,
     "config": None,
     "domain": None,
-    "shaders": {},
-    # Per-pass sets of push-constant/image names this compiled shader has no
-    # slot for (the OpenGL backend eliminates slots a pass never reads - see
-    # gpu_util.bind_push_constants). Rebuilt alongside the shaders.
-    "missing": {},
-    "textures": {},
+    # The compute engine: device, compiled kernels, buffers and the frame's
+    # command queue. None when the solver is not running, or when no device
+    # could be brought up at all.
+    "engine": None,
     "substeps": 0,
     # Playback bookkeeping (Phase 7). `last_frame` is the frame the GPU state
     # represents; `seed_frame` is the frame the run is seeded at and re-seeds
@@ -235,7 +177,6 @@ class SolverConfig:
         "viscosity",
         "max_substeps",
         "iterations",
-        "tex_width",
     )
 
     @property
@@ -369,209 +310,114 @@ def _seed_positions(config):
 
 
 def _allocate(config):
+    """Seed the particle lattice and size every device buffer for it.
+
+    `sorted_count` is the particle count rounded up to a power of two, which is
+    what the bitonic sort needs; the padding slots carry a sentinel key that
+    sorts to the tail. The buffers are all flat arrays indexed by particle or
+    by cell - the 2D texture wrap the old GLSL path needed (because Blender
+    could not read a 1D texture back) has no successor.
+    """
     positions = _seed_positions(config)
     config.particle_count = len(positions) // 4
     config.sorted_count = max(2, 1 << (max(1, config.particle_count) - 1).bit_length())
-    # Every 2D state texture shares one width, sized for the longest of them
-    # (the sort keys): the shaders address all of them through
-    # particle_texel()/cell_texel(), whose divisor is a single i_layout lane,
-    # and the surface splat indexes its own grid through cell_texel() too -
-    # a mismatch between any two textures would silently scramble the data.
-    config.tex_width = texture_width(config.sorted_count)
-    zeros = array("f", [0.0]) * (config.particle_count * 4)
-    width = config.tex_width
-    return {
-        "positions_img": make_texture(config.particle_count, values=positions, width=width),
-        "velocities_img": make_texture(config.particle_count, values=zeros, width=width),
-        "lambda_img": make_texture(config.particle_count, values=zeros, width=width),
-        # Seeded from the same initial positions as positions_img: sph_normal
-        # (once surface tension lands) and the first substep's grid build both
-        # read predicted_img before sph_predict has ever run.
-        "predicted_img": make_texture(config.particle_count, values=positions, width=width),
-        "delta_img": make_texture(config.particle_count, values=zeros, width=width),
-        "normal_img": make_texture(config.particle_count, values=zeros, width=width),
-        "keys_img": make_texture(config.sorted_count, width=width),
-        "cell_start_img": make_texture(config.cell_count, channels=1, fmt="R32F", width=width),
-        "cell_end_img": make_texture(config.cell_count, channels=1, fmt="R32F", width=width),
-    }
+    _state["engine"].allocate(config, positions)
 
 
-def _images_for_pass(body):
-    """The subset of _IMAGES a pass's own source actually reads or writes.
+def _sync_params(config, dt):
+    """Push the run's resolved settings into the engine's parameter block.
 
-    OpenGL dead-code-eliminates image slots a compiled pass never touches,
-    but Metal keeps every slot GPUShaderCreateInfo.image() declares - and
-    caps read-write textures at 8 per shader. Declaring the full 10-image
-    _IMAGES set (positions/velocities/lambda/predicted/delta/normal/keys/
-    cell_start/cell_end/collider) on every pass compiles fine on OpenGL and
-    fails on Metal.
+    Called once per frame rather than per dispatch: only `dt` and the bitonic
+    step vary inside a frame, and the engine overrides those per record.
 
-    collider_img always stays in: sph_common.glsl's collider_occupied() /
-    collider_coord() / collider_in_bounds() reference it by name, and that
-    prelude is concatenated onto every pass whether or not the pass itself
-    calls those functions - an image identifier a shader's source mentions
-    at all must be declared, dead-code elimination happens after linking,
-    not before. No pass reads more than 6 of the rest, so 6 + collider_img
-    stays under the 8-texture cap everywhere.
+    Everything here used to be squeezed into a 128-byte push-constant block
+    that was exactly full, which is why the s_corr strength and the surface
+    tension coefficient arrived bit-packed into spare lanes of the sort slot.
+    They are ordinary fields now.
     """
-    used = {name for _fmt, _type, name in _IMAGES if name != "collider_img" and name in body}
-    used.add("collider_img")
-    return tuple(image for image in _IMAGES if image[2] in used)
-
-
-def _compile_passes():
-    prelude = shader_source("sph_common")
-    shaders = {}
-    for name in _PASSES:
-        body = shader_source(name)
-        shaders[name] = build_compute_shader(
-            [prelude, body], _images_for_pass(body), _PUSH_CONSTANTS, LOCAL_GROUP_SIZE
-        )
-    # The absent-slot sets only describe this particular compile.
-    _state["missing"] = {name: set() for name in _PASSES}
-    return shaders
-
-
-_EMPTY_COLLIDER_TEXTURE = None
-
-
-def _empty_collider_texture():
-    """1x1x1 "nothing occupied" texture, bound when no collider is tagged."""
-    global _EMPTY_COLLIDER_TEXTURE
-    if _EMPTY_COLLIDER_TEXTURE is None:
-        buf = gpu.types.Buffer("FLOAT", [1], [0.0])
-        _EMPTY_COLLIDER_TEXTURE = gpu.types.GPUTexture((1, 1, 1), format="R32F", data=buf)
-    return _EMPTY_COLLIDER_TEXTURE
-
-
-def _collider_binding():
-    """(texture, i_collider) fetched live each bind, so toggling a collider's
-    tag mid-run takes effect on the very next substep rather than needing the
-    solver restarted.
-    """
-    texture, voxel_size, dims = get_solver_grid()
-    if texture is None:
-        # A voxel size of 0 tells the shader there's nothing to sample.
-        return _empty_collider_texture(), (1, 1, 1, 0)
-    voxel_size_bits = struct.unpack("<i", struct.pack("<f", voxel_size))[0]
-    return texture, (*dims, voxel_size_bits)
-
-
-def push_constant_values(config, dt, i_collider, sort_k=0, sort_j=0):
-    """The shared push-constant block as {name: 4-tuple}.
-
-    Phase 6's splat pass binds this same block against the same
-    shaders/sph_common.glsl prelude, overriding only the slots it repurposes,
-    so it is built here rather than inline in _bind().
-    """
-    scorr_k_bits = struct.unpack("<i", struct.pack("<f", config.scorr_strength))[0]
-    tension_bits = struct.unpack("<i", struct.pack("<f", config.surface_tension))[0]
-    return {
-        "i_layout": (
-            config.particle_count,
-            config.tex_width,
-            config.tex_width,
-            config.sorted_count,
-        ),
-        "i_grid": (*config.cell_dims, config.cell_count),
-        # z/w carry sph_delta.glsl's s_corr strength and sph_predict.glsl's
-        # surface-tension coefficient (both bit-packed as floats), not sort
-        # parameters - sph_sort is the only pass that reads x/y, and it never
-        # reads z/w, so these ride for free in otherwise-unused lanes rather
-        # than needing a second push-constant block.
-        "i_sort": (sort_k, sort_j, scorr_k_bits, tension_bits),
-        "f_lo": (*config.lo, config.cell_size),
-        "f_hi": (*config.hi, config.particle_radius),
-        "f_sph": (
-            config.smoothing_radius,
-            config.mass,
-            config.rest_density,
-            config.relaxation,
-        ),
-        "f_sim": (config.viscosity, dt, GRAVITY, BOUNDARY_DAMPING),
-        "i_collider": i_collider,
-    }
-
-
-def _bind(name, dt, sort_k=0, sort_j=0):
-    """Bind a pass's shader with the shared push-constant block and images."""
-    config = _state["config"]
-    shader = _state["shaders"][name]
-    missing = _state["missing"][name]
-    collider_texture, i_collider = _collider_binding()
-    shader.bind()
-    bind_push_constants(
-        shader, push_constant_values(config, dt, i_collider, sort_k, sort_j), missing
+    engine = _state["engine"]
+    engine.params.update(
+        particle_count=config.particle_count,
+        sorted_count=config.sorted_count,
+        cell_count=config.cell_count,
+        cells_x=config.cell_dims[0],
+        cells_y=config.cell_dims[1],
+        cells_z=config.cell_dims[2],
+        lo_x=config.lo.x,
+        lo_y=config.lo.y,
+        lo_z=config.lo.z,
+        cell_size=config.cell_size,
+        hi_x=config.hi.x,
+        hi_y=config.hi.y,
+        hi_z=config.hi.z,
+        particle_radius=config.particle_radius,
+        smoothing_radius=config.smoothing_radius,
+        mass=config.mass,
+        rest_density=config.rest_density,
+        relaxation=config.relaxation,
+        viscosity=config.viscosity,
+        dt=dt,
+        gravity=GRAVITY,
+        boundary_damping=BOUNDARY_DAMPING,
+        scorr_k=config.scorr_strength,
+        surface_tension=config.surface_tension,
     )
-    for image_name in (image[2] for image in _IMAGES):
-        if image_name == "collider_img":
-            bind_image(shader, image_name, collider_texture, missing)
-        else:
-            bind_image(shader, image_name, _state["textures"][image_name], missing)
-    return shader
+    _sync_collider()
 
 
-def _build_grid(dt):
-    config = _state["config"]
-    n = config.sorted_count
+def _sync_collider():
+    """Point the engine at the current collider grid.
 
-    dispatch_1d(_bind("sph_grid_key", dt), n, LOCAL_GROUP_SIZE)
-
-    # Bitonic sort: k is the current merge width, j the compare distance.
-    k = 2
-    while k <= n:
-        j = k >> 1
-        while j > 0:
-            dispatch_1d(_bind("sph_sort", dt, k, j), n, LOCAL_GROUP_SIZE)
-            j >>= 1
-        k <<= 1
-
-    dispatch_1d(_bind("sph_cell_clear", dt), config.cell_count, LOCAL_GROUP_SIZE)
-    dispatch_1d(_bind("sph_cell_range", dt), n, LOCAL_GROUP_SIZE)
-
-
-def _substep(dt):
-    config = _state["config"]
-    # sph_predict.glsl treats sigma <= 0 as a no-op, so skip the normal/
-    # curvature pass's neighbor loop entirely when surface tension is off
-    # (the shipped default) rather than paying for a dispatch nothing reads.
-    if config.surface_tension > 0.0:
-        dispatch_1d(_bind("sph_normal", dt), config.particle_count, LOCAL_GROUP_SIZE)
-    dispatch_1d(_bind("sph_predict", dt), config.particle_count, LOCAL_GROUP_SIZE)
-    _build_grid(dt)
-    for _ in range(config.iterations):
-        for name in ("sph_lambda", "sph_delta", "sph_apply_delta"):
-            dispatch_1d(_bind(name, dt), config.particle_count, LOCAL_GROUP_SIZE)
-    for name in ("sph_velocity", "sph_xsph", "sph_finalize"):
-        dispatch_1d(_bind(name, dt), config.particle_count, LOCAL_GROUP_SIZE)
+    Fetched live rather than cached, so toggling a collider's tag mid-run takes
+    effect on the very next substep rather than needing the solver restarted.
+    """
+    buffer, voxel_size, dims = get_solver_grid()
+    if buffer is None and get_solver_occupancy() is None:
+        # A voxel size of 0 tells the engine there is nothing to sample.
+        _state["engine"].set_collider(None, (1, 1, 1), 0.0)
+    else:
+        # Both forms: a GPU engine binds the buffer, the CPU engine reads the
+        # occupancy. Whichever it does not need, it ignores.
+        _state["engine"].set_collider(buffer, dims, voxel_size, occupancy=get_solver_occupancy())
 
 
 def _step(frame_dt, frame):
     """Advance one frame of simulated time and refresh the frame's output.
 
-    Timed end to end rather than per stage: compute dispatches return before
-    the GPU has run them, so it is the read-back at the end that the whole
-    frame's GPU work actually lands in. Only the total means anything.
+    The whole frame - every substep, then the surface splat, then whitewater -
+    is recorded into one command queue and submitted once, at the flush below.
+    Recording is cheap and does no GPU work, so timing anything finer than the
+    whole step would just measure how fast Python can append to a list.
     """
     started = time.perf_counter()
 
+    engine = _state["engine"]
     config = _state["config"]
     substeps, dt = config.substep_dt(frame_dt)
     _state["substeps"] = substeps
+
+    _sync_params(config, dt)
     for _ in range(substeps):
-        _substep(dt)
+        engine.substep(dt)
+
+    # Recorded into the same submission as the substeps: both read the grid the
+    # last substep built, and neither needs a read-back before the other runs.
+    _record_surface(dt)
+    _record_whitewater(frame_dt, frame)
+    engine.flush()
 
     # The cache is the only other consumer of the particle state after a step,
     # and the debug overlay wants the same read-back - share it when both do.
     positions = None
     if cache.is_open() or _state["domain"].flowx_domain.show_particles:
-        positions = read_texture(_state["textures"]["positions_img"], config.particle_count)
+        positions = engine.read_vec4("positions", config.particle_count)
     velocities = None
     if cache.is_open():
-        velocities = read_texture(_state["textures"]["velocities_img"], config.particle_count)
+        velocities = engine.read_vec4("velocities", config.particle_count)
 
-    _update_surface(dt)
-    _update_whitewater(frame_dt, frame)
+    # Extraction is CPU work on what the flush produced, so it has to follow it.
+    surface.extract()
+    whitewater.extract()
     # The cache write comes after the surface and whitewater are extracted so
     # it stores this frame's own mesh, not the previous frame's - the render
     # path replays exactly what was written here.
@@ -591,42 +437,28 @@ def _step(frame_dt, frame):
     _state["timings"].append((time.perf_counter() - started) * 1000.0)
 
 
-def _update_whitewater(frame_dt, frame):
-    """Score/sort/spawn/advect the whitewater pool, once per frame.
+def _record_whitewater(frame_dt, frame):
+    """Record the whitewater passes, once per frame.
 
-    Uses the full frame_dt rather than the substep dt _update_surface() gets:
+    Uses the full frame_dt rather than the substep dt the surface splat gets:
     spawn rate and advection are both real-time rates, and whitewater has no
     stake in the substep loop's internal stability limit the way the SPH
     passes do.
     """
     if not whitewater.is_running():
         return
-    collider = _collider_binding()
-    whitewater.update(
-        _state["config"],
-        _state["textures"],
-        push_constant_values(_state["config"], frame_dt, collider[1]),
-        collider,
-        frame_dt,
-        frame,
-    )
+    whitewater.record(_state["engine"], _state["config"], frame_dt, frame)
 
 
-def _update_surface(dt):
-    """Re-extract the fluid surface, once per frame rather than per substep.
+def _record_surface(dt):
+    """Record the surface splat, once per frame rather than per substep.
 
-    It's the only CPU round-trip in the pipeline, and nothing between substeps
-    looks at its output.
+    Its read-back and marching-cubes extraction are the only CPU round-trip in
+    the pipeline, and nothing between substeps looks at the result.
     """
     if not surface.is_running():
         return
-    collider = _collider_binding()
-    surface.update(
-        _state["config"],
-        _state["textures"],
-        push_constant_values(_state["config"], dt, collider[1]),
-        collider,
-    )
+    surface.record(_state["engine"], _state["config"], dt)
 
 
 def _update_viz(positions=None):
@@ -645,41 +477,44 @@ def _update_viz(positions=None):
         viz.set_points([])
         return
     if positions is None:
-        positions = read_texture(_state["textures"]["positions_img"], config.particle_count)
+        positions = _state["engine"].read_vec4("positions", config.particle_count)
     viz.set_points([p[:3] for p in positions])
 
 
 def _seed(domain):
     """Re-resolve the run's parameters and refill particle state from scratch.
 
-    Everything except the compiled shaders is rebuilt, so a re-seed picks up
-    edits to fluid level, resolution and the solver parameters. The shaders
+    Everything except the compiled kernels is rebuilt, so a re-seed picks up
+    edits to fluid level, resolution and the solver parameters. The kernels
     depend only on the binding layout, never on the config, so they survive -
     which is what makes re-seeding cheap enough to do on every playback loop.
     """
     config = _resolve_config(domain)
     _state["config"] = config
-    _state["textures"] = _allocate(config)
+    _allocate(config)
+    _sync_params(config, 0.0)
 
     if domain.flowx_domain.show_surface:
         if surface.is_running():
-            surface.reseed(domain, config)
+            surface.reseed(_state["engine"], domain, config)
         else:
-            surface.start(domain, config)
+            surface.start(_state["engine"], domain, config)
         # Extract once up front so the seeded fluid is visible as a surface
         # straight away instead of as an empty object until playback starts.
         # The splat gathers through the spatial hash, so that has to exist -
-        # a zero-length step builds it without advancing the simulation.
-        _build_grid(0.0)
-        _update_surface(0.0)
+        # building it here costs one dispatch chain and advances nothing.
+        _state["engine"].build_grid()
+        _record_surface(0.0)
+        _state["engine"].flush()
+        surface.extract()
     elif surface.is_running():
         surface.stop()
 
     if domain.flowx_domain.show_whitewater:
         if whitewater.is_running():
-            whitewater.reseed(domain, config)
+            whitewater.reseed(_state["engine"], domain, config)
         else:
-            whitewater.start(domain, config)
+            whitewater.start(_state["engine"], domain, config)
     elif whitewater.is_running():
         whitewater.stop()
 
@@ -702,8 +537,12 @@ def _start(domain):
     # reload a tagged collider may have its tag but no grid; build the missing
     # ones so the first substep collides correctly.
     ensure_grids(bpy.context.scene)
+    preferred = domain.flowx_domain.engine
+    engine = engines.create(None if preferred == "AUTO" else preferred.lower())
+    if engine is None:
+        raise RuntimeError(engines.unavailable_reason())
+    _state["engine"] = engine
     _state["domain"] = domain
-    _state["shaders"] = _compile_passes()
     _state["running"] = True
     _seed(domain)
     _reset_clock(bpy.context.scene)
@@ -755,7 +594,10 @@ def stop():
     cache.close()
     surface.stop()
     whitewater.stop()
-    _state.update({"running": False, "config": None, "domain": None, "shaders": {}, "textures": {}})
+    engine = _state["engine"]
+    if engine is not None:
+        engine.release()
+    _state.update({"running": False, "config": None, "domain": None, "engine": None})
     _state["timings"].clear()
     _state["warning"] = None
     viz.disable()
@@ -855,36 +697,35 @@ def _apply_cached(positions, velocities, frame):
     brought to this frame before the handler ran.
     """
     config = _state["config"]
-    width = config.tex_width
-    _state["textures"]["positions_img"] = make_texture(
-        config.particle_count, values=positions, width=width
-    )
-    _state["textures"]["velocities_img"] = make_texture(
-        config.particle_count, values=velocities, width=width
-    )
-    # The grid build below reads predicted_img, not positions_img (see
-    # sph_grid_key.glsl) - a loaded frame has no "prediction" of its own, so
-    # this just mirrors positions_img the way a fresh seed does in _allocate().
-    _state["textures"]["predicted_img"] = make_texture(
-        config.particle_count, values=positions, width=width
-    )
-    # Also reset lambda_img rather than leaving whatever density the solver
-    # last computed for a *different* particle configuration: if surface
-    # tension is on, sph_normal reads lambda_img's density channel as a
-    # per-neighbor weight before sph_lambda ever runs against these loaded
-    # positions (see _substep's pass order). Zeroing it here mirrors
-    # _allocate()'s fresh seed, where every neighbor's density is the same
-    # clamped constant - that uniform weight cancels out of both the normal's
-    # direction and the curvature ratio, unlike a stale, non-uniform density
-    # left over from wherever the timeline was before this jump.
-    _state["textures"]["lambda_img"] = make_texture(
-        config.particle_count, values=array("f", [0.0]) * (config.particle_count * 4), width=width
-    )
+    engine = _state["engine"]
+    count = config.particle_count
+
+    engine.upload_vec4("positions", positions, count)
+    engine.upload_vec4("velocities", velocities, count)
+    # The grid build below reads the predicted buffer, not the position one
+    # (see sph_grid_key) - a loaded frame has no "prediction" of its own, so
+    # this just mirrors positions the way a fresh seed does in _allocate().
+    engine.upload_vec4("predicted", positions, count)
+    # Also reset lambda rather than leaving whatever density the solver last
+    # computed for a *different* particle configuration: if surface tension is
+    # on, sph_normal reads lambda's density channel as a per-neighbour weight
+    # before sph_lambda ever runs against these loaded positions (see the
+    # engine's substep pass order). Zeroing it mirrors a fresh seed, where
+    # every neighbour's density is the same clamped constant - that uniform
+    # weight cancels out of both the normal's direction and the curvature
+    # ratio, unlike a stale, non-uniform density left over from wherever the
+    # timeline was before this jump.
+    engine.zero("lambda")
+
     _state["last_frame"] = frame
     _state["gpu_frame"] = frame
     _state["warning"] = None
-    _build_grid(0.0)
-    _update_surface(0.0)
+
+    _sync_params(config, 0.0)
+    engine.build_grid()
+    _record_surface(0.0)
+    engine.flush()
+    surface.extract()
     _update_viz()
     viz.tag_viewports_redraw()
 
@@ -1028,7 +869,7 @@ def _on_frame_change(scene, _depsgraph):
     # into the first frame. Checked before the frame==last_frame short-circuit:
     # every rendered frame must install its cached surface even if the clock
     # already sits on it.
-    if _state["rendering"] or _in_render() or not context_available():
+    if _state["rendering"] or _in_render():
         _install_cached_mesh(frame, scene, domain)
         return
     if frame == _state["last_frame"]:
@@ -1104,6 +945,29 @@ def is_running():
     return _state["running"]
 
 
+def read_state():
+    """The run's current (positions, velocities) as flat lists of 4-tuples.
+
+    A read-back on demand, for tools that need the particle state outside the
+    normal step path - notably scripts/golden.py, which compares a run against
+    a reference dump. _step() does its own read-back and shares it between the
+    cache and the overlay; this is deliberately not wired into that, so asking
+    for the state never changes what a frame costs.
+
+    Kept as a public accessor rather than reaching into the engine's buffers
+    directly, because it has to keep working across a backend change - which
+    is exactly what it was written for.
+    """
+    config = _state["config"]
+    engine = _state["engine"]
+    if not _state["running"] or config is None or engine is None:
+        return None
+    return (
+        engine.read_vec4("positions", config.particle_count),
+        engine.read_vec4("velocities", config.particle_count),
+    )
+
+
 def stats():
     """Resolved run parameters for the panel, or None when not running.
 
@@ -1128,6 +992,7 @@ def stats():
         "warning": _state["warning"],
         "step_ms": sum(timings) / len(timings) if timings else None,
         "cache": cache.info(),
+        "engine": engines.describe(_state["engine"]),
     }
 
 
@@ -1151,10 +1016,6 @@ class FLOWX_OT_sph_toggle(Operator):
             stop()
             self.report({"INFO"}, "Flow-X SPH solver stopped")
             return {"FINISHED"}
-
-        from . import gpu_test
-
-        gpu_test.stop()
 
         domain = find_domain(context.scene)
         if domain.flowx_domain.fluid_level <= 0.0:

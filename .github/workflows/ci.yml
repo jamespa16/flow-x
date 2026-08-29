@@ -22,3 +22,32 @@ jobs:
       # push: it needs a Blender download and is the job of release.yml,
       # which runs it on tag pushes and via workflow_dispatch.
       - run: python3 scripts/test_marching_cubes.py
+
+      # The backend package imports neither bpy nor gpu, so its tests run here
+      # too. On Linux there is no Metal device, so this reports a skip rather
+      # than a pass - it is still worth running, because an import error or a
+      # broken ctypes signature fails the job on every platform.
+      - run: python3 scripts/test_backend.py
+
+      # The CPU engine is numpy-only, so the whole PBF pipeline - neighbour
+      # search, constraint solve, colliders, surface, whitewater - is exercised
+      # here, on a runner with no GPU and no Blender.
+      - run: pip install numpy
+      - run: python3 scripts/test_cpu_engine.py
+
+  # The Metal helper only exists on macOS, and only here does test_backend.py
+  # actually exercise a device. Kept separate from lint so a macOS runner is
+  # not spent on ruff.
+  metal:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install numpy
+      - run: python3 scripts/build_native.py
+      - run: python3 scripts/test_backend.py
+      # Only here does the cross-engine check in this suite have a GPU to
+      # compare the numpy engine against.
+      - run: python3 scripts/test_cpu_engine.py

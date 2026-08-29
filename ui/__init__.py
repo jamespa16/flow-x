@@ -6,13 +6,10 @@ from bpy.types import Panel
 from ..collision import FLOWX_OT_toggle_collider, occupied_count
 from ..domain import FLOWX_OT_domain_add, find_domain, world_bounds
 from ..solver import (
-    PARTICLE_COUNT,
     FLOWX_OT_cache_clear,
-    FLOWX_OT_solver_gpu_test_toggle,
     FLOWX_OT_sph_bake,
     FLOWX_OT_sph_reset,
     FLOWX_OT_sph_toggle,
-    gpu_test,
     sph,
     surface,
     whitewater,
@@ -95,18 +92,6 @@ class FLOWX_PT_domain(Panel):
         box.label(text="Debug Overlays")
         box.prop(settings, "show_collider_overlay")
 
-        smoke_running = gpu_test.is_running()
-        box = layout.box()
-        box.label(text="GPU Compute Test")
-        box.operator(
-            FLOWX_OT_solver_gpu_test_toggle.bl_idname,
-            text="Stop Compute Test" if smoke_running else "Run Compute Test",
-            icon="PAUSE" if smoke_running else "PLAY",
-            depress=smoke_running,
-        )
-        if smoke_running:
-            box.label(text=f"{PARTICLE_COUNT} particles falling under gravity")
-
 
 class FLOWX_PT_solver(Panel):
     bl_label = "SPH Solver"
@@ -123,6 +108,12 @@ class FLOWX_PT_solver(Panel):
     def draw(self, context):
         layout = self.layout
         settings = context.active_object.flowx_domain
+
+        # Changing the engine mid-run would leave the timeline half-simulated
+        # by one and half by the other, so it is locked while the solver runs.
+        row = layout.row()
+        row.enabled = not sph.is_running()
+        row.prop(settings, "engine")
 
         col = layout.column(align=True)
         col.prop(settings, "rest_density")
@@ -149,6 +140,7 @@ class FLOWX_PT_solver(Panel):
 
         box = layout.box()
         col = box.column(align=True)
+        col.label(text=f"Engine: {stats['engine']}")
         dims = "x".join(str(n) for n in stats["cell_dims"])
         col.label(text=f"Grid: {dims} ({stats['cells']} cells)")
         # The solver coarsens its own spacing when a domain would blow the
