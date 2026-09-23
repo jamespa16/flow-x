@@ -87,7 +87,13 @@ def select(name=None):
     for candidate in BACKENDS:
         module = _load(candidate)
         if module is not None:
-            return module.create()
+            try:
+                return module.create()
+            except DeviceError:
+                # A loadable helper can still find no physical device (remote
+                # sessions and sandboxed macOS processes are common cases).
+                # Auto selection treats that exactly like an absent backend.
+                continue
     return None
 
 

@@ -2,8 +2,8 @@ schema_version = "1.0.0"
 
 id = "flow_x"
 name = "Flow-X"
-version = "0.2.0"
-tagline = "GPU-simulated SPH fluids with a live surface mesh"
+version = "0.3.0"
+tagline = "GPU-simulated PBF and APIC fluids with a live surface mesh"
 maintainer = "James Palmer <james.pa@outlook.com>"
 type = "add-on"
 

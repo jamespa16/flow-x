@@ -6,8 +6,8 @@ the fallback for machines with no usable device, and the reference the GPU
 engine is checked against.
 
 This is a level above solver/backend/, and the split matters: the backend is a
-generic device (buffers, kernels, a queue) that knows nothing about SPH, while
-an engine is all SPH and may not involve a device at all. That is what lets a
+generic device (buffers, kernels, a queue) that knows nothing about fluids, while
+an engine owns one fluid method and may not involve a device at all. That is what lets a
 CUDA engine reuse the pass bodies while a numpy engine reuses none of them.
 
 solver/sph.py keeps the timeline, the cache and the operators, and asks an
@@ -19,7 +19,6 @@ module to import; the device decides which module inside the method.
 """
 
 _reason = None
-_fallback = None
 
 # method -> device -> engine module. A method with no entry here has no
 # implementation at all; a module whose import fails is one this machine cannot
@@ -34,36 +33,20 @@ def create(preferred=None, method="pbf"):
     """Bring up an engine for `method`, or return None if none can run.
 
     `preferred` names a device explicitly ("metal", "cpu"); the default tries
-    the GPU and falls back. `method` names the algorithm; a method whose engine
-    does not exist yet stands in with PBF rather than failing the run, and
-    fallback_note() says so - running the wrong algorithm is better than
-    running none, but the user must be told which one they got. None rather
-    than raising, because "this machine has no usable device" is an ordinary
-    state the caller reports in the panel. unavailable_reason() says why.
+    the GPU and falls back to the *same method* on the CPU. Methods are never
+    substituted: selecting APIC must not silently run PBF. None rather than
+    raising, because "this machine has no usable device" is an ordinary state
+    the caller reports in the panel. unavailable_reason() says why.
     """
-    global _reason, _fallback
+    global _reason
     _reason = None
-    _fallback = None
 
     modules = _METHOD_MODULES.get(method)
     if modules is None:
         _reason = f"unknown solver method {method!r}"
         return None
 
-    engine = _from_modules(modules, preferred)
-    if engine is not None:
-        return engine
-    if method == "pbf":
-        return None
-
-    # The recursion resets _fallback, so the note goes back after it. The PBF
-    # attempt's _reason is the one worth keeping: "no Metal device" explains
-    # more than "APIC missing" when both are true.
-    note = f"{method.upper()} is not implemented yet - running PBF instead"
-    engine = create(preferred)
-    if engine is not None:
-        _fallback = note
-    return engine
+    return _from_modules(modules, preferred)
 
 
 def _from_modules(modules, preferred):
@@ -103,6 +86,12 @@ def _try_create(module_name):
         return module.create(), None
     except ImportError as exc:
         return None, str(exc)
+    except Exception as exc:
+        from ..backend import DeviceError
+
+        if isinstance(exc, DeviceError):
+            return None, str(exc)
+        raise
 
 
 def describe(engine):
@@ -121,5 +110,5 @@ def unavailable_reason():
 
 
 def fallback_note():
-    """Why create() gave a different method than was asked for, or None."""
-    return _fallback
+    """Compatibility shim: methods are no longer substituted."""
+    return None

@@ -548,6 +548,7 @@ class CpuEngine:
 
     def alloc_whitewater(self, capacity, sorted_count):
         del sorted_count
+        self.params.update(ww_capacity=capacity)
         self.ww = {
             "positions": np.zeros((capacity, 4), dtype=np.float32),
             "velkind": np.zeros((capacity, 4), dtype=np.float32),
@@ -721,6 +722,34 @@ class CpuEngine:
     def upload_vec4(self, name, values, count):
         data = np.asarray(values, dtype=np.float32).reshape(-1, 4)[:count]
         self.state[name][: len(data)] = data
+
+    def snapshot_state(self, include_whitewater=False):
+        """Return the persistent state needed to continue this PBF run."""
+        count = self.config.particle_count
+        state = {
+            "positions": self.read_vec4("positions", count),
+            "velocities": self.read_vec4("velocities", count),
+        }
+        if include_whitewater and self.ww:
+            capacity = len(self.ww["positions"])
+            state["ww_positions"], state["ww_velkind"] = self.read_whitewater(capacity)
+        return state
+
+    def restore_state(self, state):
+        """Restore persistent state; derived PBF scratch is rebuilt by sph.py."""
+        count = self.config.particle_count
+        self.upload_vec4("positions", state["positions"], count)
+        self.upload_vec4("velocities", state["velocities"], count)
+        self.upload_vec4("predicted", state["positions"], count)
+        self.zero("lambda")
+        if "ww_positions" in state and self.ww:
+            capacity = len(self.ww["positions"])
+            self.ww["positions"][:] = np.asarray(state["ww_positions"], dtype=np.float32).reshape(
+                -1, 4
+            )[:capacity]
+            self.ww["velkind"][:] = np.asarray(state["ww_velkind"], dtype=np.float32).reshape(
+                -1, 4
+            )[:capacity]
 
 
 def create():

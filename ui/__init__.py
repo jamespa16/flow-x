@@ -94,7 +94,7 @@ class FLOWX_PT_domain(Panel):
 
 
 class FLOWX_PT_solver(Panel):
-    bl_label = "SPH Solver"
+    bl_label = "Fluid Solver"
     bl_idname = "FLOWX_PT_solver"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -127,6 +127,9 @@ class FLOWX_PT_solver(Panel):
             col.prop(settings, "pbf_scorr_k")
             col.prop(settings, "surface_tension")
             col.prop(settings, "viscosity")
+        else:
+            col.prop(settings, "apic_pressure_iterations")
+            col.prop(settings, "apic_vorticity_strength")
         col.prop(settings, "max_substeps")
         col.prop(settings, "max_particles")
 
@@ -145,12 +148,14 @@ class FLOWX_PT_solver(Panel):
 
         box = layout.box()
         col = box.column(align=True)
-        col.label(text=f"Engine: {stats['engine']}")
-        # The factory substituted a method for the one the domain asked for.
+        col.label(text=f"Method: {stats['method'].upper()}")
+        col.label(text=f"Device: {stats['device']}")
+        # Persistent engine-selection notes are separate from timeline warnings.
         if stats["method_note"]:
             col.label(text=stats["method_note"], icon="ERROR")
         dims = "x".join(str(n) for n in stats["cell_dims"])
-        col.label(text=f"Grid: {dims} ({stats['cells']} cells)")
+        label = "Pressure Grid" if stats["method"] == "apic" else "Grid"
+        col.label(text=f"{label}: {dims} ({stats['cells']} cells)")
         # The solver coarsens its own spacing when a domain would blow the
         # particle budget, so show what it actually settled on.
         lo, hi = world_bounds(context.active_object)

@@ -38,7 +38,7 @@ python3 scripts/dev_link.py [--blender-version 5.2]
 blender --background --python scripts/smoke_test.py
 
 # same script against a packaged zip installed into a throwaway config
-BLENDER_USER_RESOURCES=/tmp/blender-config FLOWX_ZIP=dist/flow_x-0.2.0.zip \
+BLENDER_USER_RESOURCES=/tmp/blender-config FLOWX_ZIP=dist/flow_x-0.3.0.zip \
   blender --background --python scripts/smoke_test.py
 
 python3 scripts/package.py [source_dir] [out_dir]   # release zip (default out: dist/)

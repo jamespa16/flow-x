@@ -135,6 +135,26 @@ class FlowXDomainSettings(PropertyGroup):
         min=0.0,
         max=10.0,
     )
+    apic_pressure_iterations: IntProperty(
+        name="Pressure Iterations",
+        description=(
+            "Weighted-Jacobi iterations used to project the APIC grid velocity to "
+            "an incompressible field. More reduces residual divergence at a linear cost"
+        ),
+        default=40,
+        min=5,
+        max=200,
+    )
+    apic_vorticity_strength: FloatProperty(
+        name="Vorticity Strength",
+        description=(
+            "Grid vorticity-confinement strength. Raises visible swirl lost to numerical "
+            "dissipation; 0 disables the two confinement passes"
+        ),
+        default=0.3,
+        min=0.0,
+        max=5.0,
+    )
     # Phase 6 surface reconstruction. The surface grid tracks the simulation's
     # resolution through a multiplier, so refining the physics refines the look
     # without a second knob to remember - but the multiplier can be pulled
@@ -316,8 +336,7 @@ class FlowXDomainSettings(PropertyGroup):
         description=(
             "Which fluid solver to use. PBF (Position Based Fluids) is the default. "
             "APIC (Affine Particle-In-Cell) conserves angular momentum and handles "
-            "collisions through the grid, but is still under development and falls "
-            "back to PBF when unavailable"
+            "collisions and incompressibility through a staggered velocity grid"
         ),
         items=(
             (
@@ -330,7 +349,7 @@ class FlowXDomainSettings(PropertyGroup):
                 "APIC",
                 "APIC",
                 "Affine Particle-In-Cell (Jiang et al. 2015). "
-                "Grid-based transfer, conserves angular momentum. Not yet implemented",
+                "MAC-grid transfer and pressure projection; conserves angular momentum",
             ),
         ),
         default="PBF",

@@ -11,6 +11,7 @@ Run from the repo root (after `python3 scripts/dev_link.py`):
 
 import math
 import os
+import statistics
 import sys
 from pathlib import Path
 
@@ -74,7 +75,7 @@ def _init_gpu():
 
 
 def _check_solver():
-    """Confirm the SPH solver really started, and step it a few frames.
+    """Confirm both fluid methods start and produce integrated outputs.
 
     The solver operators deliberately report a warning instead of raising when
     there's no GPU context, so a green operator run alone would not catch a
@@ -94,6 +95,11 @@ def _check_solver():
         scene.frame_set(frame)
     stats = sph.stats()
     print(f"[smoke_test] stepped SPH solver 3 frames: {stats}")
+    pbf_samples = list(sph._state["timings"])
+    pbf_benchmark = {
+        "device": stats["device"],
+        "median_ms": statistics.median(pbf_samples[1:] or pbf_samples),
+    }
 
     _check_particles(sph, stats)
     _check_pbf_convergence(sph, stats)
@@ -101,6 +107,109 @@ def _check_solver():
     _check_collider_grids()
     _check_playback(sph)
     _check_cache(sph)
+    _check_apic_solver(sph, pbf_benchmark)
+
+
+def _check_apic_solver(sph, pbf_benchmark):
+    """APIC performance, v3 continuation, whitewater, and render replay."""
+    mod = sys.modules[ADDON_MODULE]
+    scene = bpy.context.scene
+    domain = mod.domain.find_domain(scene)
+    settings = domain.flowx_domain
+    sph.stop()
+    scene.frame_set(scene.frame_start)
+    settings.solver_method = "APIC"
+    settings.fluid_level = 50.0
+    settings.cache_enabled = False
+    settings.show_whitewater = False
+
+    result = _get_operator("flowx.sph_toggle")()
+    if "FINISHED" not in result or not sph.is_running():
+        raise RuntimeError(f"APIC solver did not start: {result}")
+
+    for frame in range(scene.frame_start + 1, scene.frame_start + 5):
+        scene.frame_set(frame)
+    stats = sph.stats()
+    if stats["method"] != "apic":
+        raise RuntimeError(f"selected APIC but resolved method is {stats['method']!r}")
+    _check_particles(sph, stats)
+    _check_surface(sph, stats)
+    _check_collider_grids()
+    apic_samples = list(sph._state["timings"])
+    apic_median = statistics.median(apic_samples[1:] or apic_samples)
+    ratio = apic_median / max(pbf_benchmark["median_ms"], 1e-6)
+    print(
+        f"[smoke_test] full-frame median after warm-up: "
+        f"PBF={pbf_benchmark['median_ms']:.1f} ms, APIC={apic_median:.1f} ms "
+        f"({ratio:.2f}x)"
+    )
+    if stats["device"] == pbf_benchmark["device"] == "metal" and ratio > 1.5:
+        raise RuntimeError(f"APIC benchmark is {ratio:.2f}x PBF, expected no more than 1.50x")
+
+    # Benchmark the two methods with matching output settings above. Restart
+    # APIC with whitewater and caching enabled for continuation/replay checks.
+    sph.stop()
+    scene.frame_set(scene.frame_start)
+    settings.cache_enabled = True
+    settings.show_whitewater = True
+    settings.whitewater_capacity = 128
+    settings.whitewater_spawn_rate = 240.0
+    result = _get_operator("flowx.sph_toggle")()
+    if "FINISHED" not in result or not sph.is_running():
+        raise RuntimeError(f"APIC whitewater/cache run did not start: {result}")
+
+    checkpoint = None
+    checkpoint_frame = scene.frame_start + 2
+    for frame in range(scene.frame_start + 1, scene.frame_start + 5):
+        scene.frame_set(frame)
+        if frame == checkpoint_frame:
+            checkpoint = sph._state["engine"].snapshot_state(include_whitewater=True)
+            checkpoint["whitewater_cursor"] = mod.solver.whitewater.cursor()
+    if checkpoint is None:
+        raise RuntimeError("APIC continuation checkpoint was not captured")
+
+    scene.frame_set(checkpoint_frame)
+    restored = sph._state["engine"].snapshot_state(include_whitewater=True)
+    restored["whitewater_cursor"] = mod.solver.whitewater.cursor()
+    for key in (
+        "positions",
+        "velocities",
+        "affine",
+        "ww_positions",
+        "ww_velkind",
+        "whitewater_cursor",
+    ):
+        if restored[key] != checkpoint[key]:
+            raise RuntimeError(f"APIC cache scrub did not exactly restore {key}")
+    baked = mod.solver.cache.load_mesh(checkpoint_frame, scene, domain)
+    if baked is None or not baked[0] or not baked[1]:
+        raise RuntimeError("APIC paired mesh cache did not replay the scrubbed frame")
+    if not baked[2]:
+        raise RuntimeError("APIC paired mesh cache did not include spawned whitewater")
+
+    # Exercise the actual render-handler branch: it must install the paired
+    # mesh on the CPU and leave the GPU particle state at the scrubbed frame.
+    render_frame = checkpoint_frame + 1
+    render_baked = mod.solver.cache.load_mesh(render_frame, scene, domain)
+    if render_baked is None:
+        raise RuntimeError("APIC render frame is missing from the paired mesh cache")
+    sph._on_render_pre(scene, None)
+    scene.frame_set(render_frame)
+    sph._on_render_post(scene, None)
+    replayed = mod.solver.surface.last_mesh()
+    if (
+        replayed is None
+        or len(replayed[0]) != len(render_baked[0])
+        or len(replayed[1]) != len(render_baked[1])
+    ):
+        raise RuntimeError("APIC render handler did not replay the paired surface mesh")
+    if sph._state["gpu_frame"] != checkpoint_frame:
+        raise RuntimeError("CPU render replay unexpectedly changed the APIC GPU state")
+    print(
+        f"[smoke_test] APIC {stats['device']}: surface + affine cache replay "
+        f"and baked render replay at frame {checkpoint_frame}"
+    )
+    sph.stop()
 
 
 def _check_pbf_convergence(sph, stats):
@@ -550,8 +659,8 @@ def _install_packaged_zip():
     print(f"[smoke_test] installed packaged extension from {zip_path}")
 
 
-def _run_demo(demo):
-    """Start the solver on one demo scene and apply the standard checks."""
+def _run_demo(demo, method):
+    """Start one method on a demo scene and apply the standard checks."""
     mod = sys.modules[ADDON_MODULE]
     scene = bpy.context.scene
     domain = mod.domain.find_domain(scene)
@@ -560,7 +669,11 @@ def _run_demo(demo):
     colliders = [obj.name for obj in scene.objects if obj.flowx_collider.is_collider]
     if not colliders:
         raise RuntimeError(f"{demo.name}: no tagged colliders found")
-    print(f"[smoke_test] {demo.name}: domain='{domain.name}', colliders={colliders}")
+    domain.flowx_domain.solver_method = method.upper()
+    print(
+        f"[smoke_test] {demo.name}: method={method}, "
+        f"domain='{domain.name}', colliders={colliders}"
+    )
 
     result = _get_operator("flowx.sph_toggle")()
     if "FINISHED" not in result:
@@ -572,6 +685,8 @@ def _run_demo(demo):
     for frame in range(scene.frame_start, scene.frame_start + 6):
         scene.frame_set(frame)
     stats = sph.stats()
+    if stats["method"] != method:
+        raise RuntimeError(f"{demo.name}: requested {method}, got {stats['method']}")
     _check_particles(sph, stats)
     _check_surface(sph, stats)
     _check_collider_grids()
@@ -622,8 +737,11 @@ def _check_demo_scenes():
         if not _gpu_available:
             print("[smoke_test] no GPU context; skipping demo scene replay")
             return
-        print(f"[smoke_test] replaying demo {demo.name}")
-        _run_demo(demo)
+        for method in ("pbf", "apic"):
+            print(f"[smoke_test] replaying demo {demo.name} with {method.upper()}")
+            _run_demo(demo, method)
+            sys.modules[ADDON_MODULE].solver.sph.stop()
+            bpy.context.scene.frame_set(bpy.context.scene.frame_start)
 
 
 def main():

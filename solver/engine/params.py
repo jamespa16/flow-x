@@ -2,7 +2,7 @@
 
 One struct, mirroring `struct Params` in kernels/flowx_prelude.h. Field order
 and types must match it exactly; nothing checks that at runtime, so
-scripts/test_engine.py compiles a probe kernel that reports the struct's real
+scripts/test_backend.py compiles a probe kernel that reports the struct's real
 size and a few offsets and compares them against PARAMS_FORMAT. A silent
 mismatch would corrupt every parameter past the drift point, which is not a
 failure anyone should have to debug from the symptoms.
@@ -83,6 +83,13 @@ PARAMS_FIELDS = (
     ("ww_drag", "f"),
     ("ww_buoyancy", "f"),
     ("frame_dt", "f"),
+    ("nodes_x", "i"),
+    ("nodes_y", "i"),
+    ("nodes_z", "i"),
+    ("grid_spacing", "f"),
+    ("vorticity_epsilon", "f"),
+    ("grid_max_speed", "f"),
+    ("pressure_ping", "i"),
 )
 
 # "<" - explicit little-endian and no padding. Every field is 4 bytes, so this

@@ -1,13 +1,11 @@
 """Disk cache: per-frame particle-state snapshots for scrubbing back.
 
-The solver's only state-carrying GPU textures are positions and velocities -
-everything else (density, forces, the spatial hash, the collider grid) is
-scratch, recomputed every substep - and the run is deterministic (fixed RNG
-seed, substep count derived only from the scene's frame rate). A cache of
-(positions, velocities) at every frame boundary is therefore a complete
-snapshot: loading one and rebuilding the scratch state reproduces that exact
-frame, and the collider grid the loaded frame depends on is re-derived from
-the scene's state by the depsgraph path before the frame handler runs.
+The cache records each method's persistent state and omits derived scratch.
+PBF needs positions and velocities; APIC additionally needs its affine rows;
+whitewater continuation needs the complete pool and ring cursor. Density,
+forces, the spatial hash, pressure grid and collider grid are rebuilt. Runs
+are deterministic (fixed RNG seed, substep count derived only from scene frame
+rate), so restoring those persistent fields reproduces the frame exactly.
 
 File format (little-endian, one file per run, random access by arithmetic
 offset - no index table):
@@ -20,7 +18,11 @@ Header (fixed part, then the collider name list):
     magic "FLWXCA01"   (8s)
     format_version     (I)
     flowx_version      (16s, the extension's version string)
+    method             (8s, resolved solver method)
+    device             (8s, resolved backend)
+    state_flags        (I)
     particle_count     (I)
+    whitewater_capacity (I)
     seed_frame         (i)
     last_frame         (i)
     fps                (f)
@@ -28,10 +30,10 @@ Header (fixed part, then the collider name list):
     per collider: name length (I) + name bytes
     config_hash        (32s, sha256)
 
-Each frame (fixed size):
-
-    positions      (N*4 f32)
-    velocities     (N*4 f32)
+Version 3 records the resolved solver method/device and a state bitmask in the
+header. Every frame stores positions and velocities; APIC adds its three
+padded affine rows per particle, and an enabled whitewater system adds the
+complete pool plus its ring cursor. Older formats are intentionally rejected.
 
 `last_frame` in the header is rewritten after every frame write, so a torn
 tail from a crash is ignored on load. The seed frame itself is never stored:
@@ -79,11 +81,14 @@ from ..collision import mesh_fingerprint
 from ..domain import find_domain, world_bounds
 
 MAGIC = b"FLWXCA01"
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 
-# magic, format_version, flowx_version, particle_count, seed_frame, last_frame,
-# fps, collider_count
-_FIXED_HEADER = struct.Struct("<8sI16sIiifI")
+STATE_AFFINE = 1 << 0
+STATE_WHITEWATER = 1 << 1
+
+# magic, format version, extension version, method, device, state flags,
+# particle count, whitewater capacity, seed frame, last frame, fps, colliders.
+_FIXED_HEADER = struct.Struct("<8sI16s8s8sIIIiifI")
 
 # A header is the fixed part plus one (length + name) pair per collider; 8 KiB
 # covers any collider list this add-on will ever see.
@@ -101,6 +106,8 @@ _state = {
     "mesh_path": None,
     "mesh_index": None,
     "warning": None,
+    "method": None,
+    "device": None,
 }
 
 _VERSION = None
@@ -169,28 +176,21 @@ def _motion_fingerprint(obj):
     return digest.digest()
 
 
-def config_hash(domain, scene):
-    """sha256 over everything that changes the physics, for one scene state."""
+def config_hash(domain, scene, method=None, device=None):
+    """sha256 over everything that changes one resolved simulation."""
     settings = domain.flowx_domain
+    method = (method or settings.solver_method).lower()
+    device = (device or settings.engine).lower()
     lo, hi = world_bounds(domain)
     digest = hashlib.sha256()
-    # The engine is part of the physics, not just a performance choice: the GPU
-    # and CPU engines enumerate neighbours slightly differently and their
-    # results diverge over a run, so a cache baked by one must not be replayed
-    # by the other. "Auto" hashes as itself rather than as whatever it resolved
-    # to, which is the honest answer - a machine that loses its GPU is a
-    # different physical situation, and re-baking there is correct.
-    digest.update(settings.engine.encode())
-    # The solver method changes the physics outright, but the property postdates
-    # every cache baked before it existed: hashing "PBF" would invalidate all of
-    # them to describe exactly what they already were. So only a non-default
-    # method contributes bytes - old PBF caches stay valid, and switching to
-    # anything else is a different config.
-    if settings.solver_method != "PBF":
-        digest.update(settings.solver_method.encode())
+    digest.update(_extension_version().encode())
+    digest.update(method.encode())
+    # Use the resolved device, not the AUTO preference. CPU and Metal runs
+    # diverge, so a cache must never move between them when availability changes.
+    digest.update(device.encode())
     digest.update(
         struct.pack(
-            "<f3f3fI",
+            "<f3f3fIffffII",
             _fps(scene),
             lo.x,
             lo.y,
@@ -199,56 +199,61 @@ def config_hash(domain, scene):
             hi.y,
             hi.z,
             settings.resolution,
-        )
-    )
-    digest.update(
-        struct.pack(
-            "<fffffffIII",
             settings.fluid_level,
             settings.rest_density,
-            settings.pbf_relaxation,
-            settings.pbf_scorr_k,
-            settings.viscosity,
-            settings.surface_tension,
             settings.collider_voxel_multiplier,
+            settings.surface_multiplier,
             settings.max_substeps,
-            settings.pbf_iterations,
             settings.max_particles,
         )
     )
-    # The surface and whitewater settings do not change the physics (the
-    # particle cache is valid regardless), but they change the *extracted*
-    # surface and whitewater the mesh cache stores - so a look change must
-    # invalidate the mesh file too, or a render would replay a stale surface.
-    # Both files share this one hash, so toggling either re-bakes the pair.
-    s = settings
-    digest.update(
-        struct.pack(
-            "<fffI" + "f" * 18,
-            float(s.show_surface),
-            s.surface_multiplier,
-            s.surface_iso,
-            int(s.whitewater_capacity),
-            float(s.show_whitewater),
-            s.whitewater_spawn_rate,
-            s.whitewater_trapped_air_weight,
-            s.whitewater_wave_crest_weight,
-            s.whitewater_kinetic_weight,
-            s.whitewater_kinetic_reference_speed,
-            s.whitewater_spray_speed_threshold,
-            s.whitewater_bubble_trapped_threshold,
-            s.whitewater_jitter_strength,
-            s.whitewater_normal_offset,
-            s.whitewater_spray_life_min,
-            s.whitewater_spray_life_max,
-            s.whitewater_foam_life_min,
-            s.whitewater_foam_life_max,
-            s.whitewater_bubble_life_min,
-            s.whitewater_bubble_life_max,
-            s.whitewater_drag,
-            s.whitewater_buoyancy,
+    if method == "apic":
+        digest.update(
+            struct.pack(
+                "<If",
+                settings.apic_pressure_iterations,
+                settings.apic_vorticity_strength,
+            )
         )
+    else:
+        digest.update(
+            struct.pack(
+                "<ffffI",
+                settings.pbf_relaxation,
+                settings.pbf_scorr_k,
+                settings.viscosity,
+                settings.surface_tension,
+                settings.pbf_iterations,
+            )
+        )
+
+    # Both cache files share one hash, so the extracted look belongs here too.
+    s = settings
+    look = (
+        float(s.show_surface),
+        s.surface_multiplier,
+        s.surface_iso,
+        float(s.show_whitewater),
+        s.whitewater_spawn_rate,
+        s.whitewater_trapped_air_weight,
+        s.whitewater_wave_crest_weight,
+        s.whitewater_kinetic_weight,
+        s.whitewater_kinetic_reference_speed,
+        s.whitewater_spray_speed_threshold,
+        s.whitewater_bubble_trapped_threshold,
+        s.whitewater_jitter_strength,
+        s.whitewater_normal_offset,
+        s.whitewater_spray_life_min,
+        s.whitewater_spray_life_max,
+        s.whitewater_foam_life_min,
+        s.whitewater_foam_life_max,
+        s.whitewater_bubble_life_min,
+        s.whitewater_bubble_life_max,
+        s.whitewater_drag,
+        s.whitewater_buoyancy,
     )
+    digest.update(struct.pack("<I", int(s.whitewater_capacity)))
+    digest.update(struct.pack("<" + "f" * len(look), *look))
     for name in collider_names(scene):
         digest.update(name.encode("utf-8"))
         mesh_fp = mesh_fingerprint(name)
@@ -284,7 +289,11 @@ def _pack_header(header):
             MAGIC,
             header["format_version"],
             header["flowx_version"].encode("utf-8")[:16].ljust(16, b"\x00"),
+            header["method"].encode("utf-8")[:8].ljust(8, b"\x00"),
+            header["device"].encode("utf-8")[:8].ljust(8, b"\x00"),
+            header["state_flags"],
             header["particle_count"],
+            header["whitewater_capacity"],
             header["seed_frame"],
             header["last_frame"],
             header["fps"],
@@ -308,7 +317,11 @@ def _unpack_header(data):
             magic,
             format_version,
             version,
+            method,
+            device,
+            state_flags,
             particle_count,
+            whitewater_capacity,
             seed_frame,
             last_frame,
             fps,
@@ -333,15 +346,33 @@ def _unpack_header(data):
     return {
         "format_version": format_version,
         "flowx_version": version.decode("utf-8", "replace").rstrip("\x00"),
+        "method": method.decode("utf-8", "replace").rstrip("\x00"),
+        "device": device.decode("utf-8", "replace").rstrip("\x00"),
+        "state_flags": state_flags,
         "particle_count": particle_count,
+        "whitewater_capacity": whitewater_capacity,
         "seed_frame": seed_frame,
         "last_frame": last_frame,
         "fps": fps,
         "colliders": colliders,
         "config_hash": config_hash,
         "header_size": offset + 32,
-        "frame_size": 8 * 4 * particle_count,
+        "frame_size": _frame_size(state_flags, particle_count, whitewater_capacity),
     }
+
+
+def _frame_size(state_flags, particle_count, whitewater_capacity):
+    """Bytes in one fixed-size v3 state record."""
+    particle_floats = 8 + (12 if state_flags & STATE_AFFINE else 0)
+    size = particle_count * particle_floats * 4
+    if state_flags & STATE_WHITEWATER:
+        # uint32 ring cursor, then position/life and velocity/kind float4 pools.
+        size += 4 + whitewater_capacity * 8 * 4
+    return size
+
+
+def _resolved_hash(domain, scene, header):
+    return config_hash(domain, scene, header["method"], header["device"])
 
 
 def _read_existing_header(path):
@@ -359,7 +390,7 @@ def _fail(message):
     close()
 
 
-def open(scene, domain, particle_count):
+def open(scene, domain, particle_count, method, device, whitewater_capacity=0):
     """(Re)open the run's cache file, or drop the handle when caching is off.
 
     Called at every re-seed, so a mid-run edit to any hashed setting (or to
@@ -379,14 +410,25 @@ def open(scene, domain, particle_count):
     try:
         path = cache_path(domain, scene)
         path.parent.mkdir(parents=True, exist_ok=True)
-        current_hash = config_hash(domain, scene)
+        method = method.lower()
+        device = device.lower()
+        whitewater_capacity = int(whitewater_capacity)
+        state_flags = STATE_AFFINE if method == "apic" else 0
+        if whitewater_capacity > 0:
+            state_flags |= STATE_WHITEWATER
+        current_hash = config_hash(domain, scene, method, device)
         existing = _read_existing_header(path)
-        if (
+        reuse = (
             existing is not None
             and existing["config_hash"] == current_hash
             and existing["particle_count"] == particle_count
             and existing["seed_frame"] == scene.frame_current
-        ):
+            and existing["method"] == method
+            and existing["device"] == device
+            and existing["state_flags"] == state_flags
+            and existing["whitewater_capacity"] == whitewater_capacity
+        )
+        if reuse:
             file = path.open("r+b")
             header = existing
         else:
@@ -394,28 +436,40 @@ def open(scene, domain, particle_count):
             header = {
                 "format_version": FORMAT_VERSION,
                 "flowx_version": _extension_version(),
+                "method": method,
+                "device": device,
+                "state_flags": state_flags,
                 "particle_count": particle_count,
+                "whitewater_capacity": whitewater_capacity,
                 "seed_frame": scene.frame_current,
                 "last_frame": scene.frame_current,
                 "fps": _fps(scene),
                 "colliders": collider_names(scene),
                 "config_hash": current_hash,
                 "header_size": 0,
-                "frame_size": 8 * 4 * particle_count,
+                "frame_size": _frame_size(state_flags, particle_count, whitewater_capacity),
             }
             packed = _pack_header(header)
             header["header_size"] = len(packed)
             file.write(packed)
             file.flush()
-        _state.update(file=file, path=str(path), header=header)
-        _open_mesh_file(path)
+        _state.update(
+            file=file,
+            path=str(path),
+            header=header,
+            method=method,
+            device=device,
+        )
+        _open_mesh_file(path, reset=not reuse)
     except OSError as exc:
-        _state["warning"] = (
+        message = (
             f"The cache file could not be opened ({exc}) - the run continues " "without a cache"
         )
+        close()
+        _state["warning"] = message
 
 
-def _open_mesh_file(particle_path):
+def _open_mesh_file(particle_path, reset=False):
     """Open (or remember the path of) the paired surface-mesh cache.
 
     An existing file is opened read+append and its {frame: offset} index is
@@ -428,8 +482,8 @@ def _open_mesh_file(particle_path):
     _state["mesh_file"] = None
     _state["mesh_index"] = None
     if mesh_path.exists():
-        _state["mesh_file"] = mesh_path.open("a+b")
-        _state["mesh_index"] = _scan_mesh_index(_state["mesh_file"])
+        _state["mesh_file"] = mesh_path.open("w+b" if reset else "a+b")
+        _state["mesh_index"] = {} if reset else _scan_mesh_index(_state["mesh_file"])
 
 
 def _scan_mesh_index(file):
@@ -509,8 +563,8 @@ def _append_mesh(frame, mesh, ww):
         pass
 
 
-def write_frame(frame, positions, velocities, domain, mesh=None, ww=None):
-    """Append one simulated frame (per-item 4-tuples, as read_texture returns).
+def write_frame(frame, state, domain, mesh=None, ww=None):
+    """Append one complete persistent solver-state snapshot.
 
     `mesh` is the frame's (vertices, triangles) and `ww` its whitewater
     points, stored in the paired mesh file for the CPU render path - they are
@@ -533,12 +587,25 @@ def write_frame(frame, positions, velocities, domain, mesh=None, ww=None):
         _fail("collider tagging changed - the cache file no longer matches the scene")
         return
     count = header["particle_count"]
+    positions = state.get("positions", ())
+    velocities = state.get("velocities", ())
     if len(positions) != count or len(velocities) != count:
         _fail("particle count changed - the cache file no longer matches the run")
         return
+    if header["state_flags"] & STATE_AFFINE and len(state.get("affine", ())) != count:
+        _fail("APIC affine state changed - the cache file no longer matches the run")
+        return
+    capacity = header["whitewater_capacity"]
+    if header["state_flags"] & STATE_WHITEWATER:
+        if (
+            len(state.get("ww_positions", ())) != capacity
+            or len(state.get("ww_velkind", ())) != capacity
+        ):
+            _fail("whitewater capacity changed - the cache file no longer matches the run")
+            return
     if frame <= header["seed_frame"]:
         return
-    if config_hash(domain, scene) != header["config_hash"]:
+    if _resolved_hash(domain, scene, header) != header["config_hash"]:
         _fail(
             "the simulation settings changed - the cache file no longer matches; "
             "Reset re-opens a fresh one"
@@ -549,6 +616,23 @@ def write_frame(frame, positions, velocities, domain, mesh=None, ww=None):
         file.seek(offset)
         file.write(struct.pack(f"<{count * 4}f", *[c for item in positions for c in item]))
         file.write(struct.pack(f"<{count * 4}f", *[c for item in velocities for c in item]))
+        if header["state_flags"] & STATE_AFFINE:
+            affine = state["affine"]
+            file.write(struct.pack(f"<{count * 12}f", *[c for item in affine for c in item]))
+        if header["state_flags"] & STATE_WHITEWATER:
+            file.write(struct.pack("<I", int(state.get("whitewater_cursor", 0))))
+            file.write(
+                struct.pack(
+                    f"<{capacity * 4}f",
+                    *[c for item in state["ww_positions"] for c in item],
+                )
+            )
+            file.write(
+                struct.pack(
+                    f"<{capacity * 4}f",
+                    *[c for item in state["ww_velkind"] for c in item],
+                )
+            )
         header["last_frame"] = max(header["last_frame"], frame)
         file.seek(0)
         file.write(_pack_header(header))
@@ -569,13 +653,13 @@ def write_seed_mesh(domain, scene, mesh, ww):
     """
     if _state["file"] is None or _state["header"] is None:
         return
-    if config_hash(domain, scene) != _state["header"]["config_hash"]:
+    if _resolved_hash(domain, scene, _state["header"]) != _state["header"]["config_hash"]:
         return
     _append_mesh(_state["header"]["seed_frame"], mesh, ww)
 
 
 def try_load(frame, scene, domain):
-    """(positions, velocities) for a cached frame, or None with a warning set.
+    """Persistent state for a cached frame, or None with a warning set.
 
     The frame must be inside the file's covered range and the scene must
     still hash to the file's config hash - which covers each collider's
@@ -588,7 +672,7 @@ def try_load(frame, scene, domain):
         return None
     if not header["seed_frame"] < frame <= header["last_frame"]:
         return None
-    if config_hash(domain, scene) != header["config_hash"]:
+    if _resolved_hash(domain, scene, header) != header["config_hash"]:
         _state["warning"] = (
             "The cache no longer matches the simulation settings - return to "
             f"frame {header['seed_frame']} to re-run and rebuild it."
@@ -604,8 +688,23 @@ def try_load(frame, scene, domain):
         first = header["seed_frame"] + 1
         file.seek(header["header_size"] + (frame - first) * header["frame_size"])
         n4 = header["particle_count"] * 4
-        positions = list(struct.unpack(f"<{n4}f", file.read(4 * n4)))
-        velocities = list(struct.unpack(f"<{n4}f", file.read(4 * n4)))
+        flat = struct.unpack(f"<{n4}f", file.read(4 * n4))
+        positions = [flat[i : i + 4] for i in range(0, n4, 4)]
+        flat = struct.unpack(f"<{n4}f", file.read(4 * n4))
+        velocities = [flat[i : i + 4] for i in range(0, n4, 4)]
+        state = {"positions": positions, "velocities": velocities}
+        if header["state_flags"] & STATE_AFFINE:
+            n12 = header["particle_count"] * 12
+            flat = struct.unpack(f"<{n12}f", file.read(4 * n12))
+            state["affine"] = [flat[i : i + 12] for i in range(0, n12, 12)]
+        if header["state_flags"] & STATE_WHITEWATER:
+            capacity = header["whitewater_capacity"]
+            (state["whitewater_cursor"],) = struct.unpack("<I", file.read(4))
+            nw = capacity * 4
+            flat = struct.unpack(f"<{nw}f", file.read(4 * nw))
+            state["ww_positions"] = [flat[i : i + 4] for i in range(0, nw, 4)]
+            flat = struct.unpack(f"<{nw}f", file.read(4 * nw))
+            state["ww_velkind"] = [flat[i : i + 4] for i in range(0, nw, 4)]
     except (OSError, struct.error):
         _state["warning"] = (
             "The cache file could not be read - return to "
@@ -613,7 +712,7 @@ def try_load(frame, scene, domain):
         )
         return None
     _state["warning"] = None
-    return positions, velocities
+    return state
 
 
 def load_mesh(frame, scene, domain):
@@ -633,7 +732,7 @@ def load_mesh(frame, scene, domain):
             "No baked surface cache - bake the cache (Playback > Bake Cache) " "before rendering."
         )
         return None
-    if header is not None and config_hash(domain, scene) != header["config_hash"]:
+    if header is not None and _resolved_hash(domain, scene, header) != header["config_hash"]:
         _state["warning"] = (
             "The baked cache no longer matches the settings - bake again to " "update it."
         )
@@ -681,6 +780,8 @@ def close():
         mesh_file=None,
         mesh_path=None,
         mesh_index=None,
+        method=None,
+        device=None,
     )
 
 

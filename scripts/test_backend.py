@@ -21,6 +21,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from flowx_standalone import load  # noqa: E402
 
 backend_pkg = load("solver.backend")
+engine_kernels = load("solver.engine.kernels")
+engine_params = load("solver.engine.params")
 
 # A single library holding every kernel the tests need. Kept in one string so a
 # compile failure is reported once, with line numbers that match what is here.
@@ -242,6 +244,62 @@ def test_zero_threads_is_a_no_op(backend, program):
     check(floats(buf, 4) == [5.0] * 4, "a zero-thread dispatch changed the buffer")
 
 
+def test_solver_kernel_libraries_compile(backend):
+    """PBF and APIC compile independently and expose every declared pass."""
+    for label, passes in (
+        ("PBF", engine_kernels.PBF_ALL_PASSES),
+        ("APIC", engine_kernels.APIC_ALL_PASSES),
+    ):
+        program = backend.program(engine_kernels.library_source(passes))
+        for name in engine_kernels.entry_points(passes):
+            program.kernel(name)
+        print(f"  {label}: {len(passes)} kernels")
+
+
+def test_params_layout(backend):
+    """The Python parameter block matches Metal through every APIC field."""
+    source = "\n".join(
+        (
+            engine_kernels.read("flowx_prelude.h", suffix=""),
+            engine_kernels.read("flowx_params_probe"),
+        )
+    )
+    program = backend.program(source)
+    count = 15
+    out = backend.buffer(count * 4)
+    queue = backend.queue()
+    queue.dispatch(
+        program.kernel("flowx_params_probe"),
+        1,
+        1,
+        [out],
+        constants=engine_params.ParamBlock().pack(),
+        constants_index=20,
+    )
+    queue.commit()
+    got = struct.unpack(f"<{count}I", bytes(out.map()))
+    fields = (
+        "particle_count",
+        "lo_x",
+        "smoothing_radius",
+        "collider_voxel",
+        "surface_kernel_radius",
+        "ww_capacity",
+        "frame_dt",
+        "nodes_x",
+        "nodes_y",
+        "nodes_z",
+        "grid_spacing",
+        "vorticity_epsilon",
+        "grid_max_speed",
+        "pressure_ping",
+    )
+    expected = (engine_params.PARAMS_SIZE,) + tuple(
+        engine_params.offset_of(name) for name in fields
+    )
+    check(got == expected, f"Params layout is {got}, expected {expected}")
+
+
 def main():
     metal = backend_pkg.select()
     if metal is None:
@@ -262,6 +320,8 @@ def main():
             lambda: test_kernel_outlives_a_temporary_program(metal),
         ),
         ("zero threads is a no-op", lambda: test_zero_threads_is_a_no_op(metal, program)),
+        ("solver kernel libraries compile", lambda: test_solver_kernel_libraries_compile(metal)),
+        ("parameter layout", lambda: test_params_layout(metal)),
     ]
 
     failures = 0

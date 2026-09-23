@@ -39,7 +39,14 @@ EXCLUDE_DIRS = {
     # scripts/build_native.py - but the .mm and .h are dev-only.
     "native",
 }
-EXCLUDE_FILES = {".DS_Store", ".gitignore", ".gitkeep", "pyproject.toml", "requirements-dev.txt"}
+EXCLUDE_FILES = {
+    ".DS_Store",
+    ".gitignore",
+    ".gitkeep",
+    "notes.md",
+    "pyproject.toml",
+    "requirements-dev.txt",
+}
 EXCLUDE_SUFFIXES = {".pyc", ".blend1", ".blend2"}
 
 

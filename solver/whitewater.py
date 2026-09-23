@@ -1,4 +1,4 @@
-"""Whitewater: secondary spray/foam/bubble particles, driven off the PBF state.
+"""Whitewater: secondary spray/foam/bubble particles driven by either solver.
 
 Once per frame, after the substeps have finished (mirroring Phase 6's
 surface reconstruction, which this runs alongside):
@@ -146,6 +146,18 @@ def stats():
         "live": _state["live"],
         "spawn_rate": config.spawn_rate,
     }
+
+
+def cursor():
+    """Current ring-buffer cursor, part of a resumable cached frame."""
+    return _state["cursor"]
+
+
+def restore_cursor(value):
+    """Restore ring-buffer bookkeeping after the engine pool is restored."""
+    config = _state["config"]
+    if config is not None:
+        _state["cursor"] = int(value) % config.capacity
 
 
 def record(engine, fluid_config, frame_dt, frame):
