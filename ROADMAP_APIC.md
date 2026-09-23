@@ -35,11 +35,11 @@ PBF and APIC compile separate Metal libraries, so an APIC compilation failure ca
 
 ## Cache and output
 
-Cache v3 records the method, resolved device, extension version, state flags, particle count, and whitewater capacity. PBF frames store position/velocity; APIC adds affine rows; enabled whitewater adds the full pool and ring cursor. Earlier cache formats are intentionally recreated. The paired mesh cache remains the render replay path.
+Cache v4 records the method, resolved device, extension version, state flags, particle count, and whitewater capacity. PBF frames store position, velocity, and the prior density used by surface tension; APIC adds affine rows; enabled whitewater adds the full pool and ring cursor. Earlier cache formats are intentionally recreated. The paired mesh cache remains the render replay path.
 
 ## Validation
 
-Standalone coverage includes bounded dam-break motion, 90% pressure-divergence reduction, translation/affine transfer invariants, less than 5% rotating-block angular-momentum drift over 300 steps, collider response, surface extraction, whitewater lifecycle, exact snapshot continuation, cache-v3 round trips, and optional Metal compilation/agreement tests. `scripts/smoke_test.py` exercises both methods in Blender and `scripts/golden.py` records method and device separately.
+Standalone coverage includes bounded dam-break motion, 90% pressure-divergence reduction, translation/affine transfer invariants, less than 5% rotating-block angular-momentum drift over 300 steps, collider response, surface extraction, whitewater lifecycle, exact snapshot continuation, cache-v4 round trips, and optional Metal compilation/agreement tests. `scripts/smoke_test.py` exercises both methods in Blender and `scripts/golden.py` records method and device separately.
 
 ## Deferred work
 

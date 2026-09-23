@@ -1,11 +1,13 @@
 """Disk cache: per-frame particle-state snapshots for scrubbing back.
 
 The cache records each method's persistent state and omits derived scratch.
-PBF needs positions and velocities; APIC additionally needs its affine rows;
-whitewater continuation needs the complete pool and ring cursor. Density,
-forces, the spatial hash, pressure grid and collider grid are rebuilt. Runs
-are deterministic (fixed RNG seed, substep count derived only from scene frame
-rate), so restoring those persistent fields reproduces the frame exactly.
+PBF needs positions, velocities, and the previous density used by its surface
+tension pass; APIC additionally needs its affine rows;
+whitewater continuation needs the complete pool and ring cursor. Forces, the
+spatial hash, pressure grid and collider grid are transient scratch
+and are rebuilt. Runs are deterministic (fixed RNG seed, substep count derived
+only from scene frame rate), so restoring those persistent fields reproduces
+the frame exactly.
 
 File format (little-endian, one file per run, random access by arithmetic
 offset - no index table):
@@ -30,10 +32,12 @@ Header (fixed part, then the collider name list):
     per collider: name length (I) + name bytes
     config_hash        (32s, sha256)
 
-Version 3 records the resolved solver method/device and a state bitmask in the
-header. Every frame stores positions and velocities; APIC adds its three
-padded affine rows per particle, and an enabled whitewater system adds the
-complete pool plus its ring cursor. Older formats are intentionally rejected.
+Version 4 records the resolved solver method/device and a state bitmask in the
+header. Every frame stores positions and velocities; PBF also stores its prior
+density channel, which surface tension consumes before the next density solve.
+APIC adds its three padded affine rows per particle, and an enabled whitewater
+system adds the complete pool plus its ring cursor. Older formats are
+intentionally rejected.
 
 `last_frame` in the header is rewritten after every frame write, so a torn
 tail from a crash is ignored on load. The seed frame itself is never stored:
@@ -81,10 +85,11 @@ from ..collision import mesh_fingerprint
 from ..domain import find_domain, world_bounds
 
 MAGIC = b"FLWXCA01"
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
 
 STATE_AFFINE = 1 << 0
 STATE_WHITEWATER = 1 << 1
+STATE_PBF_DENSITY = 1 << 2
 
 # magic, format version, extension version, method, device, state flags,
 # particle count, whitewater capacity, seed frame, last frame, fps, colliders.
@@ -362,8 +367,12 @@ def _unpack_header(data):
 
 
 def _frame_size(state_flags, particle_count, whitewater_capacity):
-    """Bytes in one fixed-size v3 state record."""
-    particle_floats = 8 + (12 if state_flags & STATE_AFFINE else 0)
+    """Bytes in one fixed-size v4 state record."""
+    particle_floats = 8
+    if state_flags & STATE_PBF_DENSITY:
+        particle_floats += 1
+    if state_flags & STATE_AFFINE:
+        particle_floats += 12
     size = particle_count * particle_floats * 4
     if state_flags & STATE_WHITEWATER:
         # uint32 ring cursor, then position/life and velocity/kind float4 pools.
@@ -413,7 +422,7 @@ def open(scene, domain, particle_count, method, device, whitewater_capacity=0):
         method = method.lower()
         device = device.lower()
         whitewater_capacity = int(whitewater_capacity)
-        state_flags = STATE_AFFINE if method == "apic" else 0
+        state_flags = STATE_AFFINE if method == "apic" else STATE_PBF_DENSITY
         if whitewater_capacity > 0:
             state_flags |= STATE_WHITEWATER
         current_hash = config_hash(domain, scene, method, device)
@@ -595,6 +604,9 @@ def write_frame(frame, state, domain, mesh=None, ww=None):
     if header["state_flags"] & STATE_AFFINE and len(state.get("affine", ())) != count:
         _fail("APIC affine state changed - the cache file no longer matches the run")
         return
+    if header["state_flags"] & STATE_PBF_DENSITY and len(state.get("densities", ())) != count:
+        _fail("PBF density state changed - the cache file no longer matches the run")
+        return
     capacity = header["whitewater_capacity"]
     if header["state_flags"] & STATE_WHITEWATER:
         if (
@@ -616,6 +628,8 @@ def write_frame(frame, state, domain, mesh=None, ww=None):
         file.seek(offset)
         file.write(struct.pack(f"<{count * 4}f", *[c for item in positions for c in item]))
         file.write(struct.pack(f"<{count * 4}f", *[c for item in velocities for c in item]))
+        if header["state_flags"] & STATE_PBF_DENSITY:
+            file.write(struct.pack(f"<{count}f", *state["densities"]))
         if header["state_flags"] & STATE_AFFINE:
             affine = state["affine"]
             file.write(struct.pack(f"<{count * 12}f", *[c for item in affine for c in item]))
@@ -693,6 +707,11 @@ def try_load(frame, scene, domain):
         flat = struct.unpack(f"<{n4}f", file.read(4 * n4))
         velocities = [flat[i : i + 4] for i in range(0, n4, 4)]
         state = {"positions": positions, "velocities": velocities}
+        if header["state_flags"] & STATE_PBF_DENSITY:
+            flat = struct.unpack(
+                f"<{header['particle_count']}f", file.read(4 * header["particle_count"])
+            )
+            state["densities"] = list(flat)
         if header["state_flags"] & STATE_AFFINE:
             n12 = header["particle_count"] * 12
             flat = struct.unpack(f"<{n12}f", file.read(4 * n12))

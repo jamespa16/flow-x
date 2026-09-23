@@ -244,6 +244,10 @@ class MetalEngine:
         self.params.update(dt=dt)
 
         if config.surface_tension > 0.0:
+            # Normals are evaluated from the finalized positions. Rebuild the
+            # spatial hash here rather than relying on the previous substep's
+            # grid, which is not persistent cache state.
+            self.build_grid()
             self.record("sph_normal", n)
         self.record("sph_predict", n)
         self.build_grid()
@@ -387,6 +391,11 @@ class MetalEngine:
             "positions": self.read_vec4("positions", count),
             "velocities": self.read_vec4("velocities", count),
         }
+        if self.method == "pbf":
+            # Surface tension runs before the next lambda pass and consumes
+            # this prior density channel through sph_normal.
+            state["densities"] = self.read_vec4("lambda", count)
+            state["densities"] = [row[0] for row in state["densities"]]
         if include_whitewater and self.buffers.get("ww_positions") is not None:
             capacity = self.params["ww_capacity"]
             state["ww_positions"], state["ww_velkind"] = self.read_whitewater(capacity)
@@ -399,6 +408,10 @@ class MetalEngine:
         self.upload_vec4("velocities", state["velocities"], count)
         self.upload_vec4("predicted", state["positions"], count)
         self.zero("lambda")
+        if "densities" in state:
+            self.upload_vec4(
+                "lambda", [(density, 0.0, 0.0, 0.0) for density in state["densities"]], count
+            )
         if "ww_positions" in state and self.buffers.get("ww_positions") is not None:
             capacity = self.params["ww_capacity"]
             self.upload_vec4("ww_positions", state["ww_positions"], capacity)

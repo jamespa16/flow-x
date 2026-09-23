@@ -266,6 +266,10 @@ class ApicCpuEngine(CpuEngine):
         u[:, :, 1:nx] += 0.5 * dt * (force[:, :, :-1, 0] + force[:, :, 1:, 0])
         v[:, 1:ny, :] += 0.5 * dt * (force[:, :-1, :, 1] + force[:, 1:, :, 1])
         w[1:nz, :, :] += 0.5 * dt * (force[:-1, :, :, 2] + force[1:, :, :, 2])
+        vmax = float(self.params["grid_max_speed"])
+        np.clip(u[:, :, 1:nx], -vmax, vmax, out=u[:, :, 1:nx])
+        np.clip(v[:, 1:ny, :], -vmax, vmax, out=v[:, 1:ny, :])
+        np.clip(w[1:nz, :, :], -vmax, vmax, out=w[1:nz, :, :])
 
     # --- pressure projection --------------------------------------------
 

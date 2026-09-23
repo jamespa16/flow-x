@@ -113,7 +113,8 @@ play, done.
 - **Deterministic.** Seeding uses a fixed RNG seed and the substep size comes
   only from the scene's frame rate, so the same timeline replays to the same
   particle state (bit-for-bit, which is what the cache relies on).
-- **Cache.** Cache v3 stores positions and velocities for PBF; APIC additionally
+- **Cache.** Cache v4 stores positions, velocities, and the prior density needed
+  by PBF surface tension; APIC additionally
   stores all affine rows. When whitewater is enabled it also stores the complete
   pool and ring cursor. Method, resolved device, extension version and active
   settings validate the file, so an Auto run cannot silently resume on a
@@ -263,7 +264,7 @@ demos/        shipped example scenes
 - `scripts/make_demo.py` - rebuilds the demo scenes.
 - `scripts/golden.py --method=pbf|apic` - creates and compares method-specific
   references; it rejects comparisons across methods.
-- `scripts/test_cache.py` - standalone cache-v3 state and invalidation tests.
+- `scripts/test_cache.py` - standalone cache-v4 state and invalidation tests.
 - `scripts/package.py` - builds the release zip (also run by CI on tags).
 - Lint/format: `ruff check .` and `black --check .` (see CI).
 

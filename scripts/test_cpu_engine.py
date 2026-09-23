@@ -157,8 +157,10 @@ def _positions(engine):
     return np.asarray(engine.read_vec4("positions", engine.config.particle_count))[:, :3]
 
 
-def _make_cpu():
+def _make_cpu(surface_tension=0.0):
     config, block, seed = _scene()
+    config.surface_tension = surface_tension
+    block.update(surface_tension=surface_tension)
     engine = cpu_engine.create()
     engine.params = block
     engine.allocate(config, seed)
@@ -309,6 +311,32 @@ def test_apic_rotating_block_holds_angular_momentum():
     check(drift < 0.05, f"APIC angular momentum drifted {drift:.2%} over 300 steps")
 
 
+def test_apic_confinement_clamps_each_face_component():
+    """Confinement is an acceleration, but it must retain the grid CFL cap."""
+    engine = _make_transfer_apic()
+    cap = 0.1
+    engine.params.update(vorticity_epsilon=100.0, grid_max_speed=cap)
+    rng = np.random.default_rng(42)
+    engine.grid_velocity[..., :3] = rng.uniform(-0.09, 0.09, engine.grid_velocity[..., :3].shape)
+    cell_type = np.ones(engine.grid_cell.shape[:3], dtype=np.float32)
+
+    engine._vorticity_confinement(0.1, cell_type)
+
+    nx, ny, nz = engine.config.cell_dims
+    faces = (
+        engine.grid_velocity[:nz, :ny, 1:nx, 0],
+        engine.grid_velocity[:nz, 1:ny, :nx, 1],
+        engine.grid_velocity[1:nz, :ny, :nx, 2],
+    )
+    for axis, values in enumerate(faces):
+        peak = float(np.abs(values).max())
+        check(peak <= cap + 1e-6, f"confinement exceeded the speed cap on axis {axis}: {peak}")
+        check(
+            np.isclose(np.abs(values), cap, atol=1e-6).any(),
+            f"test field did not exercise confinement on axis {axis}",
+        )
+
+
 def test_apic_collider_surface_and_whitewater():
     engine = _make_apic()
     voxel = SPACING
@@ -385,12 +413,26 @@ def test_apic_snapshot_continuation_is_exact():
 
 
 def test_pbf_snapshot_continuation_is_exact():
-    """PBF position/velocity plus the whitewater pool are sufficient state."""
+    """PBF continuation preserves prior density for surface tension."""
     ww = WhitewaterCfg()
     ww.capacity = 64
-    original = _make_cpu()
+    original = _make_cpu(surface_tension=0.05)
     original.alloc_whitewater(ww.capacity, original.config.sorted_count)
     _run(original, frames=2, substeps=1)
+    # Force the next finalization through the x-domain clamp. Before predicted
+    # was synchronized there, an uninterrupted surface-tension step read the
+    # stale pre-clamp position while a restored run read the finalized one.
+    radius = original.params["particle_radius"]
+    original.state["predicted"][0, 0] = -1.0
+    original._finalize_pass()
+    check(
+        np.isclose(original.state["positions"][0, 0], radius),
+        "PBF continuation setup did not exercise the domain clamp",
+    )
+    check(
+        np.array_equal(original.state["positions"], original.state["predicted"]),
+        "PBF finalization did not synchronize predicted positions",
+    )
     original.build_grid()
     original.step_whitewater(ww, 0, 16, 1, 1.0 / 24.0)
     checkpoint = original.snapshot_state(include_whitewater=True)
@@ -400,7 +442,7 @@ def test_pbf_snapshot_continuation_is_exact():
     original.step_whitewater(ww, 16, 12, 2, 1.0 / 24.0)
     uninterrupted = original.snapshot_state(include_whitewater=True)
 
-    resumed = _make_cpu()
+    resumed = _make_cpu(surface_tension=0.05)
     resumed.alloc_whitewater(ww.capacity, resumed.config.sorted_count)
     resumed.restore_state(checkpoint)
     resumed.substep(1.0 / 48.0)
@@ -408,7 +450,7 @@ def test_pbf_snapshot_continuation_is_exact():
     resumed.step_whitewater(ww, 16, 12, 2, 1.0 / 24.0)
     continued = resumed.snapshot_state(include_whitewater=True)
 
-    for key in ("positions", "velocities", "ww_positions", "ww_velkind"):
+    for key in ("positions", "velocities", "densities", "ww_positions", "ww_velkind"):
         check(
             np.array_equal(np.asarray(uninterrupted[key]), np.asarray(continued[key])),
             f"restored PBF continuation changed {key}",
@@ -696,6 +738,10 @@ def main():
         (
             "APIC rotating block holds angular momentum",
             test_apic_rotating_block_holds_angular_momentum,
+        ),
+        (
+            "APIC confinement clamps every face component",
+            test_apic_confinement_clamps_each_face_component,
         ),
         ("APIC collider, surface and whitewater", test_apic_collider_surface_and_whitewater),
         ("APIC snapshot continuation is exact", test_apic_snapshot_continuation_is_exact),

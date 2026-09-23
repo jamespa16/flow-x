@@ -13,7 +13,7 @@
 
 FLOWX_KERNEL void sph_finalize(FLOWX_DEVICE float4 *positions [[buffer(BUF_POSITIONS)]],
                                FLOWX_DEVICE float4 *velocities [[buffer(BUF_VELOCITIES)]],
-                               FLOWX_CONST_DEVICE float4 *predicted [[buffer(BUF_PREDICTED)]],
+                               FLOWX_DEVICE float4 *predicted [[buffer(BUF_PREDICTED)]],
                                FLOWX_CONST_DEVICE float4 *delta [[buffer(BUF_DELTA)]],
                                FLOWX_CONST_DEVICE float *collider [[buffer(BUF_COLLIDER)]],
                                FLOWX_CONSTANT Params &P [[buffer(BUF_PARAMS)]],
@@ -96,5 +96,8 @@ FLOWX_KERNEL void sph_finalize(FLOWX_DEVICE float4 *positions [[buffer(BUF_POSIT
   }
 
   positions[i] = float4(p, 1.0f);
+  // The next surface-normal pass hashes predicted positions, so it must see
+  // the collider/domain-corrected position rather than this pass's input.
+  predicted[i] = float4(p, 1.0f);
   velocities[i] = float4(v, 0.0f);
 }

@@ -1,4 +1,4 @@
-"""Standalone tests for the v3 particle-state cache.
+"""Standalone tests for the v4 particle-state cache.
 
 Blender is replaced with the tiny scene/domain surface this module needs, so
 the binary format and APIC continuation state stay covered on every CI host.
@@ -124,6 +124,8 @@ def _state(method, whitewater):
         "positions": [(0.25, 0.5, 0.75, 1.0), (0.5, 0.25, 0.125, 1.0)],
         "velocities": [(1.0, -0.5, 0.25, 0.0), (-0.25, 0.5, -1.0, 0.0)],
     }
+    if method == "pbf":
+        state["densities"] = [997.5, 1002.5]
     if method == "apic":
         state["affine"] = [tuple(float(i) / 16.0 for i in range(12))] * 2
     if whitewater:
@@ -141,7 +143,7 @@ def _state(method, whitewater):
     return state
 
 
-def test_v3_roundtrip(method, whitewater):
+def test_v4_roundtrip(method, whitewater):
     with tempfile.TemporaryDirectory(prefix="flowx-cache-test-") as temp:
         path = Path(temp) / "state.flowx_cache"
         scene = Scene()
@@ -219,23 +221,23 @@ def test_whitewater_hash_layout_covers_capacity_drag_and_buoyancy():
             )
 
 
-def test_v2_is_recreated():
+def test_v3_is_recreated():
     with tempfile.TemporaryDirectory(prefix="flowx-cache-test-") as temp:
         path = Path(temp) / "old.flowx_cache"
-        path.write_bytes(struct.pack("<8sI", cache.MAGIC, 2) + b"old cache")
+        path.write_bytes(struct.pack("<8sI", cache.MAGIC, 3) + b"old cache")
         scene = Scene()
         domain = Domain(path)
         bpy.context.scene = scene
         cache.open(scene, domain, 2, "pbf", "cpu", 0)
-        check(cache.header()["format_version"] == 3, "v2 cache was not replaced")
-        check(path.read_bytes()[8:12] == struct.pack("<I", 3), "v3 header was not written")
+        check(cache.header()["format_version"] == 4, "v3 cache was not replaced")
+        check(path.read_bytes()[8:12] == struct.pack("<I", 4), "v4 header was not written")
         cache.close()
 
 
 def main():
     tests = (
-        ("PBF v3 round-trip", lambda: test_v3_roundtrip("pbf", False)),
-        ("APIC + whitewater v3 round-trip", lambda: test_v3_roundtrip("apic", True)),
+        ("PBF v4 round-trip", lambda: test_v4_roundtrip("pbf", False)),
+        ("APIC + whitewater v4 round-trip", lambda: test_v4_roundtrip("apic", True)),
         (
             "active-method and resolved-device hash",
             test_hash_uses_resolved_identity_and_active_method_settings,
@@ -244,7 +246,7 @@ def main():
             "whitewater hash layout",
             test_whitewater_hash_layout_covers_capacity_drag_and_buoyancy,
         ),
-        ("v2 is recreated", test_v2_is_recreated),
+        ("v3 is recreated", test_v3_is_recreated),
     )
     failures = 0
     for name, run in tests:
