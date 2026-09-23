@@ -72,7 +72,16 @@ using namespace metal;
 #define BUF_WW_KEYS 11
 #define BUF_WW_POSITIONS 12
 #define BUF_WW_VELKIND 13
-#define BUF_PARAMS 14
+/* APIC. The PBF passes ignore these exactly like they ignore the whitewater
+ * slots; the node arrays are sized to (cells_* + 1)^3, the corner lattice of
+ * the same cell grid the spatial hash uses. */
+#define BUF_AFFINE 14
+#define BUF_GRID_MASS 15
+#define BUF_GRID_MOMENTUM 16
+#define BUF_GRID_VELOCITY 17
+#define BUF_GRID_VORT 18
+#define BUF_GRID_SCRATCH 19
+#define BUF_PARAMS 20
 
 /* Every parameter every pass needs, in one block.
  *
@@ -154,6 +163,16 @@ struct Params {
   float ww_drag;
   float ww_buoyancy;
   float frame_dt;
+  /* APIC node grid: dims are cells_* + 1 on the same origin; grid_spacing
+   * equals cell_size while the two lattices coincide, and is its own field so
+   * they can decouple later. */
+  int nodes_x;
+  int nodes_y;
+  int nodes_z;
+  float grid_spacing;
+  float vorticity_epsilon;
+  float grid_max_speed;
+  int pressure_ping;
 };
 
 #define FLOWX_PI 3.14159265358979323846f

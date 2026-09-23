@@ -29,11 +29,11 @@ jobs:
       # broken ctypes signature fails the job on every platform.
       - run: python3 scripts/test_backend.py
 
-      # The CPU engine is numpy-only, so the whole PBF pipeline - neighbour
-      # search, constraint solve, colliders, surface, whitewater - is exercised
-      # here, on a runner with no GPU and no Blender.
+      # Both CPU methods are numpy-only, so PBF/APIC physics, transfers,
+      # colliders, surface, whitewater and continuation are covered here.
       - run: pip install numpy
       - run: python3 scripts/test_cpu_engine.py
+      - run: python3 scripts/test_cache.py
 
   # The Metal helper only exists on macOS, and only here does test_backend.py
   # actually exercise a device. Kept separate from lint so a macOS runner is

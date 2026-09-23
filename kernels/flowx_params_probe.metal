@@ -24,4 +24,11 @@ FLOWX_KERNEL void flowx_params_probe(FLOWX_DEVICE uint *out [[buffer(0)]],
   out[5] = uint((FLOWX_CONSTANT char *)&P.surface_kernel_radius - base);
   out[6] = uint((FLOWX_CONSTANT char *)&P.ww_capacity - base);
   out[7] = uint((FLOWX_CONSTANT char *)&P.frame_dt - base);
+  out[8] = uint((FLOWX_CONSTANT char *)&P.nodes_x - base);
+  out[9] = uint((FLOWX_CONSTANT char *)&P.nodes_y - base);
+  out[10] = uint((FLOWX_CONSTANT char *)&P.nodes_z - base);
+  out[11] = uint((FLOWX_CONSTANT char *)&P.grid_spacing - base);
+  out[12] = uint((FLOWX_CONSTANT char *)&P.vorticity_epsilon - base);
+  out[13] = uint((FLOWX_CONSTANT char *)&P.grid_max_speed - base);
+  out[14] = uint((FLOWX_CONSTANT char *)&P.pressure_ping - base);
 }

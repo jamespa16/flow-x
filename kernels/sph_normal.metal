@@ -12,10 +12,9 @@
  * used for a different purpose - no new kernel family needed for this model,
  * unlike Akinci-style cohesion.
  *
- * Runs on the predicted positions and the grid built from them *last* substep:
- * normals are therefore one substep stale. That is a deliberate tradeoff, not
- * an oversight - genuinely current normals would need a second grid build
- * before sph_predict, every substep, just for this.
+ * Runs on the finalized positions and a grid freshly built from them at the
+ * start of the substep. The density channel comes from the previous constraint
+ * solve, which is the persistent PBF state needed for cache continuation.
  */
 FLOWX_KERNEL void sph_normal(FLOWX_CONST_DEVICE float4 *predicted [[buffer(BUF_PREDICTED)]],
                              FLOWX_CONST_DEVICE float4 *lambda [[buffer(BUF_LAMBDA)]],

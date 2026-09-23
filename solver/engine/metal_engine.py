@@ -34,7 +34,7 @@ where the GPU work happens and where a read-back becomes valid.
 
 import ctypes
 
-from ..backend import DeviceError, select
+from ..backend import select
 from . import kernels
 from .params import ParamBlock
 
@@ -75,21 +75,28 @@ BINDING_ORDER = (
     "ww_keys",
     "ww_positions",
     "ww_velkind",
+    "affine",
+    "grid_mass",
+    "grid_momentum",
+    "grid_velocity",
+    "grid_vort",
+    "grid_scratch",
 )
-PARAMS_INDEX = 14
+PARAMS_INDEX = 20
 
 
 class MetalEngine:
     """Device, compiled kernels, buffers and the frame's command queue."""
 
     name = "metal"
+    method = "pbf"
 
-    def __init__(self, backend):
+    def __init__(self, backend, passes=None):
         self.backend = backend
-        self.program = backend.program(kernels.library_source())
+        self.program = backend.program(kernels.library_source(passes))
         # Compile every pipeline up front: a bad kernel should be reported when
         # the solver starts, not three frames into playback.
-        self.kernels = {name: self.program.kernel(name) for name in kernels.entry_points()}
+        self.kernels = {name: self.program.kernel(name) for name in kernels.entry_points(passes)}
         self.queue = backend.queue()
         self.params = ParamBlock()
         self.buffers = {}
@@ -129,7 +136,18 @@ class MetalEngine:
         self.buffers["collider"] = self.empty_collider
         # Owned by solver/surface.py and solver/whitewater.py, which install
         # them here so the shared binding table stays complete.
-        for name in ("surface", "ww_keys", "ww_positions", "ww_velkind"):
+        for name in (
+            "surface",
+            "ww_keys",
+            "ww_positions",
+            "ww_velkind",
+            "affine",
+            "grid_mass",
+            "grid_momentum",
+            "grid_velocity",
+            "grid_vort",
+            "grid_scratch",
+        ):
             self.buffers.setdefault(name, None)
 
     def set_collider(self, buffer, dims, voxel_size, occupancy=None):
@@ -226,6 +244,10 @@ class MetalEngine:
         self.params.update(dt=dt)
 
         if config.surface_tension > 0.0:
+            # Normals are evaluated from the finalized positions. Rebuild the
+            # spatial hash here rather than relying on the previous substep's
+            # grid, which is not persistent cache state.
+            self.build_grid()
             self.record("sph_normal", n)
         self.record("sph_predict", n)
         self.build_grid()
@@ -272,6 +294,7 @@ class MetalEngine:
 
     def alloc_whitewater(self, capacity, sorted_count):
         """Allocate the whitewater pool and its scoring array."""
+        self.params.update(ww_capacity=capacity)
         self.install("ww_positions", self.backend.buffer(capacity * 4 * 4))
         self.install("ww_velkind", self.backend.buffer(capacity * 4 * 4))
         # Sized to the fluid's own key array: whitewater_potential scores one
@@ -349,14 +372,50 @@ class MetalEngine:
         self.buffers[name].zero()
 
     def upload_vec4(self, name, values, count):
-        """Overwrite a buffer's first `count` elements from flat float data.
+        """Overwrite a vec4 buffer from tuples or a flat float sequence.
 
         Used by the cache-load path, which restores a frame's state without
         simulating it.
         """
         view = self.buffers[name].map()
         flat = (ctypes.c_float * (count * 4)).from_buffer(view)
-        flat[: len(values)] = values
+        values = list(values)
+        if values and hasattr(values[0], "__iter__"):
+            values = [component for row in values[:count] for component in row]
+        flat[: min(len(values), count * 4)] = values[: count * 4]
+
+    def snapshot_state(self, include_whitewater=False):
+        """Return the persistent state needed to continue this PBF run."""
+        count = self.config.particle_count
+        state = {
+            "positions": self.read_vec4("positions", count),
+            "velocities": self.read_vec4("velocities", count),
+        }
+        if self.method == "pbf":
+            # Surface tension runs before the next lambda pass and consumes
+            # this prior density channel through sph_normal.
+            state["densities"] = self.read_vec4("lambda", count)
+            state["densities"] = [row[0] for row in state["densities"]]
+        if include_whitewater and self.buffers.get("ww_positions") is not None:
+            capacity = self.params["ww_capacity"]
+            state["ww_positions"], state["ww_velkind"] = self.read_whitewater(capacity)
+        return state
+
+    def restore_state(self, state):
+        """Restore persistent state; derived PBF scratch is rebuilt by sph.py."""
+        count = self.config.particle_count
+        self.upload_vec4("positions", state["positions"], count)
+        self.upload_vec4("velocities", state["velocities"], count)
+        self.upload_vec4("predicted", state["positions"], count)
+        self.zero("lambda")
+        if "densities" in state:
+            self.upload_vec4(
+                "lambda", [(density, 0.0, 0.0, 0.0) for density in state["densities"]], count
+            )
+        if "ww_positions" in state and self.buffers.get("ww_positions") is not None:
+            capacity = self.params["ww_capacity"]
+            self.upload_vec4("ww_positions", state["ww_positions"], capacity)
+            self.upload_vec4("ww_velkind", state["ww_velkind"], capacity)
 
 
 def create():
@@ -364,8 +423,4 @@ def create():
     backend = select()
     if backend is None:
         return None
-    try:
-        return MetalEngine(backend)
-    except DeviceError as exc:
-        print(f"Flow-X: Metal engine unavailable ({exc})")
-        return None
+    return MetalEngine(backend)

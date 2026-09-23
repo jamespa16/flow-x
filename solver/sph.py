@@ -1,4 +1,4 @@
-"""Phase 4: the PBF solver core.
+"""Fluid-solver configuration, timeline, cache, and Blender operators.
 
 Each substep runs as a chain of compute dispatches over GPU-resident particle
 state, with no CPU round-trip except the position read-back that feeds the
@@ -18,6 +18,12 @@ is what lets this run larger, fixed substeps than WCSPH's CFL-limited ones
 ever could - the substep budget here is bounded only by how far gravity can
 carry a particle before the neighbor grid it predicted into goes stale, and by
 XSPH's own explicit diffusion limit (see ``SolverConfig.substep_dt``).
+
+The opt-in APIC method uses the same particles, spatial hash, colliders and
+outputs, but transfers momentum to staggered MAC faces, projects the grid to a
+constant-density divergence-free velocity, then transfers velocity and three
+affine rows back to each particle. Its implementation lives beside the PBF
+engines, in ``apic_cpu.py`` and ``apic_metal.py``.
 
 The grid build is where this departs from the textbook GPU build. A counting
 sort needs an atomic add, and under Blender's ``gpu`` module - which this
@@ -135,6 +141,9 @@ _state = {
     # re-sync the GPU state before simulating from it.
     "gpu_frame": 0,
     "warning": None,
+    # Reserved for a persistent engine-selection note. Methods are never
+    # substituted; Auto may only fall back to the same method's CPU engine.
+    "fallback": None,
     "timings": deque(maxlen=TIMING_WINDOW),
     # Bake Cache bookkeeping: `baking` gates the timer that steps the timeline
     # forward one frame per tick, and `bake_target` is the frame it stops at
@@ -158,6 +167,7 @@ class SolverConfig:
     """
 
     __slots__ = (
+        "solver_method",
         "lo",
         "hi",
         "fill_fraction",
@@ -177,6 +187,8 @@ class SolverConfig:
         "viscosity",
         "max_substeps",
         "iterations",
+        "pressure_iterations",
+        "vorticity_strength",
     )
 
     @property
@@ -197,7 +209,11 @@ class SolverConfig:
         full frame of simulated time rather than going unstable - i.e. it
         degrades to slow motion, visibly.
         """
-        gravity_dt = CFL_FACTOR * math.sqrt(self.smoothing_radius / abs(GRAVITY))
+        length_scale = self.cell_size if self.solver_method == "apic" else self.smoothing_radius
+        gravity_dt = CFL_FACTOR * math.sqrt(length_scale / abs(GRAVITY))
+        if self.solver_method == "apic":
+            steps = min(max(1, math.ceil(frame_dt / gravity_dt)), self.max_substeps)
+            return steps, min(frame_dt / steps, gravity_dt)
         # Diffusion limit: an explicit viscosity term goes unstable once it can
         # transport momentum more than a smoothing radius in one substep.
         kinematic = self.viscosity / max(self.rest_density, 1e-6)
@@ -213,6 +229,7 @@ def _resolve_config(domain):
     size = hi - lo
 
     config = SolverConfig()
+    config.solver_method = settings.solver_method.lower()
     config.lo = lo
     config.hi = hi
     config.fill_fraction = settings.fluid_level / 100.0
@@ -224,6 +241,8 @@ def _resolve_config(domain):
     config.viscosity = settings.viscosity
     config.max_substeps = settings.max_substeps
     config.max_particles = settings.max_particles
+    config.pressure_iterations = settings.apic_pressure_iterations
+    config.vorticity_strength = settings.apic_vorticity_strength
 
     # One knob sizes the simulation: particles seed one per voxel of the
     # domain's `resolution` lattice, and the SPH kernel follows the spacing -
@@ -361,6 +380,13 @@ def _sync_params(config, dt):
         boundary_damping=BOUNDARY_DAMPING,
         scorr_k=config.scorr_strength,
         surface_tension=config.surface_tension,
+        nodes_x=config.cell_dims[0] + 1,
+        nodes_y=config.cell_dims[1] + 1,
+        nodes_z=config.cell_dims[2] + 1,
+        grid_spacing=config.cell_size,
+        vorticity_epsilon=config.vorticity_strength,
+        grid_max_speed=CFL_FACTOR * config.cell_size / max(dt, 1e-6),
+        pressure_ping=0,
     )
     _sync_collider()
 
@@ -411,10 +437,6 @@ def _step(frame_dt, frame):
     positions = None
     if cache.is_open() or _state["domain"].flowx_domain.show_particles:
         positions = engine.read_vec4("positions", config.particle_count)
-    velocities = None
-    if cache.is_open():
-        velocities = engine.read_vec4("velocities", config.particle_count)
-
     # Extraction is CPU work on what the flush produced, so it has to follow it.
     surface.extract()
     whitewater.extract()
@@ -422,10 +444,12 @@ def _step(frame_dt, frame):
     # it stores this frame's own mesh, not the previous frame's - the render
     # path replays exactly what was written here.
     if cache.is_open():
+        snapshot = engine.snapshot_state(include_whitewater=whitewater.is_running())
+        if whitewater.is_running():
+            snapshot["whitewater_cursor"] = whitewater.cursor()
         cache.write_frame(
             frame,
-            positions,
-            velocities,
+            snapshot,
             _state["domain"],
             surface.last_mesh(),
             whitewater.last_points(),
@@ -538,15 +562,25 @@ def _start(domain):
     # ones so the first substep collides correctly.
     ensure_grids(bpy.context.scene)
     preferred = domain.flowx_domain.engine
-    engine = engines.create(None if preferred == "AUTO" else preferred.lower())
+    method = domain.flowx_domain.solver_method.lower()
+    engine = engines.create(None if preferred == "AUTO" else preferred.lower(), method)
     if engine is None:
         raise RuntimeError(engines.unavailable_reason())
     _state["engine"] = engine
+    _state["fallback"] = engines.fallback_note()
     _state["domain"] = domain
     _state["running"] = True
     _seed(domain)
     _reset_clock(bpy.context.scene)
-    cache.open(bpy.context.scene, domain, _state["config"].particle_count)
+    ww_stats = whitewater.stats()
+    cache.open(
+        bpy.context.scene,
+        domain,
+        _state["config"].particle_count,
+        method=engine.method,
+        device=engine.name,
+        whitewater_capacity=ww_stats["capacity"] if ww_stats else 0,
+    )
     # The seed surface was extracted in _seed; store it in the mesh cache so a
     # render has the first frame's surface to replay (the particle file skips
     # the seed frame, but the mesh file keeps it).
@@ -579,7 +613,15 @@ def reseed(scene=None):
     # toggle itself - decides the file's fate on this re-seed: reuse while the
     # hash still matches, start fresh when it has moved. The re-extracted seed
     # surface is re-stored in the mesh cache so a render has the first frame.
-    cache.open(scene, domain, _state["config"].particle_count)
+    ww_stats = whitewater.stats()
+    cache.open(
+        scene,
+        domain,
+        _state["config"].particle_count,
+        method=_state["engine"].method,
+        device=_state["engine"].name,
+        whitewater_capacity=ww_stats["capacity"] if ww_stats else 0,
+    )
     cache.write_seed_mesh(domain, scene, surface.last_mesh(), whitewater.last_points())
     viz.tag_viewports_redraw()
     return True
@@ -597,7 +639,9 @@ def stop():
     engine = _state["engine"]
     if engine is not None:
         engine.release()
-    _state.update({"running": False, "config": None, "domain": None, "engine": None})
+    _state.update(
+        {"running": False, "config": None, "domain": None, "engine": None, "fallback": None}
+    )
     _state["timings"].clear()
     _state["warning"] = None
     viz.disable()
@@ -687,35 +731,20 @@ def _frame_dt(scene):
     return 1.0 / fps if fps > 0 else 1.0 / 24.0
 
 
-def _apply_cached(positions, velocities, frame):
+def _apply_cached(state, frame):
     """Install a cached frame's particle state and refresh its outputs.
 
-    Only positions and velocities are stored; the spatial hash is rebuilt for
-    the loaded particles (a zero-length step, exactly as a re-seed does) so
+    The complete method-specific state is stored; the spatial hash is rebuilt
+    for the loaded particles (a zero-length step, exactly as a re-seed does) so
     the surface splat can gather, and the frame's surface is extracted from
     the scene's current collider grid - which the depsgraph path has already
     brought to this frame before the handler ran.
     """
     config = _state["config"]
     engine = _state["engine"]
-    count = config.particle_count
-
-    engine.upload_vec4("positions", positions, count)
-    engine.upload_vec4("velocities", velocities, count)
-    # The grid build below reads the predicted buffer, not the position one
-    # (see sph_grid_key) - a loaded frame has no "prediction" of its own, so
-    # this just mirrors positions the way a fresh seed does in _allocate().
-    engine.upload_vec4("predicted", positions, count)
-    # Also reset lambda rather than leaving whatever density the solver last
-    # computed for a *different* particle configuration: if surface tension is
-    # on, sph_normal reads lambda's density channel as a per-neighbour weight
-    # before sph_lambda ever runs against these loaded positions (see the
-    # engine's substep pass order). Zeroing it mirrors a fresh seed, where
-    # every neighbour's density is the same clamped constant - that uniform
-    # weight cancels out of both the normal's direction and the curvature
-    # ratio, unlike a stale, non-uniform density left over from wherever the
-    # timeline was before this jump.
-    engine.zero("lambda")
+    engine.restore_state(state)
+    if "whitewater_cursor" in state:
+        whitewater.restore_cursor(state["whitewater_cursor"])
 
     _state["last_frame"] = frame
     _state["gpu_frame"] = frame
@@ -726,6 +755,8 @@ def _apply_cached(positions, velocities, frame):
     _record_surface(0.0)
     engine.flush()
     surface.extract()
+    if "ww_positions" in state:
+        whitewater.extract()
     _update_viz()
     viz.tag_viewports_redraw()
 
@@ -792,7 +823,7 @@ def _pick_up_cache_end(scene, domain, frame):
     loaded = _load_cached(end, scene, domain)
     if loaded is None:
         return False
-    _apply_cached(*loaded, end)
+    _apply_cached(loaded, end)
     return True
 
 
@@ -890,7 +921,7 @@ def _on_frame_change(scene, _depsgraph):
 
     loaded = _load_cached(frame, scene, domain)
     if loaded is not None:
-        _apply_cached(*loaded, frame)
+        _apply_cached(loaded, frame)
         return
 
     pending = frame - _state["last_frame"]
@@ -926,7 +957,7 @@ def _on_frame_change(scene, _depsgraph):
     if _state["gpu_frame"] != _state["last_frame"]:
         reloaded = _load_cached(_state["last_frame"], scene, domain)
         if reloaded is not None:
-            _apply_cached(*reloaded, _state["last_frame"])
+            _apply_cached(reloaded, _state["last_frame"])
         elif not reseed(scene):
             stop_deferred()
             return
@@ -980,6 +1011,9 @@ def stats():
         return None
     timings = _state["timings"]
     return {
+        "method": getattr(_state["engine"], "method", None),
+        "device": getattr(_state["engine"], "name", None),
+        "method_note": _state["fallback"],
         "particles": config.particle_count,
         "cells": config.cell_count,
         "cell_dims": config.cell_dims,
@@ -997,10 +1031,10 @@ def stats():
 
 
 class FLOWX_OT_sph_toggle(Operator):
-    """Seed the domain at its fluid level and run the GPU SPH solver on playback"""
+    """Seed the domain and run its selected fluid solver on playback"""
 
     bl_idname = "flowx.sph_toggle"
-    bl_label = "Toggle SPH Simulation"
+    bl_label = "Toggle Fluid Simulation"
     # Deliberately not UNDO: the run's state is GPU-side and not part of
     # Blender's undo stack, so undoing only the scene delta (the surface
     # object) would leave a simulation that is still running but no longer
@@ -1014,7 +1048,7 @@ class FLOWX_OT_sph_toggle(Operator):
     def execute(self, context):
         if _state["running"]:
             stop()
-            self.report({"INFO"}, "Flow-X SPH solver stopped")
+            self.report({"INFO"}, "Flow-X fluid solver stopped")
             return {"FINISHED"}
 
         domain = find_domain(context.scene)
@@ -1035,12 +1069,13 @@ class FLOWX_OT_sph_toggle(Operator):
             # No GPU context (some --background runs) or a shader compile
             # failure shouldn't hard-crash the operator.
             stop()
-            self.report({"WARNING"}, f"Could not start the SPH solver: {exc}")
+            self.report({"WARNING"}, f"Could not start the fluid solver: {exc}")
             return {"FINISHED"}
 
         self.report(
             {"INFO"},
-            f"Flow-X SPH solver running ({_state['config'].particle_count} particles)",
+            f"Flow-X {_state['engine'].method.upper()} solver running "
+            f"({_state['config'].particle_count} particles)",
         )
         return {"FINISHED"}
 

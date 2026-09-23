@@ -1,4 +1,4 @@
-"""Flow-X: GPU-simulated SPH fluids with a live surface mesh, for Blender."""
+"""Flow-X: GPU-simulated PBF/APIC fluids with a live surface mesh, for Blender."""
 
 from . import collision, domain, solver, ui
 

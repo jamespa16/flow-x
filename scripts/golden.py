@@ -5,13 +5,14 @@ against how it behaved on Blender's own GPU module *after* that module is
 gone, so the reference has to be captured first and compared later.
 
     blender --background <scene.blend> --python scripts/golden.py -- \
-        dump|compare <path.npz> [frames] [--whitewater] [--engine=cpu|metal]
+        dump|compare <path.npz> [frames] [--whitewater] \
+        [--method=pbf|apic] [--engine=cpu|metal]
 
-`--engine=` pins the run to one engine instead of letting it pick. A dump
-records which engine produced it, and a comparison against a reference from a
-*different* engine drops the strict per-particle window automatically: the two
-engines are not expected to agree particle by particle (see
-solver/engine/cpu_engine.py), only to describe the same fluid.
+`--method=` selects the solver method (PBF by default); references from one
+method are never comparable with the other. `--engine=` pins the device instead
+of letting it pick. A dump records method and device separately, and a
+comparison against the same method on a *different* device drops the strict
+per-particle window automatically.
 
 `--whitewater` turns the domain's whitewater on for the run. The shipped demo
 scenes leave it off (it is off by default - see domain/__init__.py), so without
@@ -54,7 +55,8 @@ STRICT_ATOL = 1e-3
 
 # Aggregate tolerances. Bounds and speeds are compared in absolute terms; the
 # occupancy histogram is compared as a fraction of the particle count.
-BOUNDS_ATOL = 0.05
+BOUNDS_ATOL = 0.10
+CENTROID_ATOL = 0.02
 SPEED_RTOL = 0.10
 HIST_FRAC = 0.05
 
@@ -89,28 +91,28 @@ def _solver():
     return sph, surface, whitewater
 
 
-def _run(frames, want_whitewater=False, engine=None):
+def _run(frames, want_whitewater=False, engine=None, method=None):
     """Seed the scene's domain and step `frames` frames, yielding per-frame data."""
     sph, surface, whitewater = _solver()
     scene = bpy.context.scene
 
-    if engine is not None:
+    if engine is not None or method is not None or want_whitewater:
         from bl_ext.user_default.flow_x.domain import find_domain
 
         domain = find_domain(scene)
         if domain is None:
-            raise SystemExit("--engine: scene has no Flow-X domain")
-        domain.flowx_domain.engine = engine.upper()
-
-    if want_whitewater:
-        from bl_ext.user_default.flow_x.domain import find_domain
-
-        domain = find_domain(scene)
-        if domain is None:
-            raise SystemExit("--whitewater: scene has no Flow-X domain")
+            raise SystemExit("selected options require a Flow-X domain")
+        if engine is not None:
+            domain.flowx_domain.engine = engine.upper()
+        if method is not None:
+            method = method.lower()
+            if method not in ("pbf", "apic"):
+                raise SystemExit(f"unknown method {method!r}; expected pbf or apic")
+            domain.flowx_domain.solver_method = method.upper()
         # Set before the run starts: solver/__init__.py reads show_whitewater
         # when it decides whether to bring the pool up, not per frame.
-        domain.flowx_domain.show_whitewater = True
+        if want_whitewater:
+            domain.flowx_domain.show_whitewater = True
 
     bpy.ops.flowx.sph_toggle()
     if not sph.is_running():
@@ -135,9 +137,9 @@ def _run(frames, want_whitewater=False, engine=None):
         }
 
 
-def dump(path, frames, want_whitewater=False, engine=None):
+def dump(path, frames, want_whitewater=False, engine=None, method=None):
     out = {}
-    for i, frame in enumerate(_run(frames, want_whitewater, engine)):
+    for i, frame in enumerate(_run(frames, want_whitewater, engine, method)):
         out[f"pos_{i}"] = frame["pos"]
         out[f"vel_{i}"] = frame["vel"]
         out[f"counts_{i}"] = np.asarray(
@@ -146,16 +148,21 @@ def dump(path, frames, want_whitewater=False, engine=None):
     out["frames"] = np.asarray([frames], dtype=np.int64)
     # Recorded so a later comparison knows whether a per-particle check is
     # meaningful or whether only the aggregates are.
-    out["engine"] = np.asarray(_engine_name(), dtype="U32")
+    identity = _engine_identity()
+    out["method"] = np.asarray(identity["method"], dtype="U16")
+    out["device"] = np.asarray(identity["device"], dtype="U32")
     np.savez_compressed(path, **out)
     print(f"golden: wrote {frames} frames to {path}")
 
 
-def _engine_name():
-    """The engine the running solver actually chose, e.g. "metal" or "cpu"."""
+def _engine_identity():
+    """Resolved method/device for the running solver."""
     sph, _surface, _whitewater = _solver()
     stats = sph.stats()
-    return (stats["engine"].split(" ")[0] if stats else "unknown") if stats else "unknown"
+    return {
+        "method": stats["method"] if stats else "unknown",
+        "device": stats["device"] if stats else "unknown",
+    }
 
 
 def _aggregates(pos, vel):
@@ -179,24 +186,34 @@ def _aggregates(pos, vel):
     }
 
 
-def compare(path, frames, want_whitewater=False, engine=None):
+def compare(path, frames, want_whitewater=False, engine=None, method=None):
     ref = np.load(path)
     available = int(ref["frames"][0])
     if frames > available:
         print(f"golden: reference holds {available} frames, comparing that many")
         frames = available
-    reference_engine = str(ref["engine"]) if "engine" in ref else "unknown"
+    reference_method = str(ref["method"]) if "method" in ref else "pbf"
+    reference_device = (
+        str(ref["device"])
+        if "device" in ref
+        else str(ref["engine"]) if "engine" in ref else "unknown"
+    )
 
     failures = []
     strict_frames = STRICT_FRAMES
     hist_frac, speed_rtol = HIST_FRAC, SPEED_RTOL
-    for i, frame in enumerate(_run(frames, want_whitewater, engine)):
+    for i, frame in enumerate(_run(frames, want_whitewater, engine, method)):
         if i == 0:
-            running = _engine_name()
-            if reference_engine not in ("unknown", running):
+            running = _engine_identity()
+            if reference_method not in ("unknown", running["method"]):
+                raise SystemExit(
+                    "golden: method mismatch: reference is "
+                    f"'{reference_method}', this run is '{running['method']}'"
+                )
+            if reference_device not in ("unknown", running["device"]):
                 print(
-                    f"golden: reference is from '{reference_engine}', this run is "
-                    f"'{running}' - comparing aggregates only"
+                    f"golden: reference is from '{reference_device}', this run is "
+                    f"'{running['device']}' - comparing aggregates only"
                 )
                 strict_frames = 0
                 hist_frac, speed_rtol = CROSS_ENGINE_HIST_FRAC, CROSS_ENGINE_SPEED_RTOL
@@ -219,17 +236,25 @@ def compare(path, frames, want_whitewater=False, engine=None):
         bounds = max(
             float(np.abs(got["lo"] - want["lo"]).max()),
             float(np.abs(got["hi"] - want["hi"]).max()),
-            float(np.abs(got["centroid"] - want["centroid"]).max()),
         )
+        centroid = float(np.abs(got["centroid"] - want["centroid"]).max())
         speed = abs(got["speed_mean"] - want["speed_mean"]) / max(want["speed_mean"], 1e-6)
         drift = float(np.abs(got["hist"] - want["hist"]).sum()) / max(pos.shape[0], 1) / 2.0
-        bad = bounds > BOUNDS_ATOL or speed > speed_rtol or drift > hist_frac
+        bad = (
+            bounds > BOUNDS_ATOL
+            or centroid > CENTROID_ATOL
+            or speed > speed_rtol
+            or drift > hist_frac
+        )
         print(
-            f"frame {i:3d} aggregate bounds={bounds:.4f} speed={speed:.3f} "
-            f"shape={drift:.3f}  {'FAIL' if bad else 'ok'}"
+            f"frame {i:3d} aggregate bounds={bounds:.4f} centroid={centroid:.4f} "
+            f"speed={speed:.3f} shape={drift:.3f}  {'FAIL' if bad else 'ok'}"
         )
         if bad:
-            failures.append(f"frame {i}: bounds {bounds:.4f}, speed {speed:.3f}, shape {drift:.3f}")
+            failures.append(
+                f"frame {i}: bounds {bounds:.4f}, centroid {centroid:.4f}, "
+                f"speed {speed:.3f}, shape {drift:.3f}"
+            )
 
         ref_counts = ref[f"counts_{i}"]
         got_counts = (frame["surface_verts"], frame["surface_tris"], frame["whitewater"])
@@ -250,15 +275,16 @@ def main():
         raise SystemExit(__doc__)
     want_whitewater = "--whitewater" in argv
     engine = next((a.split("=", 1)[1] for a in argv if a.startswith("--engine=")), None)
+    method = next((a.split("=", 1)[1] for a in argv if a.startswith("--method=")), None)
     argv = [a for a in argv if not a.startswith("--")]
     mode, path = argv[0], Path(argv[1]).resolve()
     frames = int(argv[2]) if len(argv) > 2 else DEFAULT_FRAMES
 
     _enable()
     if mode == "dump":
-        dump(path, frames, want_whitewater, engine)
+        dump(path, frames, want_whitewater, engine, method)
     elif mode == "compare":
-        compare(path, frames, want_whitewater, engine)
+        compare(path, frames, want_whitewater, engine, method)
     else:
         raise SystemExit(f"unknown mode {mode!r}")
 

@@ -94,7 +94,7 @@ class FLOWX_PT_domain(Panel):
 
 
 class FLOWX_PT_solver(Panel):
-    bl_label = "SPH Solver"
+    bl_label = "Fluid Solver"
     bl_idname = "FLOWX_PT_solver"
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
@@ -109,19 +109,27 @@ class FLOWX_PT_solver(Panel):
         layout = self.layout
         settings = context.active_object.flowx_domain
 
-        # Changing the engine mid-run would leave the timeline half-simulated
-        # by one and half by the other, so it is locked while the solver runs.
+        # Changing the method or the engine mid-run would leave the timeline
+        # half-simulated by one and half by the other, so both are locked while
+        # the solver runs.
         row = layout.row()
         row.enabled = not sph.is_running()
+        row.prop(settings, "solver_method")
         row.prop(settings, "engine")
 
         col = layout.column(align=True)
         col.prop(settings, "rest_density")
-        col.prop(settings, "pbf_iterations")
-        col.prop(settings, "pbf_relaxation")
-        col.prop(settings, "pbf_scorr_k")
-        col.prop(settings, "surface_tension")
-        col.prop(settings, "viscosity")
+        # These knobs select PBF passes the APIC chain does not have, so under
+        # APIC they would advertise physics that is not running.
+        if settings.solver_method == "PBF":
+            col.prop(settings, "pbf_iterations")
+            col.prop(settings, "pbf_relaxation")
+            col.prop(settings, "pbf_scorr_k")
+            col.prop(settings, "surface_tension")
+            col.prop(settings, "viscosity")
+        else:
+            col.prop(settings, "apic_pressure_iterations")
+            col.prop(settings, "apic_vorticity_strength")
         col.prop(settings, "max_substeps")
         col.prop(settings, "max_particles")
 
@@ -140,9 +148,14 @@ class FLOWX_PT_solver(Panel):
 
         box = layout.box()
         col = box.column(align=True)
-        col.label(text=f"Engine: {stats['engine']}")
+        col.label(text=f"Method: {stats['method'].upper()}")
+        col.label(text=f"Device: {stats['device']}")
+        # Persistent engine-selection notes are separate from timeline warnings.
+        if stats["method_note"]:
+            col.label(text=stats["method_note"], icon="ERROR")
         dims = "x".join(str(n) for n in stats["cell_dims"])
-        col.label(text=f"Grid: {dims} ({stats['cells']} cells)")
+        label = "Pressure Grid" if stats["method"] == "apic" else "Grid"
+        col.label(text=f"{label}: {dims} ({stats['cells']} cells)")
         # The solver coarsens its own spacing when a domain would blow the
         # particle budget, so show what it actually settled on.
         lo, hi = world_bounds(context.active_object)

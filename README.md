@@ -1,11 +1,12 @@
 # Flow-X
 
-GPU-simulated PBF fluids for Blender, rendered as a live liquid surface mesh.
+GPU-simulated PBF and APIC fluids for Blender, rendered as a live liquid surface mesh.
 
 Add a fluid domain, set a fill level, tag a few colliders, and hit play: a
-Position Based Fluids (PBF) simulation, with surface tension, falls,
-splashes, and settles on the GPU, with a marching-cubes surface extracted
-every frame - no Mantaflow, no baking, no Python required.
+PBF is the default for its robust, cohesive liquid look. The opt-in APIC solver
+uses a staggered MAC grid and pressure projection for incompressibility while
+preserving rotating motion. Both run on Metal or the NumPy CPU fallback and
+share colliders, surface extraction, whitewater, timeline playback and caching.
 
 ## Requirements
 
@@ -14,8 +15,9 @@ every frame - no Mantaflow, no baking, no Python required.
   GPU through Flow-X's own Metal helper, independent of Blender's `gpu`
   module. Without a usable GPU it falls back to a numpy CPU solver: the same
   physics, roughly ten times slower, which is fine for small sims and for
-  checking a setup before committing to it. The `Engine` dropdown in the SPH
-  Solver panel picks between them, and the panel says which one is running.
+  checking a setup before committing to it. The `Device` dropdown in the Fluid
+  Solver panel picks between them, and the panel reports the resolved method
+  and device separately.
   The surface mesh is extracted on the CPU either way - a bounded cost, but
   the fastest thing to lower when things get slow is `Surface Resolution`, not
   the physics.
@@ -52,11 +54,14 @@ extension on every file save.
 2. **Set the fluid level.** Select the domain, open the **N-panel > Flow-X**
    tab, and set *Fluid Level* (percentage of the domain's height the fluid
    starts filled to).
-3. **Tag colliders.** Select any mesh, open **Object Properties > Flow-X
+3. **Choose a method (optional).** The Fluid Solver panel defaults to **PBF**.
+   Select **APIC** for pressure-projected grid motion and better rotational
+   momentum preservation.
+4. **Tag colliders.** Select any mesh, open **Object Properties > Flow-X
    Collider** (the tab with the checkbox), and toggle it on. The tab shows
    the collider's voxel count; zero means it will not collide (no faces, or
    no overlap with the domain).
-4. **Play.** N-panel > Flow-X > Playback > **Play**.
+5. **Play.** N-panel > Flow-X > Playback > **Play**.
 
 The solver steps one frame per timeline frame. Scrubbing **forward** steps
 the simulation. Scrubbing **back** loads the frame from the disk cache when
@@ -76,13 +81,15 @@ play, done.
 
 ## How it works (short version)
 
-- **Solver.** Position Based Fluids: a particle predicts forward under
-  gravity and a surface-tension cohesion force, then a fixed number of
-  Jacobi constraint-solve iterations project it onto a density constraint,
-  and its velocity is derived from how far that projection actually moved
-  it - unconditionally stable for the constraint itself, so substeps are
-  sized by a free-fall/diffusion limit rather than a stiffness-driven CFL
-  limit.
+- **PBF solver.** A particle predicts forward under gravity and an optional
+  surface-tension force, then fixed Jacobi iterations project it onto a density
+  constraint. PBF exposes density iterations, relaxation, anti-clustering,
+  viscosity and surface tension.
+- **APIC solver.** Particles carry velocity plus three affine rows. Momentum is
+  gathered deterministically to staggered MAC faces, gravity and optional
+  vorticity confinement are applied, and 40 weighted-Jacobi iterations by
+  default project the grid velocity before it is transferred back. The
+  implementation follows the [MAC APIC formulation](https://www.cs.ucr.edu/~shinar/papers/2019-mac-apic.pdf).
 - **Neighbors.** A uniform grid rebuilt once per substep (not per constraint
   iteration); particles are bucketed with a bitonic sort. That was originally
   forced - Blender's Metal backend could not compile an image atomic, so a
@@ -106,12 +113,12 @@ play, done.
 - **Deterministic.** Seeding uses a fixed RNG seed and the substep size comes
   only from the scene's frame rate, so the same timeline replays to the same
   particle state (bit-for-bit, which is what the cache relies on).
-- **Cache.** With *Cache to Disk* enabled, each frame's positions and
-  velocities are appended to a binary file as the run goes, and a backward
-  scrub loads the frame from it instead of re-simulating. A paired surface
-  file stores the extracted mesh for the render path. A settings hash and a
-  per-frame fingerprint of every collider's transform validate the file before
-  anything is loaded from it.
+- **Cache.** Cache v4 stores positions, velocities, and the prior density needed
+  by PBF surface tension; APIC additionally
+  stores all affine rows. When whitewater is enabled it also stores the complete
+  pool and ring cursor. Method, resolved device, extension version and active
+  settings validate the file, so an Auto run cannot silently resume on a
+  different backend. Pre-0.3 cache files are intentionally recreated.
 - **Render.** Each rendered frame replays its cached surface and whitewater
   rather than re-extracting it, so a render matches the frames that were baked
   (see [Rendering](#rendering)).
@@ -136,6 +143,8 @@ most of the work:
   per-frame score/sort/spawn/advect pass plus a point-cloud read-back on top
   of the core solve, so it's an additive cost. *Capacity* bounds the pool and
   *Spawn Rate* bounds how fast it fills.
+- **APIC Pressure Iterations** - linear cost in APIC's pressure solve. Raise it
+  if a coarse or collider-heavy grid remains visibly compressible.
 
 If ms/step is above the scene's frame budget, the panel says so.
 
@@ -153,9 +162,10 @@ the cache already holds.
   system temp dir until the scene is saved), or any file at *Cache Path*. A
   paired `<scene>.flowx_cache.mesh` holds the extracted surface and whitewater
   for the [render path](#rendering).
-- **Size.** About 0.5 MB per frame for the particles at the default 16k
-  budget; the surface file is larger (it stores the extracted mesh). The panel
-  shows the frames covered and the running size of each.
+- **Size.** PBF stores eight floats per fluid particle per frame. APIC stores
+  twenty (position, velocity, and three padded affine rows), plus the full
+  whitewater pool when enabled. The surface file is usually larger because it
+  stores extracted geometry. The panel shows both files' coverage and size.
 - **Validity.** The file is keyed by a hash of everything that changes the
   simulation *or the extracted surface* - solver settings, domain bounds and
   resolution, collider geometry, frame rate, the surface and whitewater
@@ -208,6 +218,11 @@ look.
   mesh.
 - The GPU and CPU engines do not produce identical results, so switching
   engines invalidates a baked cache and it re-bakes.
+- APIC v1 is inviscid and has no surface-tension force. Grid boundaries can
+  look stickier than PBF at low resolution; raise Resolution or reduce
+  Vorticity Strength when that is visible.
+- Moving colliders rebuild occupancy each frame, but collider velocity is not
+  transferred into the fluid and coupling remains one-way.
 - The Metal helper is a compiled dylib. A release downloaded from the internet
   carries a quarantine flag, and macOS will refuse to load it until it is
   signed and notarized; when that happens Flow-X falls back to the CPU engine
@@ -217,10 +232,11 @@ look.
 
 | Symptom | Fix |
 |---|---|
-| "Could not start the SPH solver" warning on Run | No usable engine at all. Run `python3 scripts/test_backend.py` to check GPU compute independently of the SPH math, and `python3 scripts/test_cpu_engine.py` for the fallback. Neither needs Blender. |
-| Panel says `Engine: cpu` when you expected the GPU | The Metal helper is missing or would not load. Build it with `python3 scripts/build_native.py`; if it is a downloaded release, see the note under Limitations. |
+| "Could not start the fluid solver" warning on Run | No usable engine for the selected method. Run `python3 scripts/test_backend.py` to check Metal kernel compilation and `python3 scripts/test_cpu_engine.py` for the CPU fallback. Neither needs Blender. |
+| Panel says `Device: cpu` when you expected Metal | The Metal helper is missing or would not load. Build it with `python3 scripts/build_native.py`; if it is a downloaded release, see the note under Limitations. |
 | Scrubbing back holds and warns | Enable *Cache to Disk* in the Playback panel and play forward, or press *Reset*. |
 | Fluid passes through a collider | Check its voxel count in the Object Properties tab: 0 means no faces or no overlap with the domain. Move it in and/or check the mesh is closed. |
+| APIC fluid clings to a wall | Raise Resolution so the boundary occupies more pressure cells, and try reducing Vorticity Strength. Some free-slip grid-boundary diffusion is expected in APIC v1. |
 | Surface looks blocky | Raise *Surface Resolution* (cubic cost). |
 | ms/step too high | Raise *Smoothing Radius* (fewer particles) and/or lower *Surface Resolution*. |
 | Simpler-looking result after a Blender restart | Re-enable the extension, then Run - collider grids are rebuilt from the scene's tags on start. |
@@ -230,7 +246,7 @@ look.
 ```
 domain/       domain object, properties, add operator
 collision/    collider tagging + CPU voxelization
-solver/       PBF solver, marching cubes, surface, whitewater, timeline
+solver/       PBF/APIC solvers, marching cubes, surface, whitewater, timeline
 solver/backend/  device abstraction (buffers, kernels, a queue)
 solver/engine/   the Metal and numpy simulation engines
 ui/           N-panel and Object Properties panels
@@ -246,6 +262,9 @@ demos/        shipped example scenes
   `scripts/dev_link.py`); replays every file in `demos/` and insists on a
   real surface mesh.
 - `scripts/make_demo.py` - rebuilds the demo scenes.
+- `scripts/golden.py --method=pbf|apic` - creates and compares method-specific
+  references; it rejects comparisons across methods.
+- `scripts/test_cache.py` - standalone cache-v4 state and invalidation tests.
 - `scripts/package.py` - builds the release zip (also run by CI on tags).
 - Lint/format: `ruff check .` and `black --check .` (see CI).
 

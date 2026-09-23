@@ -1,18 +1,17 @@
-"""The PBF solver and the compute plumbing under it.
+"""The PBF/APIC solvers and the compute plumbing under them.
 
 * `backend` - the device abstraction: buffers, compiled kernels, a command
   queue. Generic, and free of Blender imports.
-* `engine` - the simulation engines that sit on a backend and know what SPH is.
+* `engine` - simulation methods that sit on a backend and advance the fluid.
 * `viz` - the debug point-cloud overlay.
-* `sph` - Phase 4's Position Based Fluids solver core, plus Phase 7's timeline
-  handling.
+* `sph` - shared configuration, timeline and Blender operators.
 * `marching_cubes` - Phase 6's iso-surface extraction, pure Python and free of
   Blender imports so it can be tested outside Blender.
 * `surface` - Phase 6's density splat, extraction and FluidSurface mesh.
 * `cache` - the disk cache: per-frame particle-state snapshots that let the
   timeline be scrubbed back without re-simulating.
-* `whitewater` - Phase 8's secondary spray/foam/bubble particles, driven off
-  the PBF state each frame into a Whitewater point-cloud child object.
+* `whitewater` - secondary spray/foam/bubble particles driven from either
+  method's positions, velocities and particle hash.
 
 The Phase 3 gravity-only compute round-trip that used to live here as
 `gpu_test` is now scripts/test_backend.py, which answers the same question -
