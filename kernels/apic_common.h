@@ -99,6 +99,55 @@ FLOWX_INLINE bool apic_face_solid(FLOWX_CONSTANT Params &P,
          apic_cell_type(P, cell_data, high) < 0.0f;
 }
 
+/* Animated colliders are packed as N occupancy floats followed by 3N wall
+ * velocity floats.  Static colliders keep the old occupancy-only allocation;
+ * collider_motion keeps this read optional in every APIC pass. */
+FLOWX_INLINE float3 apic_collider_velocity(FLOWX_CONSTANT Params &P,
+                                           FLOWX_CONST_DEVICE float *collider,
+                                           int3 c)
+{
+  if (P.collider_motion == 0 || !collider_in_bounds(P, c)) {
+    return float3(0.0f);
+  }
+  int count = P.collider_x * P.collider_y * P.collider_z;
+  int index = (c.z * P.collider_y + c.y) * P.collider_x + c.x;
+  int offset = count + index * 3;
+  return float3(collider[offset], collider[offset + 1], collider[offset + 2]);
+}
+
+FLOWX_INLINE float3 apic_wall_velocity(FLOWX_CONSTANT Params &P,
+                                       FLOWX_CONST_DEVICE float *collider,
+                                       float3 point)
+{
+  if (P.collider_motion == 0 || P.collider_voxel <= 0.0f) {
+    return float3(0.0f);
+  }
+  return apic_collider_velocity(P, collider, collider_coord(P, point));
+}
+
+FLOWX_INLINE float3 apic_solid_face_velocity(FLOWX_CONSTANT Params &P,
+                                             FLOWX_CONST_DEVICE float4 *cell_data,
+                                             FLOWX_CONST_DEVICE float *collider,
+                                             int3 node, int axis)
+{
+  int3 low = node;
+  low[axis] -= 1;
+  int3 high = node;
+  float3 result = float3(0.0f);
+  int count = 0;
+  if (cell_in_bounds(P, low) && apic_cell_type(P, cell_data, low) < 0.0f) {
+    float3 center = params_lo(P) + (float3(low) + 0.5f) * P.grid_spacing;
+    result += apic_wall_velocity(P, collider, center);
+    count++;
+  }
+  if (cell_in_bounds(P, high) && apic_cell_type(P, cell_data, high) < 0.0f) {
+    float3 center = params_lo(P) + (float3(high) + 0.5f) * P.grid_spacing;
+    result += apic_wall_velocity(P, collider, center);
+    count++;
+  }
+  return count > 0 ? result / float(count) : float3(0.0f);
+}
+
 FLOWX_INLINE float apic_pressure(FLOWX_CONSTANT Params &P,
                                  FLOWX_CONST_DEVICE float4 *cell_data,
                                  int3 cell)

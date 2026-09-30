@@ -25,6 +25,7 @@ _OVERLAY_POINT_SIZE = 4.0
 
 _grids = {}
 _mesh_fingerprints = {}
+_motion_baselines = {}
 _draw_handle = None
 
 # Union of every tagged collider's occupancy, in the domain's collider grid
@@ -33,7 +34,19 @@ _draw_handle = None
 # whenever any collider's own grid changes rather than read from `_grids` per
 # frame, so a multi-collider scene costs the solver one texture lookup, not
 # several.
-_solver_grid = {"buffer": None, "occupancy": None, "voxel_size": 0.0, "dims": (1, 1, 1)}
+_solver_grid = {
+    "buffer": None,
+    "occupancy": None,
+    "velocity": None,
+    "voxel_size": 0.0,
+    "dims": (1, 1, 1),
+}
+
+# Matrix inversion and multiplication of an unchanged animated transform can
+# leave a few ulps of noise. Treat that as stationary so an animated collider
+# does not switch the static upload layout on and off while it is at rest.
+_VELOCITY_EPSILON = 1.0e-12
+_MOTION_UNCHANGED = object()
 
 
 def _reset_state():
@@ -49,18 +62,42 @@ def _reset_state():
     """
     _grids.clear()
     _mesh_fingerprints.clear()
-    _solver_grid.update(buffer=None, occupancy=None, voxel_size=0.0, dims=(1, 1, 1))
+    _motion_baselines.clear()
+    _solver_grid.update(
+        buffer=None,
+        occupancy=None,
+        velocity=None,
+        voxel_size=0.0,
+        dims=(1, 1, 1),
+    )
 
 
 class ColliderGrid:
     """Voxelized occupancy for one collider, sized to the domain's grid."""
 
-    __slots__ = ("dims", "occupancy", "points")
+    __slots__ = ("dims", "occupancy", "points", "velocities")
 
-    def __init__(self, dims, occupancy, points):
+    def __init__(self, dims, occupancy, points, velocities=None):
         self.dims = dims
         self.occupancy = occupancy
         self.points = points
+        # Sparse map from flat voxel index to a world-space velocity. Keeping
+        # only occupied voxels avoids a second full grid per collider; the
+        # merged solver field is dense because that is the kernel's indexing
+        # contract.
+        self.velocities = velocities
+
+
+def _on_animation_flag_update(settings, context):
+    """Reset stale motion immediately when Animated Collider is toggled."""
+    obj = getattr(settings, "id_data", None)
+    scene = getattr(context, "scene", None)
+    if obj is None or scene is None:
+        return
+    reset_motion_baseline(obj_name=obj.name)
+    domain = find_domain(scene)
+    if domain is not None and getattr(obj.flowx_collider, "is_collider", False):
+        _rebuild_grid(domain, obj, scene=scene)
 
 
 class FlowXColliderSettings(PropertyGroup):
@@ -72,8 +109,10 @@ class FlowXColliderSettings(PropertyGroup):
     is_animated: BoolProperty(
         name="Animated Collider",
         description="Rebuild this collider's voxel grid every frame from its "
-        "animation, so a keyframed collider tracks its motion during playback",
+        "animation, so a keyframed collider tracks its motion during playback "
+        "and transfers one-way normal velocity to the fluid",
         default=False,
+        update=_on_animation_flag_update,
     )
 
 
@@ -113,6 +152,7 @@ class FLOWX_OT_toggle_collider(Operator):
         else:
             _grids.pop(obj.name, None)
             _mesh_fingerprints.pop(obj.name, None)
+            _motion_baselines.pop(obj.name, None)
             if domain is not None:
                 _rebuild_solver_grid(domain)
 
@@ -135,7 +175,8 @@ def _warn_collisionless(operator, context, domain, obj):
         )
         return
 
-    obj_lo, obj_hi = world_bounds(obj)
+    evaluated_obj = obj.evaluated_get(depsgraph)
+    obj_lo, obj_hi = _world_bounds_with_matrix(evaluated_obj, evaluated_obj.matrix_world)
     dom_lo, dom_hi = world_bounds(domain)
     if (
         obj_lo.x >= dom_hi.x
@@ -174,10 +215,11 @@ def mesh_fingerprint(obj_name):
 def get_solver_grid():
     """(buffer, voxel_size, dims) for the SPH solver's collider sampling.
 
-    `buffer` is a device buffer, and is None when there are no tagged
-    colliders or when the upload failed (no usable device, say). The solver
-    treats both the same way, as "nothing to collide with" - see
-    get_solver_occupancy() for the host-side copy the CPU engine reads.
+    `buffer` begins with one float occupancy value per voxel and, when
+    get_solver_velocity() is non-None, appends three velocity floats per
+    voxel. It is None when there are no tagged colliders or when upload failed
+    (no usable device, say). See get_solver_occupancy() and
+    get_solver_velocity() for the host-side forms the CPU engine reads.
     """
     return _solver_grid["buffer"], _solver_grid["voxel_size"], _solver_grid["dims"]
 
@@ -189,6 +231,46 @@ def get_solver_occupancy():
     directly rather than through a device buffer.
     """
     return _solver_grid["occupancy"]
+
+
+def get_solver_velocity():
+    """Return the merged flat float3 wall-velocity field, or ``None``.
+
+    The returned :class:`array.array` has three float32 values per collider
+    voxel in ``x, y, z`` order and the same z-major indexing as
+    :func:`get_solver_occupancy`.  ``None`` means no occupied voxel currently
+    has nonzero animated-collider motion; this is also what keeps static scenes
+    on the original occupancy-only device allocation.
+    """
+    return _solver_grid["velocity"]
+
+
+def reset_motion_baseline(scene=None, obj_name=None):
+    """Forget animated-collider transform history and clear wall velocities.
+
+    Cache loads, reseeds, backward timeline jumps and other discontinuities
+    call this before installing a new collider state.  The next animated
+    sample becomes a baseline and therefore contributes zero velocity.  When a
+    scene is supplied, the already voxelized occupancy is uploaded again with
+    the static layout so no stale motion is visible to the solver.
+
+    ``obj_name`` optionally limits the reset to one collider.  The default
+    resets all baselines, which is the safe operation for a timeline reset.
+    """
+    if obj_name is None:
+        _motion_baselines.clear()
+        names = set(_grids)
+    else:
+        _motion_baselines.pop(obj_name, None)
+        names = {obj_name} if obj_name in _grids else set()
+    for name in names:
+        _grids[name].velocities = None
+    if scene is None:
+        scene = getattr(bpy.context, "scene", None)
+    if scene is not None:
+        domain = find_domain(scene)
+        if domain is not None:
+            _rebuild_solver_grid(domain)
 
 
 def ensure_grids(scene=None):
@@ -217,6 +299,7 @@ def ensure_grids(scene=None):
     for name in stale:
         _grids.pop(name, None)
         _mesh_fingerprints.pop(name, None)
+        _motion_baselines.pop(name, None)
     if stale:
         _rebuild_solver_grid(domain)
     for obj in tagged:
@@ -253,19 +336,32 @@ def rebuild_animated_grids(scene=None):
         bpy.context.view_layer.update()
     except Exception:
         pass
-    for obj in objs:
-        _rebuild_grid(domain, obj)
+    # Rebuild all animated colliders first, then merge and upload exactly once
+    # for this logical frame.  Sorting makes overlap resolution independent of
+    # Blender collection/object iteration order.
+    for obj in sorted(objs, key=lambda item: item.name):
+        _rebuild_grid(domain, obj, upload=False, scene=scene)
+    _rebuild_solver_grid(domain)
 
 
 def _rebuild_solver_grid(domain):
     if not _grids:
-        _solver_grid.update(buffer=None, occupancy=None, voxel_size=0.0, dims=(1, 1, 1))
+        _solver_grid.update(
+            buffer=None,
+            occupancy=None,
+            velocity=None,
+            voxel_size=0.0,
+            dims=(1, 1, 1),
+        )
         return
 
     origin, voxel_size, dims = _domain_grid_geometry(domain)
     nx, ny, nz = dims
     union = bytearray(nx * ny * nz)
-    for grid in _grids.values():
+    velocity_sums = [0.0] * (nx * ny * nz * 3)
+    velocity_counts = [0] * (nx * ny * nz)
+    for name in sorted(_grids):
+        grid = _grids[name]
         # A grid built against a stale domain resolution is skipped until its
         # own transform/geometry update rebuilds it at the current one.
         if grid.dims != dims:
@@ -273,13 +369,45 @@ def _rebuild_solver_grid(domain):
         for idx, occupied in enumerate(grid.occupancy):
             if occupied:
                 union[idx] = 1
+                # Every occupying collider contributes to the deterministic
+                # overlap average; static/first-sample colliders contribute
+                # an explicit zero wall velocity.
+                velocity_counts[idx] += 1
+                velocity = grid.velocities.get(idx) if grid.velocities else None
+                if velocity is not None:
+                    base = idx * 3
+                    velocity_sums[base] += velocity.x
+                    velocity_sums[base + 1] += velocity.y
+                    velocity_sums[base + 2] += velocity.z
 
-    # Both forms are kept: a GPU engine binds the device buffer, the CPU engine
-    # reads the raw occupancy. The upload is best-effort, so on a machine with
-    # no device the occupancy is still there for the CPU path.
+    # Average every overlapping animated-collider contribution.  A dense
+    # float3 field is emitted only when at least one averaged value is
+    # materially nonzero; static scenes retain the old N-float upload.
+    merged_velocity = array("f", [0.0]) * (nx * ny * nz * 3)
+    has_motion = False
+    for idx, count in enumerate(velocity_counts):
+        if not count:
+            continue
+        base = idx * 3
+        vx = velocity_sums[base] / count
+        vy = velocity_sums[base + 1] / count
+        vz = velocity_sums[base + 2] / count
+        if max(abs(vx), abs(vy), abs(vz)) <= _VELOCITY_EPSILON:
+            continue
+        merged_velocity[base] = vx
+        merged_velocity[base + 1] = vy
+        merged_velocity[base + 2] = vz
+        has_motion = True
+    if not has_motion:
+        merged_velocity = None
+
+    # Both host forms are kept beside the packed device buffer. The upload is
+    # best-effort, so on a machine with no device the CPU path still has both
+    # occupancy and wall motion.
     _solver_grid.update(
-        buffer=_upload_to_device(union, dims),
+        buffer=_upload_to_device(union, dims, merged_velocity),
         occupancy=union,
+        velocity=merged_velocity,
         voxel_size=voxel_size,
         dims=dims,
     )
@@ -306,6 +434,76 @@ def _domain_grid_geometry(domain):
     return lo, voxel_size, dims
 
 
+def _world_bounds_with_matrix(obj, matrix):
+    """Return world bounds using an explicitly evaluated world matrix."""
+    corners = [matrix @ Vector(corner) for corner in obj.bound_box]
+    xs = [corner.x for corner in corners]
+    ys = [corner.y for corner in corners]
+    zs = [corner.z for corner in corners]
+    return Vector((min(xs), min(ys), min(zs))), Vector((max(xs), max(ys), max(zs)))
+
+
+def _frame_seconds(scene):
+    render = getattr(scene, "render", None)
+    fps = float(getattr(render, "fps", 24.0))
+    fps_base = float(getattr(render, "fps_base", 1.0))
+    if fps <= 0.0 or fps_base <= 0.0:
+        return 0.0
+    return fps_base / fps
+
+
+def _animated_voxel_velocities(obj, scene, current_matrix, occupied_points):
+    """Return sparse current-voxel velocities and retain this sample baseline.
+
+    A baseline is valid only for adjacent forward timeline frames.  This is
+    intentionally stricter than using the elapsed frame count: a frame jump
+    would otherwise turn a cache seek or a render catch-up into a teleporting
+    wall impulse.  Singular matrices and invalid frame timing clear history so
+    the next valid sample starts fresh.
+    """
+    if not getattr(obj.flowx_collider, "is_animated", False):
+        return None
+    name = obj.name
+    frame = getattr(scene, "frame_current", None)
+    try:
+        frame = int(frame)
+    except (TypeError, ValueError):
+        frame = None
+    previous = _motion_baselines.get(name)
+    if (
+        previous is not None
+        and frame is not None
+        and previous[1] == frame
+        and previous[0] == current_matrix
+    ):
+        # Blender may report the same evaluated transform through both a
+        # depsgraph update and the solver's explicit frame rebuild. Keep the
+        # already computed velocity for that logical frame instead of erasing
+        # it on the duplicate notification.
+        return _MOTION_UNCHANGED
+    _motion_baselines[name] = (current_matrix.copy(), frame)
+    if previous is None or frame is None:
+        return None
+    previous_matrix, previous_frame = previous
+    if previous_frame is None or frame != previous_frame + 1:
+        return None
+    elapsed = _frame_seconds(scene)
+    if elapsed <= 0.0:
+        return None
+    try:
+        current_inverse = current_matrix.inverted()
+    except (ValueError, ZeroDivisionError):
+        _motion_baselines.pop(name, None)
+        return None
+    velocities = {}
+    for flat_index, point in occupied_points:
+        previous_point = previous_matrix @ (current_inverse @ point)
+        velocity = (point - previous_point) / elapsed
+        if velocity.length_squared > _VELOCITY_EPSILON * _VELOCITY_EPSILON:
+            velocities[flat_index] = velocity
+    return velocities or None
+
+
 def _index_range(obj_min, obj_max, origin, voxel_size, count):
     lo = max(0, math.floor((obj_min - origin) / voxel_size))
     hi = min(count, math.ceil((obj_max - origin) / voxel_size))
@@ -325,8 +523,8 @@ def _point_inside(bvh, point, direction, epsilon=1e-4):
     return count % 2 == 1
 
 
-def _upload_to_device(occupancy, dims):
-    """Upload the occupancy grid as a flat float buffer, or None if it can't.
+def _upload_to_device(occupancy, dims, velocities=None):
+    """Upload occupancy, optionally followed by a flat float3 field.
 
     It used to go up as a 3D R32F image, because Blender's GPU API had no
     read-write storage buffer type at all and images were the only mutable
@@ -347,7 +545,9 @@ def _upload_to_device(occupancy, dims):
         if backend is None:
             return None
         data = array("f", (float(v) for v in occupancy))
-        return backend.buffer(dims[0] * dims[1] * dims[2] * 4, data)
+        if velocities is not None:
+            data.extend(velocities)
+        return backend.buffer(len(data) * 4, data)
     except Exception as exc:
         print(f"[flow-x] Skipping collider grid upload: {exc}")
         return None
@@ -364,14 +564,17 @@ def _compute_mesh_fingerprint(obj, depsgraph):
     return digest.digest()
 
 
-def _rebuild_grid(domain, obj):
+def _rebuild_grid(domain, obj, upload=True, scene=None):
     origin, voxel_size, dims = _domain_grid_geometry(domain)
     if voxel_size <= 0.0:
         _grids.pop(obj.name, None)
         _mesh_fingerprints.pop(obj.name, None)
+        _motion_baselines.pop(obj.name, None)
         return
 
     depsgraph = bpy.context.evaluated_depsgraph_get()
+    evaluated_obj = obj.evaluated_get(depsgraph)
+    current_matrix = evaluated_obj.matrix_world.copy()
     _mesh_fingerprints[obj.name] = _compute_mesh_fingerprint(obj, depsgraph)
     try:
         bvh = BVHTree.FromObject(obj, depsgraph)
@@ -382,7 +585,9 @@ def _rebuild_grid(domain, obj):
         bvh = None
     if bvh is None:
         _grids.pop(obj.name, None)
-        _rebuild_solver_grid(domain)
+        _motion_baselines.pop(obj.name, None)
+        if upload:
+            _rebuild_solver_grid(domain)
         return
 
     # FromObject builds the tree in the object's *local* space, while the
@@ -392,8 +597,8 @@ def _rebuild_grid(domain, obj):
     # (Skipping this is why a collider not sitting at the origin voxelized
     # to nothing: its world-space centers all landed outside the local tree.)
     try:
-        inv_matrix = obj.matrix_world.inverted()
-    except ValueError:
+        inv_matrix = current_matrix.inverted()
+    except (ValueError, ZeroDivisionError):
         # A singular transform (an axis scaled to zero) has no inverse, and
         # Blender raises on it rather than returning garbage. The mesh
         # voxelizes to nothing, like one with no faces, and keeps its tag in
@@ -403,11 +608,13 @@ def _rebuild_grid(domain, obj):
             "(an axis is scaled to zero)."
         )
         _grids.pop(obj.name, None)
-        _rebuild_solver_grid(domain)
+        _motion_baselines.pop(obj.name, None)
+        if upload:
+            _rebuild_solver_grid(domain)
         return
     direction = (inv_matrix.to_3x3() @ Vector((0.0, 0.0, 1.0))).normalized()
 
-    obj_lo, obj_hi = world_bounds(obj)
+    obj_lo, obj_hi = _world_bounds_with_matrix(evaluated_obj, current_matrix)
     nx, ny, nz = dims
     i0, i1 = _index_range(obj_lo.x, obj_hi.x, origin.x, voxel_size, nx)
     j0, j1 = _index_range(obj_lo.y, obj_hi.y, origin.y, voxel_size, ny)
@@ -415,6 +622,7 @@ def _rebuild_grid(domain, obj):
 
     occupancy = bytearray(nx * ny * nz)
     points = []
+    occupied_points = []
     for k in range(k0, k1):
         z = origin.z + (k + 0.5) * voxel_size
         for j in range(j0, j1):
@@ -422,13 +630,27 @@ def _rebuild_grid(domain, obj):
             for i in range(i0, i1):
                 x = origin.x + (i + 0.5) * voxel_size
                 if _point_inside(bvh, inv_matrix @ Vector((x, y, z)), direction):
-                    occupancy[(k * ny + j) * nx + i] = 1
-                    points.append(Vector((x, y, z)))
+                    flat_index = (k * ny + j) * nx + i
+                    point = Vector((x, y, z))
+                    occupancy[flat_index] = 1
+                    points.append(point)
+                    occupied_points.append((flat_index, point))
+
+    velocities = _animated_voxel_velocities(
+        obj,
+        scene=scene or bpy.context.scene,
+        current_matrix=current_matrix,
+        occupied_points=occupied_points,
+    )
+    if velocities is _MOTION_UNCHANGED:
+        prior_grid = _grids.get(obj.name)
+        velocities = prior_grid.velocities if prior_grid is not None else None
 
     # Only the merged solver grid is ever bound; a per-object upload would be
     # allocated and never read.
-    _grids[obj.name] = ColliderGrid(dims, occupancy, points)
-    _rebuild_solver_grid(domain)
+    _grids[obj.name] = ColliderGrid(dims, occupancy, points, velocities)
+    if upload:
+        _rebuild_solver_grid(domain)
 
 
 def _tag_viewports_redraw():

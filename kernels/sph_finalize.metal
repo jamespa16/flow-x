@@ -32,6 +32,8 @@ FLOWX_KERNEL void sph_finalize(FLOWX_DEVICE float4 *positions [[buffer(BUF_POSIT
   float voxel = P.collider_voxel;
 
   if (voxel > 0.0f && collider_occupied(P, collider, collider_coord(P, p))) {
+    int3 collider_cell = collider_coord(P, p);
+    float3 wall_velocity = collider_velocity(P, collider, collider_cell);
     float3 nearest_free = float3(0.0f);
     float best_dist2 = 1e30f;
     bool found = false;
@@ -60,7 +62,7 @@ FLOWX_KERNEL void sph_finalize(FLOWX_DEVICE float4 *positions [[buffer(BUF_POSIT
       float3 push_dir = (dist > 1e-6f) ? (nearest_free - p) / dist : float3(0.0f, 0.0f, 1.0f);
       p += push_dir * (dist + radius);
 
-      float vn = dot(v, push_dir);
+      float vn = dot(v - wall_velocity, push_dir);
       if (vn < 0.0f) {
         v -= vn * (1.0f + damping) * push_dir;
       }

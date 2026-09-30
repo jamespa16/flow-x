@@ -137,4 +137,16 @@ FLOWX_INLINE bool collider_occupied(FLOWX_CONSTANT Params &P,
   return collider[index] > 0.5f;
 }
 
+FLOWX_INLINE float3 collider_velocity(FLOWX_CONSTANT Params &P,
+                                      FLOWX_CONST_DEVICE float *collider,
+                                      int3 c)
+{
+  if (P.collider_motion == 0 || !collider_in_bounds(P, c)) {
+    return float3(0.0f);
+  }
+  int index = (c.z * P.collider_y + c.y) * P.collider_x + c.x;
+  int base = P.collider_x * P.collider_y * P.collider_z + index * 3;
+  return float3(collider[base], collider[base + 1], collider[base + 2]);
+}
+
 #endif /* FLOWX_SPH_COMMON_H */

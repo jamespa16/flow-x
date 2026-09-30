@@ -160,11 +160,12 @@ class MetalEngine:
         ):
             self.buffers.setdefault(name, None)
 
-    def set_collider(self, buffer, dims, voxel_size, occupancy=None):
-        """Point the collider slot at a grid, or back at the empty stand-in.
+    def set_collider(self, buffer, dims, voxel_size, occupancy=None, velocities=None):
+        """Point the collider slot at a packed occupancy/motion grid.
 
         `occupancy` is the same grid in raw host bytes, which only the CPU
-        engine needs; this one binds the device buffer and ignores it.
+        engine needs. `velocities` is likewise host data; its presence tells
+        kernels that the bound buffer appends a float3 field after occupancy.
         """
         del occupancy
         self.buffers["collider"] = buffer if buffer is not None else self.empty_collider
@@ -174,6 +175,7 @@ class MetalEngine:
             collider_y=dims[1],
             collider_z=dims[2],
             collider_voxel=voxel_size,
+            collider_motion=int(velocities is not None),
         )
 
     def install(self, name, buffer):

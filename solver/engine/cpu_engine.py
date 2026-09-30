@@ -116,6 +116,7 @@ class CpuEngine:
         self.surface_field = None
         self.ww = {}
         self.collider = None
+        self.collider_velocity = None
         self.collider_dims = (1, 1, 1)
         self._pairs = None
 
@@ -136,24 +137,41 @@ class CpuEngine:
         }
         self._pairs = None
 
-    def set_collider(self, buffer, dims, voxel_size, occupancy=None):
-        """Take the collider occupancy. The device buffer is not usable here."""
+    def set_collider(self, buffer, dims, voxel_size, occupancy=None, velocities=None):
+        """Take host collider occupancy and optional float3 wall velocities."""
         del buffer
         self.collider_dims = tuple(dims)
         if occupancy is None or voxel_size <= 0.0:
             self.collider = None
+            self.collider_velocity = None
             voxel_size = 0.0
         else:
             self.collider = np.frombuffer(bytes(occupancy), dtype=np.uint8).reshape(
                 dims[2], dims[1], dims[0]
             )
+            if velocities is None:
+                self.collider_velocity = None
+            else:
+                flat = np.frombuffer(bytes(velocities), dtype=np.float32)
+                expected = dims[0] * dims[1] * dims[2] * 3
+                if flat.size != expected:
+                    raise ValueError(
+                        f"collider velocity has {flat.size} floats, expected {expected}"
+                    )
+                self.collider_velocity = flat.reshape(dims[2], dims[1], dims[0], 3)
         self.params.update(
-            collider_x=dims[0], collider_y=dims[1], collider_z=dims[2], collider_voxel=voxel_size
+            collider_x=dims[0],
+            collider_y=dims[1],
+            collider_z=dims[2],
+            collider_voxel=voxel_size,
+            collider_motion=int(self.collider_velocity is not None),
         )
 
     def release(self):
         self.state = {}
         self.ww = {}
+        self.collider = None
+        self.collider_velocity = None
         self.surface_field = None
         self.config = None
         self._pairs = None
@@ -196,6 +214,20 @@ class CpuEngine:
             return out
         ci = c[inside]
         out[inside] = self.collider[ci[:, 2], ci[:, 1], ci[:, 0]] > 0
+        return out
+
+    def _collider_velocity(self, points):
+        """Sample the moving-collider velocity field at world-space points."""
+        out = np.zeros((len(points), 3), dtype=np.float32)
+        voxel = self.params["collider_voxel"]
+        if self.collider_velocity is None or voxel <= 0.0:
+            return out
+        c = np.floor((points - self._lo()) / voxel).astype(np.int64)
+        dims = np.array(self.collider_dims, dtype=np.int64)
+        inside = np.all((c >= 0) & (c < dims), axis=1)
+        if inside.any():
+            ci = c[inside]
+            out[inside] = self.collider_velocity[ci[:, 2], ci[:, 1], ci[:, 0]]
         return out
 
     def build_grid(self):
@@ -408,14 +440,16 @@ class CpuEngine:
         voxel = P["collider_voxel"]
         if self.collider is not None and voxel > 0.0:
             stuck = np.where(self._occupied(p))[0]
-            for index in stuck:
+            wall_velocities = self._collider_velocity(p[stuck])
+            for index, wall_velocity in zip(stuck, wall_velocities, strict=True):
                 nearest, dist2 = self._nearest_free_voxel(p[index], voxel)
                 if nearest is None:
                     continue
                 dist = math.sqrt(dist2)
                 push = (nearest - p[index]) / dist if dist > 1e-6 else np.array([0.0, 0.0, 1.0])
                 p[index] += push * (dist + radius)
-                vn = float(np.dot(v[index], push))
+                relative = v[index] - wall_velocity
+                vn = float(np.dot(relative, push))
                 if vn < 0.0:
                     v[index] -= vn * (1.0 + damping) * push
 
@@ -689,6 +723,7 @@ class CpuEngine:
         v[foam] *= damping
         v[foam, 2] += gravity * 0.1 * dt
 
+        previous = p.copy()
         p = p + v * dt
         life = life - dt
 
@@ -701,8 +736,28 @@ class CpuEngine:
 
         blocked = self._occupied(p)
         if blocked.any():
-            p[blocked] -= v[blocked] * dt
-            v[blocked] *= 0.2
+            blocked_indices = np.flatnonzero(blocked)
+            wall_velocities = self._collider_velocity(p[blocked_indices])
+            voxel = self.params["collider_voxel"]
+            for index, wall_velocity in zip(blocked_indices, wall_velocities, strict=True):
+                nearest, dist2 = self._nearest_free_voxel(p[index], voxel)
+                if nearest is None:
+                    # Preserve the previous bounded fallback for malformed or
+                    # completely filled collider neighbourhoods.
+                    p[index] = previous[index]
+                    v[index] *= 0.2
+                    continue
+                dist = math.sqrt(dist2)
+                normal = (
+                    (nearest - p[index]) / dist
+                    if dist > 1e-6
+                    else np.array((0.0, 0.0, 1.0), dtype=np.float32)
+                )
+                p[index] += normal * dist
+                relative = v[index] - wall_velocity
+                vn = float(np.dot(relative, normal))
+                if vn < 0.0:
+                    v[index] -= vn * (1.0 + self.params["boundary_damping"]) * normal
 
         pool[alive, :3] = p
         pool[alive, 3] = life

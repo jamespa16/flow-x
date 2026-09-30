@@ -3,6 +3,7 @@ FLOWX_KERNEL void apic_grid_update(FLOWX_CONST_DEVICE float4 *mass [[buffer(BUF_
                                    FLOWX_DEVICE float4 *velocity [[buffer(BUF_GRID_VELOCITY)]],
                                    FLOWX_DEVICE float4 *velocity_old [[buffer(BUF_GRID_VELOCITY_OLD)]],
                                    FLOWX_CONST_DEVICE float4 *cell_data [[buffer(BUF_GRID_SCRATCH)]],
+                                   FLOWX_CONST_DEVICE float *collider [[buffer(BUF_COLLIDER)]],
                                    FLOWX_CONSTANT Params &P [[buffer(BUF_PARAMS)]],
                                    FLOWX_TID)
 {
@@ -16,6 +17,12 @@ FLOWX_KERNEL void apic_grid_update(FLOWX_CONST_DEVICE float4 *mass [[buffer(BUF_
   for (int axis = 0; axis < 3; ++axis) {
     if (!apic_face_valid(P, node, axis)) {
       continue;
+    }
+    bool solid = apic_face_solid(P, cell_data, node, axis);
+    if (solid) {
+      /* Solid faces carry the wall's own velocity (zero for static colliders), even
+       * where no particle has deposited mass on them. */
+      value[axis] = apic_solid_face_velocity(P, cell_data, collider, node, axis)[axis];
     }
     float m = mass[index][axis];
     if (m <= 1e-12f) {
@@ -31,7 +38,7 @@ FLOWX_KERNEL void apic_grid_update(FLOWX_CONST_DEVICE float4 *mass [[buffer(BUF_
      * every particle faster than it. Measured on the dam break, a reference
      * taken before the cap made FLIP lose energy faster than APIC. */
     old_value[axis] = clamp(v, -P.grid_max_speed, P.grid_max_speed);
-    if (apic_face_solid(P, cell_data, node, axis)) {
+    if (solid) {
       continue;
     }
     if (axis == 2) {

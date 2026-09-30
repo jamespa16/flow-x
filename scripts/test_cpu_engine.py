@@ -583,6 +583,33 @@ def test_apic_collider_surface_and_whitewater():
     check(all(p[3] <= 0.0 for p in pool), "APIC whitewater did not expire")
 
 
+def test_apic_preserves_moving_solid_face_velocity():
+    engine = _make_apic()
+    voxel = SPACING
+    dims = (int(1.0 / voxel),) * 3
+    occupancy = np.zeros((dims[2], dims[1], dims[0]), dtype=np.uint8)
+    velocity = np.zeros((dims[2], dims[1], dims[0], 3), dtype=np.float32)
+    occupancy[:, :, 10:12] = 1
+    velocity[:, :, 10:12, 0] = 1.0
+    engine.set_collider(
+        None,
+        dims,
+        voxel,
+        occupancy=occupancy.tobytes(),
+        velocities=velocity.tobytes(),
+    )
+    engine.build_grid()
+    cell_type = engine._classify_cells()
+    engine.grid_velocity.fill(0.0)
+    engine._apply_solid_faces(cell_type)
+    nx, ny, nz = engine.config.cell_dims
+    interface = engine.grid_velocity[:nz, :ny, 5, 0]
+    check(np.allclose(interface, 1.0), "APIC did not impose moving-wall face velocity")
+    engine._project(1.0 / 48.0, cell_type)
+    interface = engine.grid_velocity[:nz, :ny, 5, 0]
+    check(np.allclose(interface, 1.0), "APIC projection erased moving-wall velocity")
+
+
 def test_apic_snapshot_continuation_is_exact():
     """Restoring all persistent state must reproduce an uninterrupted step."""
     ww = WhitewaterCfg()
@@ -803,6 +830,93 @@ def test_collider_is_not_penetrated():
     check(not inside.any(), f"{int(inside.sum())} particles ended up inside the collider")
 
 
+def _moving_voxel_fixture(engine, wall_velocity):
+    """Install one occupied voxel and a matching packed wall-velocity field."""
+    voxel = SPACING
+    dims = (int(1.0 / voxel),) * 3
+    occupancy = np.zeros((dims[2], dims[1], dims[0]), dtype=np.uint8)
+    velocity = np.zeros((dims[2], dims[1], dims[0], 3), dtype=np.float32)
+    cell = (10, 10, 4)
+    occupancy[cell[2], cell[1], cell[0]] = 1
+    velocity[cell[2], cell[1], cell[0]] = wall_velocity
+    engine.set_collider(
+        None,
+        dims,
+        voxel,
+        occupancy=occupancy.tobytes(),
+        velocities=velocity.tobytes(),
+    )
+    return cell
+
+
+def test_moving_collider_relative_normal_response():
+    engine = _make_cpu()
+    _moving_voxel_fixture(engine, (0.0, 0.0, 1.0))
+    index = 0
+    # Near the occupied voxel's upper face, so recovery has an unambiguous +Z
+    # normal. X is tangential and must remain untouched by a frictionless wall.
+    point = np.array((0.525, 0.525, 0.249), dtype=np.float32)
+    engine.state["predicted"][index, :3] = point
+    engine.state["velocities"][index, :3] = (0.7, 0.0, -0.2)
+    engine.state["delta"][index, :3] = 0.0
+    engine._finalize_pass()
+    velocity = engine.state["velocities"][index, :3]
+    expected_normal = -0.2 - (-1.2) * (1.0 + engine.params["boundary_damping"])
+    check(abs(float(velocity[0]) - 0.7) < 1e-5, "moving collider changed tangential speed")
+    check(
+        abs(float(velocity[2]) - expected_normal) < 1e-5,
+        f"moving-wall normal response was {velocity[2]:.5f}, expected {expected_normal:.5f}",
+    )
+    check(
+        not engine._occupied(engine.state["positions"][[index], :3])[0],
+        "particle was not pushed out",
+    )
+
+
+def test_static_collider_response_is_unchanged():
+    engine = _make_cpu()
+    voxel = SPACING
+    dims = (int(1.0 / voxel),) * 3
+    occupancy = np.zeros((dims[2], dims[1], dims[0]), dtype=np.uint8)
+    occupancy[4, 10, 10] = 1
+    engine.set_collider(None, dims, voxel, occupancy=occupancy.tobytes())
+    index = 0
+    engine.state["predicted"][index, :3] = (0.525, 0.525, 0.249)
+    engine.state["velocities"][index, :3] = (0.7, 0.0, -0.2)
+    engine.state["delta"][index, :3] = 0.0
+    engine._finalize_pass()
+    velocity = engine.state["velocities"][index, :3]
+    expected_normal = -0.2 - (-0.2) * (1.0 + engine.params["boundary_damping"])
+    check(abs(float(velocity[0]) - 0.7) < 1e-6, "static collider changed tangential speed")
+    check(abs(float(velocity[2]) - expected_normal) < 1e-5, "static response regressed")
+
+
+def test_rotating_collider_velocity_sampling():
+    engine = _make_cpu()
+    voxel = SPACING
+    dims = (int(1.0 / voxel),) * 3
+    occupancy = np.ones((dims[2], dims[1], dims[0]), dtype=np.uint8)
+    z, y, x = np.indices((dims[2], dims[1], dims[0]), dtype=np.float32)
+    centers = np.stack((x + 0.5, y + 0.5, z + 0.5), axis=-1) * voxel
+    relative = centers - np.array((0.5, 0.5, 0.5), dtype=np.float32)
+    omega = np.array((0.0, 0.0, 2.0), dtype=np.float32)
+    velocity = np.cross(np.broadcast_to(omega, relative.shape), relative)
+    engine.set_collider(
+        None,
+        dims,
+        voxel,
+        occupancy=occupancy.tobytes(),
+        velocities=velocity.astype(np.float32).tobytes(),
+    )
+    points = np.array(((0.225, 0.525, 0.525), (0.775, 0.525, 0.525)), dtype=np.float32)
+    sampled = engine._collider_velocity(points)
+    check(sampled[0, 1] < 0.0 < sampled[1, 1], "rotating wall directions were not preserved")
+    check(
+        abs(float(sampled[0, 0] - sampled[1, 0])) < 1e-6,
+        "rotation sampling was not symmetric",
+    )
+
+
 def test_surface_field_brackets_the_iso():
     engine = _make_cpu()
     _run(engine, frames=4)
@@ -842,6 +956,121 @@ def test_whitewater_spawns_and_expires():
         engine.step_whitewater(ww, cursor, 0, 99, dt)
     pool, _velkind = engine.read_whitewater(ww.capacity)
     check(all(p[3] <= 0.0 for p in pool), "whitewater particles never expired")
+
+
+def test_whitewater_uses_moving_collider_normal_velocity():
+    engine = _make_cpu()
+    _moving_voxel_fixture(engine, (0.0, 0.0, 2.0))
+    engine.params.update(gravity=0.0)
+    ww = WhitewaterCfg()
+    engine.alloc_whitewater(ww.capacity, engine.config.sorted_count)
+    # Tangential X motion lands at the occupied voxel's X centre, leaving the
+    # nearest-free recovery normal unambiguously along +Z.
+    engine.ww["positions"][0] = (0.509, 0.525, 0.190, 1.0)
+    engine.ww["velkind"][0] = (0.4, 0.0, 1.0, 0.0)
+    engine._whitewater_advect(ww, 0.04)
+    position = engine.ww["positions"][0, :3]
+    velocity = engine.ww["velkind"][0, :3]
+    expected_normal = 1.0 - (1.0 - 2.0) * (1.0 + engine.params["boundary_damping"])
+    check(abs(float(velocity[0]) - 0.4) < 1e-6, "whitewater tangential speed changed")
+    check(
+        abs(float(velocity[2]) - expected_normal) < 1e-5,
+        "whitewater did not use collider-relative normal speed",
+    )
+    check(not engine._occupied(position[None, :])[0], "whitewater remained inside collider")
+
+
+def test_moving_collider_agrees_with_metal():
+    """Packed wall motion drives the same PBF contact and APIC face on Metal."""
+    backend_pkg = load("solver.backend")
+    backend = backend_pkg.select()
+    if backend is None:
+        print("  skipped: no GPU device on this machine")
+        return
+
+    # PBF relative-normal collision response.
+    cpu = _make_cpu()
+    _moving_voxel_fixture(cpu, (0.0, 0.0, 1.0))
+    index = 0
+    point = np.array((0.525, 0.525, 0.249), dtype=np.float32)
+    cpu.state["predicted"][index, :3] = point
+    cpu.state["velocities"][index, :3] = (0.7, 0.0, -0.2)
+    cpu.state["delta"][index, :3] = 0.0
+
+    packed = np.concatenate(
+        (cpu.collider.astype(np.float32).ravel(), cpu.collider_velocity.ravel())
+    ).astype(np.float32)
+    collider_buffer = backend.buffer(packed.nbytes, packed)
+    gpu = load("solver.engine.metal_engine").MetalEngine(backend)
+    gpu.params = cpu.params
+    gpu.allocate(cpu.config, np.asarray(cpu.state["positions"], dtype=np.float32).ravel())
+    gpu.set_collider(
+        collider_buffer,
+        cpu.collider_dims,
+        cpu.params["collider_voxel"],
+        velocities=cpu.collider_velocity.tobytes(),
+    )
+    predicted = np.frombuffer(gpu.buffers["predicted"].map(), dtype=np.float32).reshape(-1, 4)
+    velocity = np.frombuffer(gpu.buffers["velocities"].map(), dtype=np.float32).reshape(-1, 4)
+    delta = np.frombuffer(gpu.buffers["delta"].map(), dtype=np.float32).reshape(-1, 4)
+    predicted[index, :3] = point
+    velocity[index, :3] = (0.7, 0.0, -0.2)
+    delta[index, :3] = 0.0
+    cpu._finalize_pass()
+    gpu.record("sph_finalize", cpu.config.particle_count)
+    gpu.flush()
+    check(
+        np.allclose(velocity[index, :3], cpu.state["velocities"][index, :3], atol=1e-5),
+        "Metal PBF moving-wall response disagreed with CPU",
+    )
+
+    # APIC moving no-penetration face, before and after projection.
+    apic = _make_apic()
+    voxel = SPACING
+    dims = (int(1.0 / voxel),) * 3
+    occupancy = np.zeros((dims[2], dims[1], dims[0]), dtype=np.uint8)
+    wall_velocity = np.zeros((dims[2], dims[1], dims[0], 3), dtype=np.float32)
+    occupancy[:, :, 10:12] = 1
+    wall_velocity[:, :, 10:12, 0] = 1.0
+    apic.set_collider(
+        None,
+        dims,
+        voxel,
+        occupancy=occupancy.tobytes(),
+        velocities=wall_velocity.tobytes(),
+    )
+    packed = np.concatenate((occupancy.astype(np.float32).ravel(), wall_velocity.ravel())).astype(
+        np.float32
+    )
+    collider_buffer = backend.buffer(packed.nbytes, packed)
+    apic_gpu = load("solver.engine.apic_metal").ApicMetalEngine(backend)
+    apic_gpu.params = apic.params
+    apic_gpu.allocate(apic.config, np.asarray(apic.state["positions"], dtype=np.float32).ravel())
+    apic_gpu.set_collider(collider_buffer, dims, voxel, velocities=wall_velocity.tobytes())
+    nodes = math.prod(n + 1 for n in apic.config.cell_dims)
+    apic_gpu.build_grid()
+    apic_gpu.record("apic_grid_clear", max(nodes, apic.config.cell_count))
+    apic_gpu.record("apic_classify", apic.config.cell_count)
+    apic_gpu.record("apic_p2g", nodes)
+    apic_gpu.record("apic_grid_update", nodes)
+    apic_gpu.flush()
+    grid = np.frombuffer(apic_gpu.buffers["grid_velocity"].map(), dtype=np.float32).reshape(
+        nodes, 4
+    )
+    nx, ny, _nz = apic.config.cell_dims
+    face_index = (0 * (ny + 1) + 0) * (nx + 1) + 5
+    check(abs(float(grid[face_index, 0]) - 1.0) < 1e-6, "Metal APIC missed wall velocity")
+    apic_gpu.record("apic_divergence", apic.config.cell_count)
+    ping = 0
+    for _ in range(apic.config.pressure_iterations):
+        apic_gpu.record("apic_pressure", apic.config.cell_count, pressure_ping=ping)
+        ping = 1 - ping
+    apic_gpu.record("apic_project", nodes, pressure_ping=ping)
+    apic_gpu.flush()
+    check(
+        abs(float(grid[face_index, 0]) - 1.0) < 1e-6,
+        "Metal APIC projection erased wall velocity",
+    )
 
 
 def test_agrees_with_the_gpu_engine():
@@ -1104,8 +1333,19 @@ def main():
         ("it falls and spreads", test_it_actually_falls_and_spreads),
         ("density approaches rest", test_density_approaches_rest),
         ("collider is not penetrated", test_collider_is_not_penetrated),
+        (
+            "moving collider uses relative normal velocity",
+            test_moving_collider_relative_normal_response,
+        ),
+        ("static collider response is unchanged", test_static_collider_response_is_unchanged),
+        ("rotating collider velocity samples", test_rotating_collider_velocity_sampling),
         ("surface field brackets the iso", test_surface_field_brackets_the_iso),
         ("whitewater spawns and expires", test_whitewater_spawns_and_expires),
+        (
+            "whitewater uses moving collider normal velocity",
+            test_whitewater_uses_moving_collider_normal_velocity,
+        ),
+        ("moving collider agrees with Metal", test_moving_collider_agrees_with_metal),
         ("PBF snapshot continuation is exact", test_pbf_snapshot_continuation_is_exact),
         ("APIC stays finite and bounded", test_apic_stays_finite_and_bounded),
         ("APIC projection residual", test_apic_projection_residual),
@@ -1133,6 +1373,10 @@ def main():
             test_apic_confinement_clamps_each_face_component,
         ),
         ("APIC collider, surface and whitewater", test_apic_collider_surface_and_whitewater),
+        (
+            "APIC preserves moving solid-face velocity",
+            test_apic_preserves_moving_solid_face_velocity,
+        ),
         ("APIC snapshot continuation is exact", test_apic_snapshot_continuation_is_exact),
         ("agrees with the GPU engine", test_agrees_with_the_gpu_engine),
         ("APIC agrees with Metal and projects", test_apic_agrees_with_metal_and_projects),

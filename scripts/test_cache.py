@@ -1,4 +1,4 @@
-"""Standalone tests for the v4 particle-state cache.
+"""Standalone tests for the v5 particle-state cache.
 
 Blender is replaced with the tiny scene/domain surface this module needs, so
 the binary format and APIC continuation state stay covered on every CI host.
@@ -100,6 +100,27 @@ class Scene:
         self.name = "CacheTest"
 
 
+class ColliderSettings:
+    is_collider = True
+    is_animated = False
+
+
+class Collider:
+    def __init__(self, name="Collider"):
+        self.name = name
+        self.type = "MESH"
+        self.flowx_collider = ColliderSettings()
+        self.animation_data = None
+        self.matrix_world = ((1.0, 0.0, 0.0, 0.0),) * 4
+
+
+class ObjectCollection(list):
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return next(obj for obj in self if obj.name == key)
+        return super().__getitem__(key)
+
+
 class Domain:
     def __init__(self, path):
         self.flowx_domain = Settings()
@@ -146,7 +167,7 @@ def _state(method, whitewater):
     return state
 
 
-def test_v4_roundtrip(method, whitewater):
+def test_v5_roundtrip(method, whitewater):
     with tempfile.TemporaryDirectory(prefix="flowx-cache-test-") as temp:
         path = Path(temp) / "state.flowx_cache"
         scene = Scene()
@@ -244,23 +265,35 @@ def test_whitewater_hash_layout_covers_capacity_drag_and_buoyancy():
             )
 
 
-def test_v3_is_recreated():
+def test_v4_is_recreated():
     with tempfile.TemporaryDirectory(prefix="flowx-cache-test-") as temp:
         path = Path(temp) / "old.flowx_cache"
-        path.write_bytes(struct.pack("<8sI", cache.MAGIC, 3) + b"old cache")
+        path.write_bytes(struct.pack("<8sI", cache.MAGIC, 4) + b"old cache")
         scene = Scene()
         domain = Domain(path)
         bpy.context.scene = scene
         cache.open(scene, domain, 2, "pbf", "cpu", 0)
-        check(cache.header()["format_version"] == 4, "v3 cache was not replaced")
-        check(path.read_bytes()[8:12] == struct.pack("<I", 4), "v4 header was not written")
+        check(cache.header()["format_version"] == 5, "v4 cache was not replaced")
+        check(path.read_bytes()[8:12] == struct.pack("<I", 5), "v5 header was not written")
         cache.close()
+
+
+def test_hash_includes_animated_collider_flag():
+    with tempfile.TemporaryDirectory(prefix="flowx-cache-test-") as temp:
+        scene = Scene()
+        collider = Collider()
+        scene.objects = ObjectCollection([collider])
+        domain = Domain(Path(temp) / "state.flowx_cache")
+        static_hash = cache.config_hash(domain, scene, "pbf", "cpu")
+        collider.flowx_collider.is_animated = True
+        animated_hash = cache.config_hash(domain, scene, "pbf", "cpu")
+        check(static_hash != animated_hash, "animated-collider flag was omitted from cache hash")
 
 
 def main():
     tests = (
-        ("PBF v4 round-trip", lambda: test_v4_roundtrip("pbf", False)),
-        ("APIC + whitewater v4 round-trip", lambda: test_v4_roundtrip("apic", True)),
+        ("PBF v5 round-trip", lambda: test_v5_roundtrip("pbf", False)),
+        ("APIC + whitewater v5 round-trip", lambda: test_v5_roundtrip("apic", True)),
         (
             "active-method and resolved-device hash",
             test_hash_uses_resolved_identity_and_active_method_settings,
@@ -269,7 +302,8 @@ def main():
             "whitewater hash layout",
             test_whitewater_hash_layout_covers_capacity_drag_and_buoyancy,
         ),
-        ("v3 is recreated", test_v3_is_recreated),
+        ("v4 is recreated", test_v4_is_recreated),
+        ("animated-collider hash flag", test_hash_includes_animated_collider_flag),
     )
     failures = 0
     for name, run in tests:

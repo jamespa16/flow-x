@@ -39,6 +39,7 @@ FLOWX_KERNEL void whitewater_advect(FLOWX_DEVICE float4 *ww_positions [[buffer(B
 
   float4 vel_kind = ww_velkind[slot];
   float3 p = pos_life.xyz;
+  float3 previous = p;
   float3 v = vel_kind.xyz;
   int kind = int(vel_kind.w);
 
@@ -72,8 +73,41 @@ FLOWX_KERNEL void whitewater_advect(FLOWX_DEVICE float4 *ww_positions [[buffer(B
   }
 
   if (P.collider_voxel > 0.0f && collider_occupied(P, collider, collider_coord(P, p))) {
-    p -= v * dt;
-    v *= 0.2f;
+    int3 c = collider_coord(P, p);
+    float3 wall_velocity = collider_velocity(P, collider, c);
+    float3 nearest = float3(0.0f);
+    float best = 1e30f;
+    bool found = false;
+    for (int dz = -2; dz <= 2; ++dz) {
+      for (int dy = -2; dy <= 2; ++dy) {
+        for (int dx = -2; dx <= 2; ++dx) {
+          int3 nc = c + int3(dx, dy, dz);
+          if (!collider_in_bounds(P, nc) || collider_occupied(P, collider, nc)) {
+            continue;
+          }
+          float3 center = params_lo(P) + (float3(nc) + 0.5f) * P.collider_voxel;
+          float d2 = dot(center - p, center - p);
+          if (d2 < best) {
+            nearest = center;
+            best = d2;
+            found = true;
+          }
+        }
+      }
+    }
+    if (found) {
+      float dist = sqrt(best);
+      float3 normal = dist > 1e-6f ? (nearest - p) / dist : float3(0.0f, 0.0f, 1.0f);
+      p += normal * dist;
+      float vn = dot(v - wall_velocity, normal);
+      if (vn < 0.0f) {
+        v -= vn * (1.0f + P.boundary_damping) * normal;
+      }
+    }
+    else {
+      p = previous;
+      v *= 0.2f;
+    }
   }
 
   ww_positions[slot] = float4(p, life);

@@ -11,10 +11,11 @@ The implementation follows the [staggered MAC APIC formulation](https://www.cs.u
 3. Deterministically gather mass and affine momentum to staggered MAC faces.
 4. Normalize velocity, keep a capped pre-gravity copy for FLIP, apply gravity and the grid CFL clamp.
 5. Optionally compute curl and apply vorticity confinement.
-6. Apply solid/domain no-penetration conditions.
+6. Apply solid/domain no-penetration conditions, using animated-collider wall
+   velocity for the normal component while preserving tangential slip.
 7. Classify solid, fluid, and air pressure cells and compute divergence.
 8. Solve for pressure: diagonally preconditioned CG by default (up to 40 iterations, early exit at a relative-residual tolerance), or weighted Jacobi (`omega = 2/3`).
-9. Apply the pressure gradient and solid-face conditions.
+9. Apply the pressure gradient and solid-face conditions, retaining moving collider face velocities after projection.
 10. Gather projected velocities back to particles and reconstruct three padded affine rows, blending in FLIP's velocity change when the blend is above 0.
 
 The pressure cell dimensions equal the particle-hash dimensions. MAC arrays use a padded `(nx+1) x (ny+1) x (nz+1)` allocation with component-specific valid face regions. P2G is a face-owned gather rather than a float-atomic scatter, preserving deterministic cache replay.
@@ -39,16 +40,16 @@ PBF and APIC compile separate Metal libraries, so an APIC compilation failure ca
 
 ## Cache and output
 
-Cache v4 records the method, resolved device, extension version, state flags, particle count, and whitewater capacity. PBF frames store position, velocity, and the prior density used by surface tension; APIC adds affine rows; enabled whitewater adds the full pool and ring cursor. Earlier cache formats are intentionally recreated. The paired mesh cache remains the render replay path.
+Cache v5 records the method, resolved device, extension version, state flags, particle count, and whitewater capacity. PBF frames store position, velocity, and the prior density used by surface tension; APIC adds affine rows; enabled whitewater adds the full pool and ring cursor. Collider animation definitions and the Animated Collider flag are hashed, while transient transforms and velocity grids are rebuilt during replay. Earlier cache formats are intentionally recreated. The paired mesh cache remains the render replay path.
 
 ## Validation
 
-Standalone coverage includes bounded dam-break motion, the pressure residual and pool volume drift for both solvers, sealed-region PCG, translation/affine transfer invariants, less than 5% rotating-block angular-momentum drift over 300 steps, collider response, surface extraction, whitewater lifecycle, exact snapshot continuation, cache-v4 round trips, and optional Metal compilation/agreement tests. `scripts/smoke_test.py` exercises both methods in Blender and `scripts/golden.py` records method and device separately.
+Standalone coverage includes bounded dam-break motion, the pressure residual and pool volume drift for both solvers, sealed-region PCG, translation/affine transfer invariants, less than 5% rotating-block angular-momentum drift over 300 steps, moving-collider normal response with tangential slip, surface extraction, whitewater lifecycle, exact snapshot continuation, cache-v5 round trips, and optional Metal compilation/agreement tests. `scripts/smoke_test.py` exercises both methods in Blender and `scripts/golden.py` records method and device separately.
 
 ## Deferred work
 
 - ~~FLIP blending and PCG pressure solving~~ - done, see `ROADMAP_APIC_SOLVE.md`
 - particle reseeding/remeshing
-- collider velocity transfer and two-way coupling
+- swept collision detection, friction, and two-way coupling
 - APIC viscosity and surface tension
 - CUDA and multi-domain interaction
