@@ -24,7 +24,6 @@ _FACE_OFFSETS = (
     np.array((0.5, 0.5, 0.0), dtype=np.float64),
 )
 _JACOBI_OMEGA = 2.0 / 3.0
-_INVERSE_EPSILON = 1e-8
 # PCG breakdown guard, relative to r.z at the start of the solve. p.Ap can only
 # approach zero once the residual has nothing left in the matrix's range - a
 # converged solve, or a sealed fluid pocket whose right-hand side has a
@@ -199,8 +198,13 @@ class ApicCpuEngine(CpuEngine):
             return nx, ny + 1, nz
         return nx, ny, nz + 1
 
-    def _face_samples(self, axis):
-        """Yield particle indices, face indices, weights and offsets per corner."""
+    def _face_samples(self, axis, gradients=False):
+        """Yield particle indices, face indices, weights and offsets per corner.
+
+        With ``gradients`` also yield each corner weight's gradient (in 1/m), and keep the
+        corners whose weight is zero: on a face plane the far corner has no weight but
+        still has a gradient, and dropping it is what made B.D^-1 singular.
+        """
         points = self.state["positions"][:, :3].astype(np.float64)
         dx = float(self.params["grid_spacing"])
         local = (points - self._lo()) / dx - _FACE_OFFSETS[axis]
@@ -214,15 +218,24 @@ class ApicCpuEngine(CpuEngine):
             valid = np.all((index >= 0) & (index < dims), axis=1)
             if not valid.any():
                 continue
-            weights = np.where(c, frac, 1.0 - frac).prod(axis=1)
-            valid &= weights > 0.0
+            per_axis = np.where(c, frac, 1.0 - frac)
+            weights = per_axis.prod(axis=1)
+            if not gradients:
+                valid &= weights > 0.0
             if not valid.any():
                 continue
             particle = np.flatnonzero(valid)
             face = index[valid]
             face_position = self._lo() + (face + _FACE_OFFSETS[axis]) * dx
             offset = face_position - points[valid]
-            yield particle, face, weights[valid], offset
+            if not gradients:
+                yield particle, face, weights[valid], offset
+                continue
+            grad = np.empty((len(particle), 3), dtype=np.float64)
+            for k in range(3):
+                others = [j for j in range(3) if j != k]
+                grad[:, k] = (1.0 if c[k] else -1.0) * per_axis[valid][:, others].prod(axis=1)
+            yield particle, face, weights[valid], offset, grad / dx
 
     # --- APIC transfers --------------------------------------------------
 
@@ -549,34 +562,19 @@ class ApicCpuEngine(CpuEngine):
         n = self.config.particle_count
         velocity = np.zeros((n, 3), dtype=np.float64)
         affine = np.zeros((n, 3, 3), dtype=np.float64)
-        dx = float(self.params["grid_spacing"])
         blend = float(self.params["flip_blend"])
         old_velocity = np.zeros((n, 3), dtype=np.float64) if blend > 0.0 else None
 
         for axis in range(3):
-            moment = np.zeros((n, 3, 3), dtype=np.float64)
-            covariance = np.zeros((n, 3), dtype=np.float64)
-            for particle, face, weight, offset in self._face_samples(axis):
+            for particle, face, weight, _, grad in self._face_samples(axis, gradients=True):
                 values = self.grid_velocity[face[:, 2], face[:, 1], face[:, 0], axis]
+                # C = sum v grad(w) equals B.D^-1 wherever D is invertible, and stays
+                # finite on a face plane where D is singular. kernels/apic_g2p.metal.
+                np.add.at(affine[:, axis], particle, values[:, None] * grad)
                 np.add.at(velocity[:, axis], particle, weight * values)
                 if old_velocity is not None:
                     old = self.grid_velocity_old[face[:, 2], face[:, 1], face[:, 0], axis]
                     np.add.at(old_velocity[:, axis], particle, weight * old)
-                local = offset / dx
-                for a in range(3):
-                    np.add.at(covariance[:, a], particle, weight * values * local[:, a])
-                    for b in range(3):
-                        np.add.at(
-                            moment[:, a, b],
-                            particle,
-                            weight * local[:, a] * local[:, b],
-                        )
-
-            determinant = np.linalg.det(moment)
-            good = np.abs(determinant) >= _INVERSE_EPSILON
-            if good.any():
-                inverse = np.linalg.inv(moment[good])
-                affine[good, axis] = np.einsum("ij,ijk->ik", covariance[good], inverse) / dx
 
         motion = None
         if old_velocity is not None:

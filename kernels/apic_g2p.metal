@@ -1,28 +1,3 @@
-FLOWX_INLINE float3 apic_solve_symmetric(float3 diagonal, float3 off_diagonal,
-                                         float3 rhs)
-{
-  /* Matrix rows: (a,b,c), (b,d,e), (c,e,f). */
-  float a = diagonal.x;
-  float d = diagonal.y;
-  float f = diagonal.z;
-  float b = off_diagonal.x;
-  float c = off_diagonal.y;
-  float e = off_diagonal.z;
-  float determinant = a * (d * f - e * e) - b * (b * f - c * e) +
-                      c * (b * e - c * d);
-  if (abs(determinant) < 1e-8f) {
-    return float3(0.0f);
-  }
-  float3 result;
-  result.x = ((d * f - e * e) * rhs.x + (c * e - b * f) * rhs.y +
-              (b * e - c * d) * rhs.z) / determinant;
-  result.y = ((c * e - b * f) * rhs.x + (a * f - c * c) * rhs.y +
-              (b * c - a * e) * rhs.z) / determinant;
-  result.z = ((b * e - c * d) * rhs.x + (b * c - a * e) * rhs.y +
-              (a * d - b * b) * rhs.z) / determinant;
-  return result;
-}
-
 FLOWX_KERNEL void apic_g2p(FLOWX_CONST_DEVICE float4 *positions [[buffer(BUF_POSITIONS)]],
                            FLOWX_DEVICE float4 *velocities [[buffer(BUF_VELOCITIES)]],
                            FLOWX_DEVICE float4 *affine [[buffer(BUF_AFFINE)]],
@@ -45,9 +20,8 @@ FLOWX_KERNEL void apic_g2p(FLOWX_CONST_DEVICE float4 *positions [[buffer(BUF_POS
     float3 local = (xp - params_lo(P)) / P.grid_spacing - apic_face_offset(axis);
     int3 base = int3(floor(local));
     float component = 0.0f;
-    float3 covariance = float3(0.0f);
-    float3 diagonal = float3(0.0f);
-    float3 off_diagonal = float3(0.0f); /* xy, xz, yz */
+    float3 row = float3(0.0f);
+    float3 frac = local - float3(base);
 
     for (int dz = 0; dz <= 1; ++dz) {
       for (int dy = 0; dy <= 1; ++dy) {
@@ -56,26 +30,28 @@ FLOWX_KERNEL void apic_g2p(FLOWX_CONST_DEVICE float4 *positions [[buffer(BUF_POS
           if (!apic_face_valid(P, node, axis)) {
             continue;
           }
-          float weight = apic_weight(P, xp, node, axis);
-          if (weight <= 0.0f) {
-            continue;
-          }
+          /* Trilinear weight and its gradient. The corner is kept even when its
+           * weight is zero: on a face plane the far corner carries no weight but
+           * still carries a gradient, and dropping it is what made the old
+           * B.D^-1 form singular there (rows of ~27000 1/s). C = sum v grad(w)
+           * equals B.D^-1 wherever D is invertible. Keep in sync with
+           * solver/engine/apic_cpu.py. */
+          float3 w1 = float3(dx ? frac.x : 1.0f - frac.x, dy ? frac.y : 1.0f - frac.y,
+                             dz ? frac.z : 1.0f - frac.z);
+          float3 sign = float3(dx ? 1.0f : -1.0f, dy ? 1.0f : -1.0f, dz ? 1.0f : -1.0f);
+          float weight = w1.x * w1.y * w1.z;
+          float3 grad = sign * float3(w1.y * w1.z, w1.x * w1.z, w1.x * w1.y);
           float value = grid_velocity[apic_node_index(P, node)][axis];
           if (flip) {
             old_velocity[axis] += weight * grid_velocity_old[apic_node_index(P, node)][axis];
           }
-          float3 r = (apic_face_position(P, node, axis) - xp) / P.grid_spacing;
           component += weight * value;
-          covariance += weight * value * r;
-          diagonal += weight * r * r;
-          off_diagonal += weight * float3(r.x * r.y, r.x * r.z, r.y * r.z);
+          row += value * grad;
         }
       }
     }
     particle_velocity[axis] = component;
-    float3 row = apic_solve_symmetric(diagonal, off_diagonal, covariance) /
-                 P.grid_spacing;
-    affine[particle * 3 + axis] = float4(row, 0.0f);
+    affine[particle * 3 + axis] = float4(row / P.grid_spacing, 0.0f);
   }
   if (flip) {
     /* FLIP hands the particle the grid's change rather than the grid's value,

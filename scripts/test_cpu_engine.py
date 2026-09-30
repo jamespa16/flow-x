@@ -214,7 +214,9 @@ def test_apic_projection_residual():
     """The residual-divergence metric, for Jacobi and PCG on the same run.
 
     Recorded baseline (this dam break, fourth substep, 40 iterations):
-    Jacobi leaves 3.0% RMS / 2.0% max of the pre-projection divergence. PCG
+    Jacobi leaves 19% RMS / 17% max of the pre-projection divergence (it was
+    3.0% / 1.2% before G2P's affine rows stopped blowing up on face planes;
+    the projection now sees a real velocity field instead of a noisy one). PCG
     reaches the 1e-3 tolerance in about 20 iterations, and with the tolerance
     at zero runs until its breakdown guard stops it at the float64 floor,
     around 1e-6. The bounds below are loose on both sides of those numbers so
@@ -227,8 +229,8 @@ def test_apic_projection_residual():
     """
     jacobi_rms, jacobi_max, _ = _projection_residual("jacobi")
     print(f"  Jacobi x40 residual: rms {jacobi_rms:.2e}, max {jacobi_max:.2e}")
-    check(0.005 < jacobi_rms < 0.10, f"Jacobi residual {jacobi_rms:.2e} left its baseline")
-    check(0.002 < jacobi_max < 0.10, f"Jacobi max residual {jacobi_max:.2e} left its baseline")
+    check(0.05 < jacobi_rms < 0.40, f"Jacobi residual {jacobi_rms:.2e} left its baseline")
+    check(0.05 < jacobi_max < 0.40, f"Jacobi max residual {jacobi_max:.2e} left its baseline")
 
     pcg_rms, pcg_max, ran = _projection_residual("pcg")
     print(f"  PCG <=40 (tol 1e-3) residual: rms {pcg_rms:.2e}, max {pcg_max:.2e}, {ran} its")
@@ -280,17 +282,35 @@ def _pool_volume_drift(solver, frames=24):
 
 
 def test_apic_pool_volume_drift():
-    """Baseline: Jacobi x40 loses 14% of the pool's fluid cells in one second.
+    """Baseline: Jacobi x40 loses 27% of the pool's fluid cells in one second.
 
     PCG at the default tolerance loses none. The Jacobi bounds bracket the
-    recorded 14% so a regression - or an accidental improvement to the path
-    kept for comparison - shows up.
+    recorded 27% (14% before the affine-row fix) so a regression - or an
+    accidental improvement to the path kept for comparison - shows up.
     """
     jacobi = _pool_volume_drift("jacobi")
     pcg = _pool_volume_drift("pcg")
     print(f"  pool volume drift over 24 frames: Jacobi {jacobi:.1%}, PCG {pcg:.1%}")
-    check(0.05 < jacobi < 0.25, f"Jacobi pool drift {jacobi:.1%} left its baseline")
+    check(0.10 < jacobi < 0.45, f"Jacobi pool drift {jacobi:.1%} left its baseline")
     check(pcg <= 0.01, f"PCG pool lost {pcg:.1%} of its volume")
+
+
+def test_apic_affine_rows_stay_bounded_at_rest():
+    """A pool at rest must stay at rest: its affine rows used to blow up.
+
+    Seeded on a lattice, every particle sits on face planes, where the old
+    B.D^-1 reconstruction was a 0/0 cancellation. The float64 engine kept those
+    inverses: rows reached ~1e4 1/s and the pool reached ~1.4 m/s within two
+    seconds (sane rows are ~10). The gradient form is finite on the plane.
+    """
+    engine = _make_pool("pcg")
+    for _ in range(96):
+        engine.substep(1.0 / 96.0)
+    rows = np.abs(engine.state["affine"][:, :, :3]).max()
+    speed = np.abs(engine.state["velocities"][:, :3]).max()
+    print(f"  resting pool after 1 s: max |C| {rows:.2e} 1/s, max speed {speed:.2e} m/s")
+    check(np.isfinite(rows) and rows < 10.0, f"affine rows blew up: max |C| {rows:.1f}")
+    check(speed < 0.05, f"resting pool accelerated to {speed:.3f} m/s")
 
 
 def _pressure_diagonal(cell_type):
@@ -1089,6 +1109,7 @@ def main():
         ("PBF snapshot continuation is exact", test_pbf_snapshot_continuation_is_exact),
         ("APIC stays finite and bounded", test_apic_stays_finite_and_bounded),
         ("APIC projection residual", test_apic_projection_residual),
+        ("APIC affine rows stay bounded at rest", test_apic_affine_rows_stay_bounded_at_rest),
         ("APIC pool volume drift", test_apic_pool_volume_drift),
         ("APIC PCG sealed regions", test_apic_pcg_sealed_regions),
         ("APIC PCG is deterministic", test_apic_pcg_is_deterministic),
