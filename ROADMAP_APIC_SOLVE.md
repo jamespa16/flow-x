@@ -209,6 +209,11 @@ and restores it exactly.
 
 ### Pre-existing issue found: APIC affine reconstruction
 
+*Fixed afterwards: G2P now uses the gradient form described at the end of this section, on both
+engines. A resting lattice pool stays at rest (max |C| 7e-4 s⁻¹, speed 5e-5 m/s after 1 s,
+against rows of ~1e4 and 1.4 m/s before). Jacobi's dam-break residual (3% → 19%) and pool
+drift (14% → 27%) baselines moved with it; PCG is unaffected. The text below is the diagnosis.*
+
 G2P rebuilds each affine row as B·D⁻¹ with a determinant cutoff of 1e-8. With trilinear
 weights D = diag(f(1−f)), which is singular whenever a particle sits on a face plane, and B·D⁻¹
 is then a near-0/0 cancellation. The float64 CPU engine keeps those inverses; float32 Metal
