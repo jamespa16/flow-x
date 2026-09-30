@@ -60,7 +60,10 @@ class Settings:
     max_substeps = 8
     max_particles = 16000
     apic_pressure_iterations = 40
+    apic_pressure_solver = "PCG"
+    apic_pressure_tolerance = 1e-3
     apic_vorticity_strength = 0.3
+    apic_flip_blend = 0.0
     pbf_relaxation = 100.0
     pbf_scorr_k = 0.1
     viscosity = 0.1
@@ -182,6 +185,26 @@ def test_hash_uses_resolved_identity_and_active_method_settings():
         check(
             cache.config_hash(domain, scene, "apic", "cpu") != apic,
             "an active APIC setting did not invalidate its cache",
+        )
+        # Every APIC solve setting separates caches, so two blends (or two
+        # pressure solvers) never share frames.
+        for name, change in (
+            ("apic_flip_blend", 0.25),
+            ("apic_pressure_tolerance", 1e-4),
+            ("apic_pressure_solver", "JACOBI"),
+        ):
+            before = cache.config_hash(domain, scene, "apic", "cpu")
+            setattr(domain.flowx_domain, name, change)
+            check(
+                cache.config_hash(domain, scene, "apic", "cpu") != before,
+                f"changing {name} did not invalidate an APIC cache",
+            )
+        # Under Jacobi the tolerance is unused, so it must not split caches.
+        before = cache.config_hash(domain, scene, "apic", "cpu")
+        domain.flowx_domain.apic_pressure_tolerance = 1e-2
+        check(
+            cache.config_hash(domain, scene, "apic", "cpu") == before,
+            "the PCG tolerance invalidated a Jacobi cache",
         )
 
         pbf = cache.config_hash(domain, scene, "pbf", "cpu")

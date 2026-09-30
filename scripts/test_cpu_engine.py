@@ -63,6 +63,7 @@ class Config:
         self.iterations = iterations
         self.surface_tension = surface_tension
         self.pressure_iterations = 40
+        self.pressure_solver = "pcg"
         self.vorticity_strength = 0.0
 
 
@@ -143,6 +144,7 @@ def _scene():
         grid_spacing=cell_size,
         vorticity_epsilon=0.0,
         grid_max_speed=0.25 * cell_size / (1.0 / 48.0),
+        pressure_tolerance=1e-3,
     )
     return config, block, seed.ravel()
 
@@ -187,17 +189,196 @@ def test_apic_stays_finite_and_bounded():
     check(p[:, 2].mean() < 0.30, "APIC fluid did not fall")
 
 
-def test_apic_projection_reduces_divergence():
+def _make_apic_solver(solver, iterations=40, tolerance=1e-3):
     engine = _make_apic()
+    engine.config.pressure_solver = solver
+    engine.config.pressure_iterations = iterations
+    engine.params.update(pressure_tolerance=tolerance)
+    return engine
+
+
+def _projection_residual(solver, iterations=40, tolerance=1e-3):
+    """(rms, max) post/pre divergence ratio over fluid cells after 4 substeps."""
+    engine = _make_apic_solver(solver, iterations, tolerance)
     # The first free-surface projection begins from an empty grid and is the
     # hardest. A few normal substeps are a more useful steady-state check.
     for _ in range(4):
         engine.substep(1.0 / 48.0)
-    before = engine.last_divergence_before
-    after = engine.last_divergence_after
-    print(f"  APIC divergence {before:.4f} -> {after:.4f}")
-    check(before > 0.0, "APIC test field had no divergence to project")
-    check(after <= before * 0.10, f"APIC pressure left {after / before:.1%} divergence")
+    check(engine.last_divergence_before > 0.0, "APIC test field had no divergence to project")
+    rms = engine.last_divergence_after / engine.last_divergence_before
+    peak = engine.last_divergence_max_after / engine.last_divergence_max_before
+    return rms, peak, engine.last_pressure_iterations
+
+
+def test_apic_projection_residual():
+    """The residual-divergence metric, for Jacobi and PCG on the same run.
+
+    Recorded baseline (this dam break, fourth substep, 40 iterations):
+    Jacobi leaves 3.0% RMS / 2.0% max of the pre-projection divergence. PCG
+    reaches the 1e-3 tolerance in about 20 iterations, and with the tolerance
+    at zero runs until its breakdown guard stops it at the float64 floor,
+    around 1e-6. The bounds below are loose on both sides of those numbers so
+    that a change in either direction is noticed rather than absorbed.
+
+    Equal wall time favours PCG further: on the CPU engine one PCG iteration
+    over the compact fluid vector costs less than one full-grid Jacobi sweep
+    (about 0.02 ms against 0.09 ms here), so the comparison at equal iteration
+    count is the conservative one.
+    """
+    jacobi_rms, jacobi_max, _ = _projection_residual("jacobi")
+    print(f"  Jacobi x40 residual: rms {jacobi_rms:.2e}, max {jacobi_max:.2e}")
+    check(0.005 < jacobi_rms < 0.10, f"Jacobi residual {jacobi_rms:.2e} left its baseline")
+    check(0.002 < jacobi_max < 0.10, f"Jacobi max residual {jacobi_max:.2e} left its baseline")
+
+    pcg_rms, pcg_max, ran = _projection_residual("pcg")
+    print(f"  PCG <=40 (tol 1e-3) residual: rms {pcg_rms:.2e}, max {pcg_max:.2e}, {ran} its")
+    check(pcg_rms <= 1e-3, f"PCG stopped at rms {pcg_rms:.2e}, above its 1e-3 tolerance")
+    check(ran < 40, f"PCG needed all {ran} iterations to reach 1e-3")
+
+    full_rms, full_max, ran = _projection_residual("pcg", tolerance=0.0)
+    print(f"  PCG x40 (tol 0) residual: rms {full_rms:.2e}, max {full_max:.2e}, {ran} its")
+    # The Phase 2 exit margin: two orders of magnitude below Jacobi at the
+    # same iteration cap, on both norms. Measured margin is about 10^4.
+    check(full_rms < jacobi_rms * 1e-2, "PCG is not clearly better than Jacobi (rms)")
+    check(full_max < jacobi_max * 1e-2, "PCG is not clearly better than Jacobi (max)")
+
+
+def _make_pool(solver, fill=0.4):
+    """A still pool over the whole floor: nothing should move, nothing be lost."""
+    config, block, _ = _scene()
+    xs = np.arange(SPACING * 0.5, 1.0, SPACING)
+    zs = np.arange(SPACING * 0.5, fill, SPACING)
+    grid = np.stack(np.meshgrid(xs, xs, zs, indexing="ij"), axis=-1).reshape(-1, 3)
+    seed = np.zeros((len(grid), 4), dtype=np.float32)
+    seed[:, :3] = grid
+    seed[:, 3] = 1.0
+    config = Config(len(grid), config.cell_dims, config.cell_count)
+    config.pressure_solver = solver
+    block.update(particle_count=config.particle_count, sorted_count=config.sorted_count)
+    engine = apic_cpu.create()
+    engine.params = block
+    engine.allocate(config, seed.ravel())
+    return engine
+
+
+def _pool_volume_drift(solver, frames=24):
+    """Fractional fluid-cell loss of a settled pool over `frames` frames.
+
+    Particle count is fixed, so the cells the solver sees as fluid are its own
+    measure of volume. A weak solve lets the pool compact slowly under gravity,
+    which is the visible symptom: the surface sinks and the top layer of cells
+    empties.
+    """
+    engine = _make_pool(solver)
+    start = None
+    for _ in range(frames):
+        for _ in range(2):
+            engine.substep(1.0 / 48.0)
+        count = int((engine.grid_cell[..., 3] > 0.0).sum())
+        start = count if start is None else start
+    return (start - count) / start
+
+
+def test_apic_pool_volume_drift():
+    """Baseline: Jacobi x40 loses 14% of the pool's fluid cells in one second.
+
+    PCG at the default tolerance loses none. The Jacobi bounds bracket the
+    recorded 14% so a regression - or an accidental improvement to the path
+    kept for comparison - shows up.
+    """
+    jacobi = _pool_volume_drift("jacobi")
+    pcg = _pool_volume_drift("pcg")
+    print(f"  pool volume drift over 24 frames: Jacobi {jacobi:.1%}, PCG {pcg:.1%}")
+    check(0.05 < jacobi < 0.25, f"Jacobi pool drift {jacobi:.1%} left its baseline")
+    check(pcg <= 0.01, f"PCG pool lost {pcg:.1%} of its volume")
+
+
+def _pressure_diagonal(cell_type):
+    """Per-cell count of non-solid neighbours: the pressure matrix's diagonal."""
+    padded = np.pad(cell_type, 1, constant_values=-1.0)
+    diagonal = np.zeros(cell_type.shape)
+    for axis in range(3):
+        for shift in (-1, 1):
+            diagonal += np.roll(padded, shift, axis=axis)[1:-1, 1:-1, 1:-1] >= 0.0
+    return np.where(cell_type > 0.0, diagonal, 0.0)
+
+
+def _sealed_projection(cell_type, seed=7):
+    """Project a random face field through `cell_type` with PCG; return the engine."""
+    engine = _make_transfer_apic()
+    engine.config.pressure_solver = "pcg"
+    engine.config.pressure_iterations = 200
+    engine.params.update(pressure_tolerance=1e-5)
+    rng = np.random.default_rng(seed)
+    engine.grid_velocity[..., :3] = rng.uniform(-1.0, 1.0, engine.grid_velocity[..., :3].shape)
+    engine.grid_cell[..., 3] = cell_type
+    engine._apply_solid_faces(cell_type)
+    engine._project(1.0 / 48.0, cell_type)
+    return engine
+
+
+def test_apic_pcg_sealed_regions():
+    """A fluid region with no air cell makes the pressure matrix singular.
+
+    Its null vector is a constant pressure over the region, and the right-hand
+    side is consistent with it only up to roundoff (the divergence of a field
+    with every boundary face zeroed sums to zero exactly, in exact arithmetic).
+    Starting from zero keeps the Krylov iterates in the preconditioned range,
+    and the breakdown guard stops the solve instead of dividing by a vanishing
+    p.Ap once the range part is exhausted. Both cases here - the whole domain
+    full, and a sealed tank beside an open pool - must converge, stay finite,
+    and not pick up a drifting constant.
+
+    "No constant" is measured with the diagonal as weight: with the diagonal
+    preconditioner every iterate lies in D^-1 range(A), and range(A) is the
+    zero-sum vectors, so sum(D p) over a sealed region stays zero while the
+    plain mean need not.
+    """
+    dims = (8, 8, 8)
+    full = np.ones(dims, dtype=np.float32)
+    engine = _sealed_projection(full)
+    pressure = engine.grid_cell[..., 1]
+    weights = _pressure_diagonal(full)
+    offset = abs((weights * pressure).sum()) / (weights * np.abs(pressure)).sum()
+    ratio = engine.last_divergence_after / engine.last_divergence_before
+    print(
+        f"  sealed box: residual {ratio:.2e} in {engine.last_pressure_iterations} its, "
+        f"weighted mean p {offset:.2e} of mean |p|"
+    )
+    check(np.isfinite(pressure).all(), "sealed box pressure is not finite")
+    check(ratio < 1e-3, f"sealed box kept {ratio:.2e} of its divergence")
+    check(offset < 1e-4, "sealed box pressure picked up a constant offset")
+
+    # A tank: a solid shell around a fluid-filled interior, with an open pool
+    # (air above it) in the rest of the domain.
+    tank = np.zeros(dims, dtype=np.float32)
+    tank[:4] = 1.0
+    tank[0:6, 0:6, 0:6] = -1.0
+    tank[1:5, 1:5, 1:5] = 1.0
+    engine = _sealed_projection(tank, seed=11)
+    ratio = engine.last_divergence_after / engine.last_divergence_before
+    pressure = engine.grid_cell[..., 1]
+    weights = _pressure_diagonal(tank)
+    inside = weights[1:5, 1:5, 1:5] * pressure[1:5, 1:5, 1:5]
+    offset = abs(inside.sum()) / np.abs(inside).sum()
+    print(
+        f"  sealed tank + open pool: residual {ratio:.2e} in "
+        f"{engine.last_pressure_iterations} its, tank weighted mean p {offset:.2e}"
+    )
+    check(np.isfinite(pressure).all(), "sealed tank pressure is not finite")
+    check(ratio < 1e-3, f"sealed tank kept {ratio:.2e} of its divergence")
+    check(offset < 1e-4, "sealed tank pressure picked up a constant offset")
+
+
+def test_apic_pcg_is_deterministic():
+    """Two identical runs agree bit for bit: cached scrubbing depends on it."""
+    runs = []
+    for _ in range(2):
+        engine = _make_apic_solver("pcg")
+        _run(engine, frames=3)
+        runs.append(engine.snapshot_state())
+    for key in ("positions", "velocities", "affine"):
+        check(runs[0][key] == runs[1][key], f"PCG run changed {key} between identical runs")
 
 
 def _make_transfer_apic(points_per_axis=4):
@@ -236,6 +417,7 @@ def _make_transfer_apic(points_per_axis=4):
         boundary_damping=0.0,
         grid_max_speed=100.0,
         vorticity_epsilon=0.0,
+        pressure_tolerance=1e-3,
     )
     engine = apic_cpu.create()
     engine.params = block
@@ -287,8 +469,9 @@ def test_apic_transfer_preserves_translation_and_rotation():
     )
 
 
-def test_apic_rotating_block_holds_angular_momentum():
+def test_apic_rotating_block_holds_angular_momentum(blend=0.0):
     engine = _make_transfer_apic(points_per_axis=4)
+    engine.params.update(flip_blend=blend)
     points = _positions(engine)
     center = points.mean(axis=0)
     omega = 0.4
@@ -307,7 +490,7 @@ def test_apic_rotating_block_holds_angular_momentum():
         engine.substep(1.0 / 240.0)
     after = momentum()
     drift = abs(after - before) / before
-    print(f"  rotating-block angular momentum drift {drift:.2%}")
+    print(f"  rotating-block angular momentum drift {drift:.2%} at FLIP blend {blend}")
     check(drift < 0.05, f"APIC angular momentum drifted {drift:.2%} over 300 steps")
 
 
@@ -410,6 +593,83 @@ def test_apic_snapshot_continuation_is_exact():
             np.array_equal(np.asarray(uninterrupted[key]), np.asarray(continued[key])),
             f"restored APIC continuation changed {key}",
         )
+
+
+def test_apic_flip_snapshot_continuation_is_exact():
+    """FLIP moves advection to the end of the substep and persists nothing new.
+
+    The carried velocity is the stored velocity and the grid field it moves
+    by is rebuilt inside the substep, so a restored frame must still continue
+    exactly as the uninterrupted run did.
+    """
+    runs = []
+    original = _make_apic()
+    original.params.update(flip_blend=0.5)
+    _run(original, frames=2, substeps=1)
+    checkpoint = original.snapshot_state()
+    original.substep(1.0 / 48.0)
+    runs.append(original.snapshot_state())
+
+    resumed = _make_apic()
+    resumed.params.update(flip_blend=0.5)
+    resumed.restore_state(checkpoint)
+    resumed.substep(1.0 / 48.0)
+    runs.append(resumed.snapshot_state())
+    for key in ("positions", "velocities", "affine"):
+        check(
+            np.array_equal(np.asarray(runs[0][key]), np.asarray(runs[1][key])),
+            f"restored FLIP continuation changed {key}",
+        )
+
+
+def test_apic_flip_blend_zero_is_apic():
+    """Blend 0 must not read anything FLIP added: it is APIC, bit for bit.
+
+    Poisons the saved pre-force grid velocity with NaN every substep; a blend-0
+    run that so much as multiplied it by zero would come out NaN.
+    """
+    clean = _make_apic()
+    poisoned = _make_apic()
+    normalise = poisoned._normalise_and_force
+
+    def poisoned_normalise(dt):
+        normalise(dt)
+        poisoned.grid_velocity_old.fill(np.nan)
+
+    poisoned._normalise_and_force = poisoned_normalise
+    _run(clean, frames=3)
+    _run(poisoned, frames=3)
+    a, b = clean.snapshot_state(), poisoned.snapshot_state()
+    for key in ("positions", "velocities", "affine"):
+        check(a[key] == b[key], f"blend 0 depends on the FLIP grid copy ({key})")
+
+
+def _dam_break_summary(blend, frames=24):
+    engine = _make_apic()
+    engine.params.update(flip_blend=blend)
+    _run(engine, frames=frames)
+    velocity = engine.state["velocities"][:, :3]
+    fluid = int((engine.grid_cell[..., 3] > 0.0).sum())
+    return engine, fluid, velocity
+
+
+def test_apic_flip_dam_break_holds_volume():
+    """FLIP at the recommended blends stays finite and keeps the fluid's volume.
+
+    Before advection moved to the grid field, a pure-FLIP dam break lost half
+    its fluid cells in a second as particles clumped against the floor; this
+    is the regression check for that. The comparison is against APIC's own
+    count at the same frame, since a settled dam break legitimately has fewer
+    fluid cells than the block it started as.
+    """
+    _engine, apic_cells, _velocity = _dam_break_summary(0.0)
+    for blend in (0.25, 0.5, 1.0):
+        _engine, cells, velocity = _dam_break_summary(blend)
+        speed = float(np.linalg.norm(velocity, axis=1).max())
+        print(f"  blend {blend:.2f}: {cells} fluid cells (APIC {apic_cells}), peak {speed:.2f} m/s")
+        check(np.isfinite(velocity).all(), f"FLIP blend {blend} produced NaN or inf")
+        check(cells >= 0.85 * apic_cells, f"FLIP blend {blend} lost volume: {cells} cells")
+        check(speed < 10.0, f"FLIP blend {blend} blew up to {speed:.1f} m/s")
 
 
 def test_pbf_snapshot_continuation_is_exact():
@@ -611,29 +871,34 @@ def test_apic_agrees_with_metal_and_projects():
         return
 
     metal_type = load("solver.engine.apic_metal").ApicMetalEngine
-    gpu = metal_type(backend)
-    config, block, seed = _scene()
-    gpu.params = block
-    gpu.allocate(config, seed)
-    gpu.set_collider(None, (1, 1, 1), 0.0)
-    cpu = _make_apic()
+    for solver, blend in (("jacobi", 0.0), ("pcg", 0.0), ("pcg", 0.5)):
+        gpu = metal_type(backend)
+        config, block, seed = _scene()
+        config.pressure_solver = solver
+        block.update(flip_blend=blend)
+        gpu.params = block
+        gpu.allocate(config, seed)
+        gpu.set_collider(None, (1, 1, 1), 0.0)
+        cpu = _make_apic_solver(solver)
+        cpu.params.update(flip_blend=blend)
 
-    for _ in range(2):
         for _ in range(2):
-            gpu.substep(1.0 / 48.0)
-            cpu.substep(1.0 / 48.0)
-        gpu.flush()
+            for _ in range(2):
+                gpu.substep(1.0 / 48.0)
+                cpu.substep(1.0 / 48.0)
+            gpu.flush()
 
-    a = np.asarray(gpu.read_vec4("positions", config.particle_count))[:, :3]
-    b = _positions(cpu)
-    centroid = np.abs(a.mean(axis=0) - b.mean(axis=0)).max()
-    bounds = max(
-        np.abs(a.min(axis=0) - b.min(axis=0)).max(),
-        np.abs(a.max(axis=0) - b.max(axis=0)).max(),
-    )
-    print(f"  APIC centroid delta {centroid:.4f} m, bounds delta {bounds:.4f} m")
-    check(centroid < 0.02, f"APIC CPU/Metal centroid drift is {centroid:.4f} m")
-    check(bounds < 0.10, f"APIC CPU/Metal bounds drift is {bounds:.4f} m")
+        a = np.asarray(gpu.read_vec4("positions", config.particle_count))[:, :3]
+        b = _positions(cpu)
+        centroid = np.abs(a.mean(axis=0) - b.mean(axis=0)).max()
+        bounds = max(
+            np.abs(a.min(axis=0) - b.min(axis=0)).max(),
+            np.abs(a.max(axis=0) - b.max(axis=0)).max(),
+        )
+        label = f"{solver}, FLIP {blend}"
+        print(f"  APIC {label}: centroid delta {centroid:.4f} m, bounds delta {bounds:.4f} m")
+        check(centroid < 0.02, f"APIC {label} CPU/Metal centroid drift is {centroid:.4f} m")
+        check(bounds < 0.10, f"APIC {label} CPU/Metal bounds drift is {bounds:.4f} m")
 
     # A single fluid cell with a divergent face field has an exact pressure
     # solution and isolates the Metal Jacobi/projection chain from transfers.
@@ -719,6 +984,99 @@ def test_apic_agrees_with_metal_and_projects():
     check(snapshot["affine"] == restored["affine"], "Metal APIC affine state did not round-trip")
 
 
+def test_apic_pcg_agrees_with_metal():
+    """The Metal PCG chain against the numpy one, on the same grid problem.
+
+    Both solve the pressure system for one divergence field and one cell
+    classification - taken from a real dam-break substep, with a solid block
+    added so walls, solids and air all appear in the stencil - and the
+    pressure fields are compared directly, which isolates the solve from the
+    transfers around it. The CPU runs in float64 and Metal in float32, so they
+    are not expected to agree to the bit, and near the tolerance they could
+    stop an iteration apart. Measured: the same iteration, and pressures within
+    4e-7 of their peak. The bounds leave a decade of room over that.
+
+    Also: repeated Metal solves are bit-identical (the reduction order is
+    fixed), and a Metal projection with PCG pressure removes the divergence of
+    the single-cell fixture the Jacobi check uses, far past Jacobi's 90%.
+    """
+    backend_pkg = load("solver.backend")
+    backend = backend_pkg.select()
+    if backend is None:
+        print("  skipped: no GPU device on this machine")
+        return
+
+    cpu = _make_apic_solver("pcg")
+    for _ in range(4):
+        cpu.substep(1.0 / 48.0)
+    cell_type = cpu.grid_cell[..., 3].copy()
+    cell_type[2:4, 3:6, 3:6] = -1.0
+    divergence = cpu.grid_cell[..., 0].copy()
+    divergence[cell_type <= 0.0] = 0.0
+    dt = 1.0 / 48.0
+
+    gpu = load("solver.engine.apic_metal").ApicMetalEngine(backend)
+    config, block, seed = _scene()
+    gpu.params = block
+    gpu.allocate(config, seed)
+    gpu.set_collider(None, (1, 1, 1), 0.0)
+    gpu.params.update(dt=dt)
+    cells = np.frombuffer(gpu.buffers["grid_scratch"].map(), dtype=np.float32).reshape(
+        config.cell_count, 4
+    )
+
+    rhs = REST_DENSITY * SPACING * 2.0 * SPACING * 2.0 * divergence / dt
+    want = cpu._solve_pcg(rhs.astype(np.float32), cell_type).ravel()
+    want_iterations = cpu.last_pressure_iterations
+
+    solutions = []
+    for _ in range(3):
+        cells[:] = 0.0
+        cells[:, 0] = divergence.ravel()
+        cells[:, 3] = cell_type.ravel()
+        gpu.record_pcg()
+        gpu.flush()
+        solutions.append(cells[:, 1].copy())
+    iterations, _rr = gpu.pcg_stats()
+    got = solutions[0]
+    error = float(np.abs(got - want).max() / np.abs(want).max())
+    print(
+        f"  PCG pressure CPU/Metal relative error {error:.1e}; "
+        f"iterations CPU {want_iterations}, Metal {iterations}"
+    )
+    check(
+        all(np.array_equal(got, other) for other in solutions[1:]),
+        "repeated Metal PCG solves differ",
+    )
+    check(abs(iterations - want_iterations) <= 1, "Metal PCG stopped far from the CPU solve")
+    check(error < 1e-5, f"Metal PCG pressure differs from the CPU by {error:.1e} of peak")
+
+    # The single-cell fixture from the Jacobi check, through PCG.
+    nx, ny, nz = config.cell_dims
+    nodes = (nx + 1) * (ny + 1) * (nz + 1)
+    velocity = np.frombuffer(gpu.buffers["grid_velocity"].map(), dtype=np.float32).reshape(nodes, 4)
+    velocity.fill(0.0)
+    cells.fill(0.0)
+    center = (nx // 2, ny // 2, nz // 2)
+    center_cell = (center[2] * ny + center[1]) * nx + center[0]
+
+    def node_index(c):
+        return (c[2] * (ny + 1) + c[1]) * (nx + 1) + c[0]
+
+    cells[center_cell, 3] = 1.0
+    velocity[node_index((center[0] + 1, center[1], center[2])), 0] = 1.0
+    gpu.record("apic_divergence", config.cell_count)
+    gpu.flush()
+    before = abs(float(cells[center_cell, 0]))
+    gpu.record_pcg()
+    gpu.record("apic_project", nodes, pressure_ping=0)
+    gpu.record("apic_divergence", config.cell_count)
+    gpu.flush()
+    after = abs(float(cells[center_cell, 0]))
+    print(f"  Metal PCG fixture divergence {before:.4f} -> {after:.2e}")
+    check(after <= before * 1e-3, "Metal PCG projection left too much divergence")
+
+
 def main():
     tests = [
         ("dam break stays finite", test_dam_break_stays_finite),
@@ -730,7 +1088,10 @@ def main():
         ("whitewater spawns and expires", test_whitewater_spawns_and_expires),
         ("PBF snapshot continuation is exact", test_pbf_snapshot_continuation_is_exact),
         ("APIC stays finite and bounded", test_apic_stays_finite_and_bounded),
-        ("APIC projection reduces divergence", test_apic_projection_reduces_divergence),
+        ("APIC projection residual", test_apic_projection_residual),
+        ("APIC pool volume drift", test_apic_pool_volume_drift),
+        ("APIC PCG sealed regions", test_apic_pcg_sealed_regions),
+        ("APIC PCG is deterministic", test_apic_pcg_is_deterministic),
         (
             "APIC transfer preserves translation and rotation",
             test_apic_transfer_preserves_translation_and_rotation,
@@ -740,6 +1101,13 @@ def main():
             test_apic_rotating_block_holds_angular_momentum,
         ),
         (
+            "APIC rotating block at the top recommended FLIP blend",
+            lambda: test_apic_rotating_block_holds_angular_momentum(blend=0.5),
+        ),
+        ("APIC FLIP blend 0 is APIC", test_apic_flip_blend_zero_is_apic),
+        ("APIC FLIP dam break holds volume", test_apic_flip_dam_break_holds_volume),
+        ("APIC FLIP continuation is exact", test_apic_flip_snapshot_continuation_is_exact),
+        (
             "APIC confinement clamps every face component",
             test_apic_confinement_clamps_each_face_component,
         ),
@@ -747,6 +1115,7 @@ def main():
         ("APIC snapshot continuation is exact", test_apic_snapshot_continuation_is_exact),
         ("agrees with the GPU engine", test_agrees_with_the_gpu_engine),
         ("APIC agrees with Metal and projects", test_apic_agrees_with_metal_and_projects),
+        ("APIC PCG agrees with Metal", test_apic_pcg_agrees_with_metal),
     ]
     failures = 0
     for name, run in tests:

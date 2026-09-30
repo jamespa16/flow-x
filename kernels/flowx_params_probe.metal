@@ -31,4 +31,7 @@ FLOWX_KERNEL void flowx_params_probe(FLOWX_DEVICE uint *out [[buffer(0)]],
   out[12] = uint((FLOWX_CONSTANT char *)&P.vorticity_epsilon - base);
   out[13] = uint((FLOWX_CONSTANT char *)&P.grid_max_speed - base);
   out[14] = uint((FLOWX_CONSTANT char *)&P.pressure_ping - base);
+  out[15] = uint((FLOWX_CONSTANT char *)&P.pcg_stage - base);
+  out[16] = uint((FLOWX_CONSTANT char *)&P.pressure_tolerance - base);
+  out[17] = uint((FLOWX_CONSTANT char *)&P.flip_blend - base);
 }

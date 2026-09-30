@@ -26,7 +26,9 @@ FLOWX_INLINE float3 apic_solve_symmetric(float3 diagonal, float3 off_diagonal,
 FLOWX_KERNEL void apic_g2p(FLOWX_CONST_DEVICE float4 *positions [[buffer(BUF_POSITIONS)]],
                            FLOWX_DEVICE float4 *velocities [[buffer(BUF_VELOCITIES)]],
                            FLOWX_DEVICE float4 *affine [[buffer(BUF_AFFINE)]],
+                           FLOWX_DEVICE float4 *motion [[buffer(BUF_DELTA)]],
                            FLOWX_CONST_DEVICE float4 *grid_velocity [[buffer(BUF_GRID_VELOCITY)]],
+                           FLOWX_CONST_DEVICE float4 *grid_velocity_old [[buffer(BUF_GRID_VELOCITY_OLD)]],
                            FLOWX_CONSTANT Params &P [[buffer(BUF_PARAMS)]],
                            FLOWX_TID)
 {
@@ -36,6 +38,8 @@ FLOWX_KERNEL void apic_g2p(FLOWX_CONST_DEVICE float4 *positions [[buffer(BUF_POS
   }
   float3 xp = positions[particle].xyz;
   float3 particle_velocity = float3(0.0f);
+  float3 old_velocity = float3(0.0f);
+  bool flip = P.flip_blend > 0.0f;
 
   for (int axis = 0; axis < 3; ++axis) {
     float3 local = (xp - params_lo(P)) / P.grid_spacing - apic_face_offset(axis);
@@ -57,6 +61,9 @@ FLOWX_KERNEL void apic_g2p(FLOWX_CONST_DEVICE float4 *positions [[buffer(BUF_POS
             continue;
           }
           float value = grid_velocity[apic_node_index(P, node)][axis];
+          if (flip) {
+            old_velocity[axis] += weight * grid_velocity_old[apic_node_index(P, node)][axis];
+          }
           float3 r = (apic_face_position(P, node, axis) - xp) / P.grid_spacing;
           component += weight * value;
           covariance += weight * value * r;
@@ -69,6 +76,19 @@ FLOWX_KERNEL void apic_g2p(FLOWX_CONST_DEVICE float4 *positions [[buffer(BUF_POS
     float3 row = apic_solve_symmetric(diagonal, off_diagonal, covariance) /
                  P.grid_spacing;
     affine[particle * 3 + axis] = float4(row, 0.0f);
+  }
+  if (flip) {
+    /* FLIP hands the particle the grid's change rather than the grid's value,
+     * which keeps detail the grid is too coarse to hold - and the noise that
+     * comes with it, hence a blend. The affine rows stay APIC's. Behind a
+     * branch, not a multiply by zero, so blend 0 is exactly APIC.
+     *
+     * The grid's own value is kept in the (PBF-only) delta buffer for the
+     * advection that follows this pass: positions move through the grid
+     * field, not the carried velocity. See ApicMetalEngine.substep. */
+    motion[particle] = float4(particle_velocity, 0.0f);
+    float3 flip_velocity = velocities[particle].xyz + particle_velocity - old_velocity;
+    particle_velocity = mix(particle_velocity, flip_velocity, P.flip_blend);
   }
   velocities[particle] = float4(particle_velocity, 0.0f);
 }

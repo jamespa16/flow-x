@@ -90,6 +90,9 @@ PARAMS_FIELDS = (
     ("vorticity_epsilon", "f"),
     ("grid_max_speed", "f"),
     ("pressure_ping", "i"),
+    ("pcg_stage", "i"),
+    ("pressure_tolerance", "f"),
+    ("flip_blend", "f"),
 )
 
 # "<" - explicit little-endian and no padding. Every field is 4 bytes, so this

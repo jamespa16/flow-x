@@ -188,7 +188,10 @@ class SolverConfig:
         "max_substeps",
         "iterations",
         "pressure_iterations",
+        "pressure_solver",
+        "pressure_tolerance",
         "vorticity_strength",
+        "flip_blend",
     )
 
     @property
@@ -242,7 +245,10 @@ def _resolve_config(domain):
     config.max_substeps = settings.max_substeps
     config.max_particles = settings.max_particles
     config.pressure_iterations = settings.apic_pressure_iterations
+    config.pressure_solver = settings.apic_pressure_solver.lower()
+    config.pressure_tolerance = settings.apic_pressure_tolerance
     config.vorticity_strength = settings.apic_vorticity_strength
+    config.flip_blend = settings.apic_flip_blend
 
     # One knob sizes the simulation: particles seed one per voxel of the
     # domain's `resolution` lattice, and the SPH kernel follows the spacing -
@@ -387,6 +393,8 @@ def _sync_params(config, dt):
         vorticity_epsilon=config.vorticity_strength,
         grid_max_speed=CFL_FACTOR * config.cell_size / max(dt, 1e-6),
         pressure_ping=0,
+        pressure_tolerance=config.pressure_tolerance,
+        flip_blend=config.flip_blend,
     )
     _sync_collider()
 

@@ -6,16 +6,16 @@ The implementation follows the [staggered MAC APIC formulation](https://www.cs.u
 
 ## Per-substep algorithm
 
-1. Advect particles with the previous projected velocity, recover collider penetration, clamp the domain, and mirror positions into `predicted`.
+1. Advect particles with the previous projected velocity, recover collider penetration, clamp the domain, and mirror positions into `predicted`. (With a FLIP blend above 0 this step moves to the end of the substep; see `ROADMAP_APIC_SOLVE.md`.)
 2. Rebuild the particle hash.
 3. Deterministically gather mass and affine momentum to staggered MAC faces.
-4. Normalize velocity, apply gravity and the grid CFL clamp.
+4. Normalize velocity, keep a capped pre-gravity copy for FLIP, apply gravity and the grid CFL clamp.
 5. Optionally compute curl and apply vorticity confinement.
 6. Apply solid/domain no-penetration conditions.
 7. Classify solid, fluid, and air pressure cells and compute divergence.
-8. Run weighted Jacobi (`omega = 2/3`) with 40 iterations by default.
+8. Solve for pressure: diagonally preconditioned CG by default (up to 40 iterations, early exit at a relative-residual tolerance), or weighted Jacobi (`omega = 2/3`).
 9. Apply the pressure gradient and solid-face conditions.
-10. Gather projected velocities back to particles and reconstruct three padded affine rows.
+10. Gather projected velocities back to particles and reconstruct three padded affine rows, blending in FLIP's velocity change when the blend is above 0.
 
 The pressure cell dimensions equal the particle-hash dimensions. MAC arrays use a padded `(nx+1) x (ny+1) x (nz+1)` allocation with component-specific valid face regions. P2G is a face-owned gather rather than a float-atomic scatter, preserving deterministic cache replay.
 
@@ -29,7 +29,11 @@ Buffer slots 0–13 retain the PBF/surface/whitewater layout. APIC uses:
 - 17: packed MAC face velocity
 - 18: cell curl and magnitude
 - 19: divergence, pressure ping/pong, and cell type
-- 20: `Params`
+- 20: pre-force MAC face velocity (FLIP's reference)
+- 21: PCG per-cell vectors (residual, direction, A·direction, diagonal)
+- 22: PCG per-threadgroup partial sums
+- 23: PCG scalars (see `PCG_*` in `apic_common.h`)
+- 24: `Params`
 
 PBF and APIC compile separate Metal libraries, so an APIC compilation failure cannot prevent PBF from starting. Auto selection falls back only across devices for the selected method; it never substitutes PBF for APIC.
 
@@ -39,11 +43,11 @@ Cache v4 records the method, resolved device, extension version, state flags, pa
 
 ## Validation
 
-Standalone coverage includes bounded dam-break motion, 90% pressure-divergence reduction, translation/affine transfer invariants, less than 5% rotating-block angular-momentum drift over 300 steps, collider response, surface extraction, whitewater lifecycle, exact snapshot continuation, cache-v4 round trips, and optional Metal compilation/agreement tests. `scripts/smoke_test.py` exercises both methods in Blender and `scripts/golden.py` records method and device separately.
+Standalone coverage includes bounded dam-break motion, the pressure residual and pool volume drift for both solvers, sealed-region PCG, translation/affine transfer invariants, less than 5% rotating-block angular-momentum drift over 300 steps, collider response, surface extraction, whitewater lifecycle, exact snapshot continuation, cache-v4 round trips, and optional Metal compilation/agreement tests. `scripts/smoke_test.py` exercises both methods in Blender and `scripts/golden.py` records method and device separately.
 
 ## Deferred work
 
-- FLIP blending and PCG pressure solving
+- ~~FLIP blending and PCG pressure solving~~ - done, see `ROADMAP_APIC_SOLVE.md`
 - particle reseeding/remeshing
 - collider velocity transfer and two-way coupling
 - APIC viscosity and surface tension

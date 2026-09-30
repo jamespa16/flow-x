@@ -6,13 +6,15 @@ gone, so the reference has to be captured first and compared later.
 
     blender --background <scene.blend> --python scripts/golden.py -- \
         dump|compare <path.npz> [frames] [--whitewater] \
-        [--method=pbf|apic] [--engine=cpu|metal]
+        [--method=pbf|apic] [--engine=cpu|metal] \
+        [--pressure=pcg|jacobi] [--flip-blend=<0..1>]
 
 `--method=` selects the solver method (PBF by default); references from one
-method are never comparable with the other. `--engine=` pins the device instead
-of letting it pick. A dump records method and device separately, and a
-comparison against the same method on a *different* device drops the strict
-per-particle window automatically.
+method are never comparable with the other. `--pressure=` and `--flip-blend=`
+pin APIC's pressure solver and FLIP blend instead of taking the scene's.
+`--engine=` pins the device instead of letting it pick. A dump records method
+and device separately, and a comparison against the same method on a
+*different* device drops the strict per-particle window automatically.
 
 `--whitewater` turns the domain's whitewater on for the run. The shipped demo
 scenes leave it off (it is off by default - see domain/__init__.py), so without
@@ -91,12 +93,13 @@ def _solver():
     return sph, surface, whitewater
 
 
-def _run(frames, want_whitewater=False, engine=None, method=None):
+def _run(frames, want_whitewater=False, engine=None, method=None, apic=None):
     """Seed the scene's domain and step `frames` frames, yielding per-frame data."""
     sph, surface, whitewater = _solver()
     scene = bpy.context.scene
+    apic = apic or {}
 
-    if engine is not None or method is not None or want_whitewater:
+    if engine is not None or method is not None or want_whitewater or apic:
         from bl_ext.user_default.flow_x.domain import find_domain
 
         domain = find_domain(scene)
@@ -113,6 +116,8 @@ def _run(frames, want_whitewater=False, engine=None, method=None):
         # when it decides whether to bring the pool up, not per frame.
         if want_whitewater:
             domain.flowx_domain.show_whitewater = True
+        for name, value in apic.items():
+            setattr(domain.flowx_domain, name, value)
 
     bpy.ops.flowx.sph_toggle()
     if not sph.is_running():
@@ -137,9 +142,9 @@ def _run(frames, want_whitewater=False, engine=None, method=None):
         }
 
 
-def dump(path, frames, want_whitewater=False, engine=None, method=None):
+def dump(path, frames, want_whitewater=False, engine=None, method=None, apic=None):
     out = {}
-    for i, frame in enumerate(_run(frames, want_whitewater, engine, method)):
+    for i, frame in enumerate(_run(frames, want_whitewater, engine, method, apic)):
         out[f"pos_{i}"] = frame["pos"]
         out[f"vel_{i}"] = frame["vel"]
         out[f"counts_{i}"] = np.asarray(
@@ -186,7 +191,7 @@ def _aggregates(pos, vel):
     }
 
 
-def compare(path, frames, want_whitewater=False, engine=None, method=None):
+def compare(path, frames, want_whitewater=False, engine=None, method=None, apic=None):
     ref = np.load(path)
     available = int(ref["frames"][0])
     if frames > available:
@@ -202,7 +207,7 @@ def compare(path, frames, want_whitewater=False, engine=None, method=None):
     failures = []
     strict_frames = STRICT_FRAMES
     hist_frac, speed_rtol = HIST_FRAC, SPEED_RTOL
-    for i, frame in enumerate(_run(frames, want_whitewater, engine, method)):
+    for i, frame in enumerate(_run(frames, want_whitewater, engine, method, apic)):
         if i == 0:
             running = _engine_identity()
             if reference_method not in ("unknown", running["method"]):
@@ -276,15 +281,24 @@ def main():
     want_whitewater = "--whitewater" in argv
     engine = next((a.split("=", 1)[1] for a in argv if a.startswith("--engine=")), None)
     method = next((a.split("=", 1)[1] for a in argv if a.startswith("--method=")), None)
+    apic = {}
+    pressure = next((a.split("=", 1)[1] for a in argv if a.startswith("--pressure=")), None)
+    if pressure is not None:
+        if pressure.lower() not in ("pcg", "jacobi"):
+            raise SystemExit(f"unknown pressure solver {pressure!r}; expected pcg or jacobi")
+        apic["apic_pressure_solver"] = pressure.upper()
+    blend = next((a.split("=", 1)[1] for a in argv if a.startswith("--flip-blend=")), None)
+    if blend is not None:
+        apic["apic_flip_blend"] = float(blend)
     argv = [a for a in argv if not a.startswith("--")]
     mode, path = argv[0], Path(argv[1]).resolve()
     frames = int(argv[2]) if len(argv) > 2 else DEFAULT_FRAMES
 
     _enable()
     if mode == "dump":
-        dump(path, frames, want_whitewater, engine, method)
+        dump(path, frames, want_whitewater, engine, method, apic)
     elif mode == "compare":
-        compare(path, frames, want_whitewater, engine, method)
+        compare(path, frames, want_whitewater, engine, method, apic)
     else:
         raise SystemExit(f"unknown mode {mode!r}")
 

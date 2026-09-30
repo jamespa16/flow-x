@@ -13,9 +13,12 @@ runner or a checkout with no bin/ built is not a broken backend.
 """
 
 import ctypes
+import math
 import struct
 import sys
 from pathlib import Path
+
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from flowx_standalone import load  # noqa: E402
@@ -23,6 +26,7 @@ from flowx_standalone import load  # noqa: E402
 backend_pkg = load("solver.backend")
 engine_kernels = load("solver.engine.kernels")
 engine_params = load("solver.engine.params")
+metal_engine = load("solver.engine.metal_engine")
 
 # A single library holding every kernel the tests need. Kept in one string so a
 # compile failure is reported once, with line numbers that match what is here.
@@ -265,7 +269,7 @@ def test_params_layout(backend):
         )
     )
     program = backend.program(source)
-    count = 15
+    count = 18
     out = backend.buffer(count * 4)
     queue = backend.queue()
     queue.dispatch(
@@ -274,7 +278,7 @@ def test_params_layout(backend):
         1,
         [out],
         constants=engine_params.ParamBlock().pack(),
-        constants_index=20,
+        constants_index=metal_engine.PARAMS_INDEX,
     )
     queue.commit()
     got = struct.unpack(f"<{count}I", bytes(out.map()))
@@ -293,11 +297,83 @@ def test_params_layout(backend):
         "vorticity_epsilon",
         "grid_max_speed",
         "pressure_ping",
+        "pcg_stage",
+        "pressure_tolerance",
+        "flip_blend",
     )
     expected = (engine_params.PARAMS_SIZE,) + tuple(
         engine_params.offset_of(name) for name in fields
     )
     check(got == expected, f"Params layout is {got}, expected {expected}")
+
+
+def _tree_sum(lanes):
+    """Emulate the kernels' fixed-order group tree (flowx_group_sum) in float32."""
+    lanes = np.array(lanes, dtype=np.float32)
+    stride = len(lanes) // 2
+    while stride:
+        lanes[:stride] += lanes[stride : 2 * stride]
+        stride //= 2
+    return lanes[0]
+
+
+def test_deterministic_reduction(backend):
+    """The PCG dot products: a fixed two-level tree, reproducible to the bit.
+
+    Drives the real kernels. apic_pcg_update with alpha = 0 leaves its inputs
+    alone and reduces r.r per group; apic_pcg_reduce then sums the groups. The
+    result must be bit-identical run to run, and bit-identical to a float32
+    emulation of the same order - which is the proof that the order is fixed
+    by lane indices and not by scheduling. A float-atomic sum would pass
+    neither check reliably, and a cache scrubbed across such a sum would
+    replay differently from the run that wrote it.
+    """
+    group = metal_engine.GROUP_SIZE
+    cells = group * 300 + 17  # more groups than lanes, and a ragged last group
+    groups = -(-cells // group)
+    program = backend.program(engine_kernels.library_source(engine_kernels.APIC_ALL_PASSES))
+    update = program.kernel("apic_pcg_update")
+    reduce = program.kernel("apic_pcg_reduce")
+
+    rng = np.random.default_rng(3)
+    residual = rng.standard_normal(cells).astype(np.float32) * np.float32(1e3)
+    pcg = np.zeros((cells, 4), dtype=np.float32)
+    pcg[:, 0] = residual
+    pcg[:, 3] = 1.0
+    cell_data = np.zeros((cells, 4), dtype=np.float32)
+    cell_data[:, 3] = 1.0
+
+    buffers = dict.fromkeys(metal_engine.BINDING_ORDER)
+    buffers["grid_scratch"] = backend.buffer(cell_data.nbytes, cell_data.tobytes())
+    buffers["pcg"] = backend.buffer(pcg.nbytes, pcg.tobytes())
+    buffers["pcg_partials"] = backend.buffer(groups * 16)
+    buffers["pcg_scalars"] = backend.buffer(8 * 4)
+    bindings = backend.bindings([buffers[name] for name in metal_engine.BINDING_ORDER])
+    block = engine_params.ParamBlock(cell_count=cells)
+
+    results = set()
+    for _ in range(8):
+        buffers["pcg_scalars"].zero()
+        queue = backend.queue()
+        common = {"constants_index": metal_engine.PARAMS_INDEX}
+        queue.dispatch(update, groups * group, group, bindings, constants=block.pack(), **common)
+        queue.dispatch(reduce, group, group, bindings, constants=block.pack(pcg_stage=2), **common)
+        queue.commit()
+        results.add(bytes(buffers["pcg_scalars"].map())[7 * 4 : 8 * 4])
+    check(len(results) == 1, f"reduction gave {len(results)} different answers over 8 runs")
+    got = struct.unpack("<f", results.pop())[0]
+
+    squares = np.zeros(groups * group, dtype=np.float32)
+    squares[:cells] = residual * residual
+    partials = [_tree_sum(squares[g * group : (g + 1) * group]) for g in range(groups)]
+    lanes = np.zeros(group, dtype=np.float32)
+    for g, value in enumerate(partials):
+        lanes[g % group] += value
+    want = float(_tree_sum(lanes))
+    exact = math.fsum(float(r) * float(r) for r in residual)
+    print(f"  r.r over {cells} cells: {got!r} (emulated {want!r}, exact {exact:.9g})")
+    check(got == want, f"reduction {got!r} is not the fixed-order sum {want!r}")
+    check(abs(got - exact) <= 1e-5 * exact, "reduction is far from the exact sum")
 
 
 def main():
@@ -322,6 +398,7 @@ def main():
         ("zero threads is a no-op", lambda: test_zero_threads_is_a_no_op(metal, program)),
         ("solver kernel libraries compile", lambda: test_solver_kernel_libraries_compile(metal)),
         ("parameter layout", lambda: test_params_layout(metal)),
+        ("deterministic reduction", lambda: test_deterministic_reduction(metal)),
     ]
 
     failures = 0

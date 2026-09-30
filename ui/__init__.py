@@ -128,8 +128,12 @@ class FLOWX_PT_solver(Panel):
             col.prop(settings, "surface_tension")
             col.prop(settings, "viscosity")
         else:
+            col.prop(settings, "apic_pressure_solver")
             col.prop(settings, "apic_pressure_iterations")
+            if settings.apic_pressure_solver == "PCG":
+                col.prop(settings, "apic_pressure_tolerance")
             col.prop(settings, "apic_vorticity_strength")
+            col.prop(settings, "apic_flip_blend")
         col.prop(settings, "max_substeps")
         col.prop(settings, "max_particles")
 

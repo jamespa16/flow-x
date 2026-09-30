@@ -62,6 +62,11 @@ APIC_PASSES = (
     "apic_confinement",
     "apic_divergence",
     "apic_pressure",
+    "apic_pcg_init",
+    "apic_pcg_matvec",
+    "apic_pcg_reduce",
+    "apic_pcg_update",
+    "apic_pcg_direction",
     "apic_project",
     "apic_g2p",
 )
