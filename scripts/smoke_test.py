@@ -122,6 +122,9 @@ def _check_apic_solver(sph, pbf_benchmark):
     settings.fluid_level = 50.0
     settings.cache_enabled = False
     settings.show_whitewater = False
+    # The benchmark runs the defaults, which is the PCG pressure solve.
+    if settings.apic_pressure_solver != "PCG":
+        raise RuntimeError(f"APIC defaults to {settings.apic_pressure_solver}, expected PCG")
 
     result = _get_operator("flowx.sph_toggle")()
     if "FINISHED" not in result or not sph.is_running():
@@ -147,9 +150,12 @@ def _check_apic_solver(sph, pbf_benchmark):
         raise RuntimeError(f"APIC benchmark is {ratio:.2f}x PBF, expected no more than 1.50x")
 
     # Benchmark the two methods with matching output settings above. Restart
-    # APIC with whitewater and caching enabled for continuation/replay checks.
+    # APIC with whitewater and caching enabled for continuation/replay checks,
+    # and with FLIP blending on: FLIP moves advection to the end of the
+    # substep, and cached scrubbing must still restore that run exactly.
     sph.stop()
     scene.frame_set(scene.frame_start)
+    settings.apic_flip_blend = 0.5
     settings.cache_enabled = True
     settings.show_whitewater = True
     settings.whitewater_capacity = 128
@@ -206,10 +212,11 @@ def _check_apic_solver(sph, pbf_benchmark):
     if sph._state["gpu_frame"] != checkpoint_frame:
         raise RuntimeError("CPU render replay unexpectedly changed the APIC GPU state")
     print(
-        f"[smoke_test] APIC {stats['device']}: surface + affine cache replay "
-        f"and baked render replay at frame {checkpoint_frame}"
+        f"[smoke_test] APIC {stats['device']} (PCG, FLIP 0.5): surface + affine cache "
+        f"replay and baked render replay at frame {checkpoint_frame}"
     )
     sph.stop()
+    settings.apic_flip_blend = 0.0
 
 
 def _check_pbf_convergence(sph, stats):
@@ -659,7 +666,7 @@ def _install_packaged_zip():
     print(f"[smoke_test] installed packaged extension from {zip_path}")
 
 
-def _run_demo(demo, method):
+def _run_demo(demo, method, flip_blend=0.0):
     """Start one method on a demo scene and apply the standard checks."""
     mod = sys.modules[ADDON_MODULE]
     scene = bpy.context.scene
@@ -670,8 +677,9 @@ def _run_demo(demo, method):
     if not colliders:
         raise RuntimeError(f"{demo.name}: no tagged colliders found")
     domain.flowx_domain.solver_method = method.upper()
+    domain.flowx_domain.apic_flip_blend = flip_blend
     print(
-        f"[smoke_test] {demo.name}: method={method}, "
+        f"[smoke_test] {demo.name}: method={method}, FLIP blend={flip_blend}, "
         f"domain='{domain.name}', colliders={colliders}"
     )
 
@@ -737,9 +745,9 @@ def _check_demo_scenes():
         if not _gpu_available:
             print("[smoke_test] no GPU context; skipping demo scene replay")
             return
-        for method in ("pbf", "apic"):
+        for method, flip_blend in (("pbf", 0.0), ("apic", 0.0), ("apic", 0.5)):
             print(f"[smoke_test] replaying demo {demo.name} with {method.upper()}")
-            _run_demo(demo, method)
+            _run_demo(demo, method, flip_blend)
             sys.modules[ADDON_MODULE].solver.sph.stop()
             bpy.context.scene.frame_set(bpy.context.scene.frame_start)
 

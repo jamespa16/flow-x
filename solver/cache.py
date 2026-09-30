@@ -215,11 +215,16 @@ def config_hash(domain, scene, method=None, device=None):
     if method == "apic":
         digest.update(
             struct.pack(
-                "<If",
+                "<Iff",
                 settings.apic_pressure_iterations,
                 settings.apic_vorticity_strength,
+                settings.apic_flip_blend,
             )
         )
+        digest.update(settings.apic_pressure_solver.encode())
+        # The tolerance only changes a PCG run; Jacobi ignores it.
+        if settings.apic_pressure_solver == "PCG":
+            digest.update(struct.pack("<f", settings.apic_pressure_tolerance))
     else:
         digest.update(
             struct.pack(

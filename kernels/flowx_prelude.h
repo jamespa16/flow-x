@@ -35,6 +35,13 @@ using namespace metal;
 #define FLOWX_KERNEL kernel
 #define FLOWX_INLINE inline
 #define FLOWX_TID uint tid [[thread_position_in_grid]]
+/* For the passes that cooperate within a threadgroup (the deterministic
+ * reductions): the grid id plus the thread's lane and its group's index. */
+#define FLOWX_GROUP_TID                                                         \
+  uint tid [[thread_position_in_grid]], uint lid [[thread_position_in_threadgroup]], \
+      uint group [[threadgroup_position_in_grid]]
+#define FLOWX_SHARED threadgroup
+#define FLOWX_BARRIER() threadgroup_barrier(mem_flags::mem_threadgroup)
 
 #else /* CUDA - not built yet; the shape the port has to fill in. */
 
@@ -44,6 +51,9 @@ using namespace metal;
 #define FLOWX_KERNEL extern "C" __global__
 #define FLOWX_INLINE __device__ inline
 #define FLOWX_TID
+#define FLOWX_GROUP_TID
+#define FLOWX_SHARED __shared__
+#define FLOWX_BARRIER() __syncthreads()
 /* CUDA has float3/float4 but no operators on them; a port supplies those here
  * along with a thread-id definition, and the pass bodies stay untouched. */
 
@@ -81,7 +91,22 @@ using namespace metal;
 #define BUF_GRID_VELOCITY 17
 #define BUF_GRID_VORT 18
 #define BUF_GRID_SCRATCH 19
-#define BUF_PARAMS 20
+/* FLIP blending: the grid velocity as P2G left it, before forces and the
+ * pressure projection, so G2P can hand particles the grid's *change*. */
+#define BUF_GRID_VELOCITY_OLD 20
+/* The PCG pressure solve. Per cell (residual, direction, A*direction,
+ * diagonal); per reduction group a float4 of partial sums; and a handful of
+ * scalars (see PCG_* in apic_common.h) that the reduce pass writes and the
+ * vector passes read, so the loop never needs a host read-back. */
+#define BUF_PCG 21
+#define BUF_PCG_PARTIALS 22
+#define BUF_PCG_SCALARS 23
+#define BUF_PARAMS 24
+
+/* Threads per group for every pass, and the width of the reduction trees.
+ * solver/engine/metal_engine.py's GROUP_SIZE must equal this: the reductions
+ * size their threadgroup arrays from it and rely on full groups. */
+#define FLOWX_GROUP_SIZE 64
 
 /* Every parameter every pass needs, in one block.
  *
@@ -173,6 +198,12 @@ struct Params {
   float vorticity_epsilon;
   float grid_max_speed;
   int pressure_ping;
+  /* PCG: which reduction apic_pcg_reduce finishes (set per dispatch), and the
+   * relative residual at which the solve stops early. */
+  int pcg_stage;
+  float pressure_tolerance;
+  /* 0 = pure APIC, 1 = pure FLIP; see apic_g2p. */
+  float flip_blend;
 };
 
 #define FLOWX_PI 3.14159265358979323846f

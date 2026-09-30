@@ -23,6 +23,10 @@ jobs:
       # which runs it on tag pushes and via workflow_dispatch.
       - run: python3 scripts/test_marching_cubes.py
 
+      # Everything below needs numpy: the CPU engines are built on it, and
+      # test_backend.py emulates the kernels' reduction order with it.
+      - run: pip install numpy
+
       # The backend package imports neither bpy nor gpu, so its tests run here
       # too. On Linux there is no Metal device, so this reports a skip rather
       # than a pass - it is still worth running, because an import error or a
@@ -31,7 +35,6 @@ jobs:
 
       # Both CPU methods are numpy-only, so PBF/APIC physics, transfers,
       # colliders, surface, whitewater and continuation are covered here.
-      - run: pip install numpy
       - run: python3 scripts/test_cpu_engine.py
       - run: python3 scripts/test_cache.py
 

@@ -87,9 +87,13 @@ play, done.
   viscosity and surface tension.
 - **APIC solver.** Particles carry velocity plus three affine rows. Momentum is
   gathered deterministically to staggered MAC faces, gravity and optional
-  vorticity confinement are applied, and 40 weighted-Jacobi iterations by
-  default project the grid velocity before it is transferred back. The
-  implementation follows the [MAC APIC formulation](https://www.cs.ucr.edu/~shinar/papers/2019-mac-apic.pdf).
+  vorticity confinement are applied, and a preconditioned conjugate-gradient
+  pressure solve (up to 40 iterations, stopping early at its tolerance)
+  projects the grid velocity before it is transferred back. Its dot products
+  are fixed-order reductions, so runs stay reproducible for the cache. Weighted
+  Jacobi is still selectable for comparison, and an optional FLIP blend trades
+  APIC's smoothness for retained small-scale motion. The implementation
+  follows the [MAC APIC formulation](https://www.cs.ucr.edu/~shinar/papers/2019-mac-apic.pdf).
 - **Neighbors.** A uniform grid rebuilt once per substep (not per constraint
   iteration); particles are bucketed with a bitonic sort. That was originally
   forced - Blender's Metal backend could not compile an image atomic, so a
@@ -143,8 +147,16 @@ most of the work:
   per-frame score/sort/spawn/advect pass plus a point-cloud read-back on top
   of the core solve, so it's an additive cost. *Capacity* bounds the pool and
   *Spawn Rate* bounds how fast it fills.
-- **APIC Pressure Iterations** - linear cost in APIC's pressure solve. Raise it
-  if a coarse or collider-heavy grid remains visibly compressible.
+- **APIC Pressure Solver / Iterations / Tolerance** - PCG (the default) usually
+  meets its tolerance well inside the iteration cap and holds a still pool's
+  volume; Jacobi runs every iteration and a deep pool slowly sinks under it
+  (about 14% of its fluid cells in a second in the test scene). On Metal, PCG
+  records every capped iteration and skips the ones after convergence on the
+  device, so the cap - not the tolerance - bounds its cost.
+- **APIC FLIP Blend** - 0 is pure APIC. Higher keeps more particle-level motion
+  and adds noise; 0.5 or below is recommended. Above that, angular momentum
+  drifts noticeably at low particle counts (13% over 300 steps at 1.0 in the
+  rotating-block test, against 2% at 0.5).
 
 If ms/step is above the scene's frame budget, the panel says so.
 

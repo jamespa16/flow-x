@@ -39,7 +39,9 @@ from . import kernels
 from .params import ParamBlock
 
 # Threads per group. 64 matches the old GLSL local_group_size and is a whole
-# number of the M-series' 32-wide execution width.
+# number of the M-series' 32-wide execution width. FLOWX_GROUP_SIZE in
+# kernels/flowx_prelude.h must agree: the reduction passes size their
+# threadgroup arrays from it.
 GROUP_SIZE = 64
 
 # The SPH state buffers, and how wide each element is in floats. Every one is a
@@ -81,8 +83,12 @@ BINDING_ORDER = (
     "grid_velocity",
     "grid_vort",
     "grid_scratch",
+    "grid_velocity_old",
+    "pcg",
+    "pcg_partials",
+    "pcg_scalars",
 )
-PARAMS_INDEX = 20
+PARAMS_INDEX = 24
 
 
 class MetalEngine:
@@ -147,6 +153,10 @@ class MetalEngine:
             "grid_velocity",
             "grid_vort",
             "grid_scratch",
+            "grid_velocity_old",
+            "pcg",
+            "pcg_partials",
+            "pcg_scalars",
         ):
             self.buffers.setdefault(name, None)
 

@@ -135,15 +135,61 @@ class FlowXDomainSettings(PropertyGroup):
         min=0.0,
         max=10.0,
     )
+    apic_pressure_solver: EnumProperty(
+        name="Pressure Solver",
+        description=(
+            "How the APIC pressure projection is solved. PCG converges far further "
+            "for the same iteration budget; Jacobi is kept for comparison"
+        ),
+        items=(
+            (
+                "PCG",
+                "PCG",
+                "Preconditioned conjugate gradient. Stops early once the tolerance is "
+                "met; holds a still pool's volume",
+            ),
+            (
+                "JACOBI",
+                "Jacobi",
+                "Weighted Jacobi relaxation. Cheap per iteration but slow to converge, "
+                "so deep fluid slowly loses volume",
+            ),
+        ),
+        default="PCG",
+    )
     apic_pressure_iterations: IntProperty(
         name="Pressure Iterations",
         description=(
-            "Weighted-Jacobi iterations used to project the APIC grid velocity to "
-            "an incompressible field. More reduces residual divergence at a linear cost"
+            "Upper bound on pressure-solver iterations per substep. PCG usually "
+            "reaches its tolerance well before this; Jacobi always runs all of them"
         ),
         default=40,
         min=5,
         max=200,
+    )
+    apic_pressure_tolerance: FloatProperty(
+        name="Pressure Tolerance",
+        description=(
+            "PCG stops once the remaining divergence is this fraction of what it "
+            "started from. Smaller is more incompressible and costs more iterations"
+        ),
+        default=1e-3,
+        min=0.0,
+        max=0.1,
+        precision=5,
+        step=0.01,
+    )
+    apic_flip_blend: FloatProperty(
+        name="FLIP Blend",
+        description=(
+            "Mix of FLIP into the APIC grid-to-particle transfer. 0 is pure APIC; "
+            "higher keeps more small-scale motion and splash but adds particle noise. "
+            "0.5 or below is recommended"
+        ),
+        default=0.0,
+        min=0.0,
+        max=1.0,
+        subtype="FACTOR",
     )
     apic_vorticity_strength: FloatProperty(
         name="Vorticity Strength",

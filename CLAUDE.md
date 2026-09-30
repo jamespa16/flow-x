@@ -25,10 +25,11 @@ black --check .
 # build the Metal helper (needed for the GPU engine; not for the CPU one)
 python3 scripts/build_native.py [--debug] [--check]
 
-# the tests that run without Blender — all three are in CI
+# the tests that run without Blender — all four are in CI
 python3 scripts/test_marching_cubes.py   # iso-surface extraction
-python3 scripts/test_backend.py          # device, kernels, atomics, dispatch order
-python3 scripts/test_cpu_engine.py       # the numpy PBF, and its agreement with the GPU
+python3 scripts/test_backend.py          # device, kernels, atomics, dispatch order, reductions
+python3 scripts/test_cpu_engine.py       # the numpy PBF/APIC, and their agreement with the GPU
+python3 scripts/test_cache.py            # cache format and config-hash invalidation
 
 # dev loop: symlink the checkout into Blender's user_default extensions repo,
 # then restart Blender (or Preferences > Get Extensions > Refresh Local) and Enable
@@ -54,7 +55,7 @@ blender --background demos/pool_with_ramp.blend --python scripts/golden.py -- \
 `scripts/reload_on_save.py` runs *inside* Blender (Scripting tab) and re-enables the
 extension whenever a `.py`/`.metal` file changes.
 
-CI (`.github/workflows/ci.yml`) is lint plus the three Blender-free test scripts on
+CI (`.github/workflows/ci.yml`) is lint plus the four Blender-free test scripts on
 Linux, and a macOS job that builds the dylib and runs the two that need a device.
 The Blender smoke test lives in `release.yml` and runs on tag pushes /
 `workflow_dispatch`, since it needs to download Blender.
@@ -132,7 +133,15 @@ it. What remains is real:
   program frees the pipelines it handed out and the failure surfaces later, inside
   submit, as a null kernel.
 - **`solver/backend/`, `solver/engine/params.py` and `solver/engine/cpu_engine.py` must
-  not import `bpy`** (nor `marching_cubes.py`) — three CI test scripts depend on it.
+  not import `bpy`** (nor `marching_cubes.py`) — the CI test scripts depend on it.
+- **GPU reductions must be fixed-order.** APIC's PCG dot products are a
+  threadgroup tree plus a single-group second pass (`flowx_group_sum`,
+  `apic_pcg_reduce`), never float atomics: atomic accumulation order is the
+  hardware's, and a different order is a different rounding, which breaks cached
+  scrubbing. The trees assume full 64-lane groups, so `FLOWX_GROUP_SIZE` in the
+  prelude must equal `GROUP_SIZE` in `metal_engine.py`, and reduction passes are
+  dispatched in whole groups. `scripts/test_backend.py` checks the sum bit for
+  bit against a float32 emulation of the same order.
 - **Image atomics used to be impossible**, which is why the grid build is a bitonic
   sort and whitewater uses a ring buffer instead of compaction. Atomics work now; those
   two are simply not yet rewritten. If you rewrite them, re-bake a `scripts/golden.py`

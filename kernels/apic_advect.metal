@@ -1,11 +1,17 @@
 /* Move particles with the previous projected velocity, then recover any
- * collider/domain penetration before the new particle-to-grid transfer. */
+ * collider/domain penetration before the new particle-to-grid transfer.
+ *
+ * Under FLIP blending this runs at the end of the substep instead, and moves
+ * particles by the grid velocity apic_g2p left in the delta buffer rather than
+ * by the carried velocity; the carried velocity only takes the collision
+ * response. See ApicMetalEngine.substep for why. */
 
 #define APIC_MAX_COLLIDER_SEARCH 2
 
 FLOWX_KERNEL void apic_advect(FLOWX_DEVICE float4 *positions [[buffer(BUF_POSITIONS)]],
                               FLOWX_DEVICE float4 *velocities [[buffer(BUF_VELOCITIES)]],
                               FLOWX_DEVICE float4 *predicted [[buffer(BUF_PREDICTED)]],
+                              FLOWX_CONST_DEVICE float4 *motion [[buffer(BUF_DELTA)]],
                               FLOWX_CONST_DEVICE float *collider [[buffer(BUF_COLLIDER)]],
                               FLOWX_CONSTANT Params &P [[buffer(BUF_PARAMS)]],
                               FLOWX_TID)
@@ -14,8 +20,9 @@ FLOWX_KERNEL void apic_advect(FLOWX_DEVICE float4 *positions [[buffer(BUF_POSITI
   if (i >= P.particle_count) {
     return;
   }
+  bool flip = P.flip_blend > 0.0f;
   float3 v = velocities[i].xyz;
-  float3 p = positions[i].xyz + v * P.dt;
+  float3 p = positions[i].xyz + (flip ? motion[i].xyz : v) * P.dt;
   float radius = P.particle_radius;
 
   if (P.collider_voxel > 0.0f &&
@@ -55,13 +62,20 @@ FLOWX_KERNEL void apic_advect(FLOWX_DEVICE float4 *positions [[buffer(BUF_POSITI
   float3 lo = params_lo(P) + radius;
   float3 hi = params_hi(P) - radius;
   for (int axis = 0; axis < 3; ++axis) {
+    /* The carried FLIP velocity need not point the way the motion did, so
+     * only its into-wall component is reflected. Under APIC they are the
+     * same vector and the reflection is unconditional, as it always was. */
     if (p[axis] < lo[axis]) {
       p[axis] = lo[axis];
-      v[axis] *= -P.boundary_damping;
+      if (!flip || v[axis] < 0.0f) {
+        v[axis] *= -P.boundary_damping;
+      }
     }
     else if (p[axis] > hi[axis]) {
       p[axis] = hi[axis];
-      v[axis] *= -P.boundary_damping;
+      if (!flip || v[axis] > 0.0f) {
+        v[axis] *= -P.boundary_damping;
+      }
     }
   }
   positions[i] = float4(p, 1.0f);
