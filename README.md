@@ -101,10 +101,11 @@ play, done.
   runs its own Metal kernels where atomics work.
 - **Colliders.** CPU-voxelized into the domain's grid (BVH ray parity) and
   uploaded as an occupancy buffer the finalize pass samples; rebuilt when a
-  collider's transform or geometry changes. A keyframed collider is tagged
-  with the *Animated Collider* option (Object Properties > Flow-X Collider),
-  which rebuilds its grid every frame from its animation so the fluid tracks
-  its motion.
+  collider's transform or geometry changes. A keyframed rigid collider is
+  tagged with the *Animated Collider* option (Object Properties > Flow-X
+  Collider), which rebuilds its grid every frame and transfers the collider's
+  velocity into PBF, APIC, and whitewater through one-way normal contact
+  response. Tangential fluid motion remains frictionless.
 - **Surface.** Particles are splatted onto a scalar grid on the GPU, read
   back once per frame, and extracted with a self-contained marching-cubes
   implementation into the `<Domain>.FluidSurface` child mesh.
@@ -117,12 +118,15 @@ play, done.
 - **Deterministic.** Seeding uses a fixed RNG seed and the substep size comes
   only from the scene's frame rate, so the same timeline replays to the same
   particle state (bit-for-bit, which is what the cache relies on).
-- **Cache.** Cache v4 stores positions, velocities, and the prior density needed
+- **Cache.** Cache v5 stores positions, velocities, and the prior density needed
   by PBF surface tension; APIC additionally
   stores all affine rows. When whitewater is enabled it also stores the complete
   pool and ring cursor. Method, resolved device, extension version and active
   settings validate the file, so an Auto run cannot silently resume on a
-  different backend. Pre-0.3 cache files are intentionally recreated.
+  different backend. Collider geometry, animation definitions, and the
+  Animated Collider flag are part of the invalidation hash; transient collider
+  transforms and velocity grids are reconstructed while replaying. Older
+  cache files are intentionally recreated.
 - **Render.** Each rendered frame replays its cached surface and whitewater
   rather than re-extracting it, so a render matches the frames that were baked
   (see [Rendering](#rendering)).
@@ -181,11 +185,11 @@ the cache already holds.
 - **Validity.** The file is keyed by a hash of everything that changes the
   simulation *or the extracted surface* - solver settings, domain bounds and
   resolution, collider geometry, frame rate, the surface and whitewater
-  settings, this extension's version - plus a per-frame fingerprint of each
-  collider's world transform. Change any of those and the next Reset starts a
-  fresh file; until then the stale file warns instead of showing old state and
-  stops growing, so frames simulated under the new settings never mix with the
-  old run.
+  settings, this extension's version, each collider's animation definition,
+  and its Animated Collider flag. Change any of those and the next Reset
+  starts a fresh file; until then the stale file warns instead of showing old
+  state and stops growing, so frames simulated under the new settings never
+  mix with the old run.
 - **Clear Cache** deletes both files. A running simulation stops writing until
   the next Reset.
 
@@ -218,7 +222,10 @@ look.
   mesh offset from the fluid until the next re-seed (Reset, or the playback
   loop). Colliders may move; the domain may not.
 - Colliders are static or simply-animated rigid meshes; no deforming/skinned
-  colliders. Zero-face or out-of-domain colliders are tagged but warn.
+  colliders. Animated colliders transfer only one-way normal velocity: there
+  is no friction, swept continuous collision detection, or two-way force
+  coupling. Fast motion can still move more than one voxel between samples.
+  Zero-face or out-of-domain colliders are tagged but warn.
 - A domain scaled to zero volume is refused, not simulated.
 - The surface uses a flat water-ish material; there is no refraction.
   Whitewater spray/foam/bubble renders as a raw point cloud carrying `life`
@@ -233,8 +240,9 @@ look.
 - APIC v1 is inviscid and has no surface-tension force. Grid boundaries can
   look stickier than PBF at low resolution; raise Resolution or reduce
   Vorticity Strength when that is visible.
-- Moving colliders rebuild occupancy each frame, but collider velocity is not
-  transferred into the fluid and coupling remains one-way.
+- Moving rigid colliders rebuild occupancy and velocity each frame. Their
+  normal velocity is transferred into PBF, APIC, and whitewater with one-way
+  coupling; tangential velocity is left unchanged.
 - The Metal helper is a compiled dylib. A release downloaded from the internet
   carries a quarantine flag, and macOS will refuse to load it until it is
   signed and notarized; when that happens Flow-X falls back to the CPU engine
@@ -276,7 +284,7 @@ demos/        shipped example scenes
 - `scripts/make_demo.py` - rebuilds the demo scenes.
 - `scripts/golden.py --method=pbf|apic` - creates and compares method-specific
   references; it rejects comparisons across methods.
-- `scripts/test_cache.py` - standalone cache-v4 state and invalidation tests.
+- `scripts/test_cache.py` - standalone cache-v5 state and invalidation tests.
 - `scripts/package.py` - builds the release zip (also run by CI on tags).
 - Lint/format: `ruff check .` and `black --check .` (see CI).
 

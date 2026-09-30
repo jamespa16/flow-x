@@ -78,7 +78,9 @@ from ..collision import (
     ensure_grids,
     get_solver_grid,
     get_solver_occupancy,
+    get_solver_velocity,
     rebuild_animated_grids,
+    reset_motion_baseline,
 )
 from ..domain import find_domain, is_alive, is_degenerate, world_bounds
 from . import cache, surface, viz, whitewater
@@ -155,6 +157,10 @@ _state = {
     # - unlike the compute context, which Blender only drops partway into that
     # first frame - every rendered frame sees this and takes the CPU path.
     "rendering": False,
+    # Guards the frame_set calls used to evaluate every logical catch-up
+    # frame. Those calls fire frame_change_pre recursively; the nested handler
+    # must let Blender evaluate animation without stepping the solver twice.
+    "internal_frame_change": False,
 }
 
 
@@ -406,13 +412,20 @@ def _sync_collider():
     effect on the very next substep rather than needing the solver restarted.
     """
     buffer, voxel_size, dims = get_solver_grid()
+    velocities = get_solver_velocity()
     if buffer is None and get_solver_occupancy() is None:
         # A voxel size of 0 tells the engine there is nothing to sample.
         _state["engine"].set_collider(None, (1, 1, 1), 0.0)
     else:
         # Both forms: a GPU engine binds the buffer, the CPU engine reads the
         # occupancy. Whichever it does not need, it ignores.
-        _state["engine"].set_collider(buffer, dims, voxel_size, occupancy=get_solver_occupancy())
+        _state["engine"].set_collider(
+            buffer,
+            dims,
+            voxel_size,
+            occupancy=get_solver_occupancy(),
+            velocities=velocities,
+        )
 
 
 def _step(frame_dt, frame):
@@ -569,6 +582,8 @@ def _start(domain):
     # reload a tagged collider may have its tag but no grid; build the missing
     # ones so the first substep collides correctly.
     ensure_grids(bpy.context.scene)
+    reset_motion_baseline()
+    rebuild_animated_grids(bpy.context.scene)
     preferred = domain.flowx_domain.engine
     method = domain.flowx_domain.solver_method.lower()
     engine = engines.create(None if preferred == "AUTO" else preferred.lower(), method)
@@ -615,6 +630,8 @@ def reseed(scene=None):
     if is_degenerate(domain):
         return False
     scene = scene or bpy.context.scene
+    reset_motion_baseline()
+    rebuild_animated_grids(scene)
     _seed(domain)
     _reset_clock(scene)
     # Re-open the cache so a mid-run edit to any hashed setting - or to the
@@ -831,8 +848,27 @@ def _pick_up_cache_end(scene, domain, frame):
     loaded = _load_cached(end, scene, domain)
     if loaded is None:
         return False
+    reset_motion_baseline()
+    _evaluate_simulation_frame(scene, end)
     _apply_cached(loaded, end)
     return True
+
+
+def _evaluate_simulation_frame(scene, frame):
+    """Evaluate animation and rebuild moving colliders for one logical frame."""
+    if scene.frame_current != frame:
+        _state["internal_frame_change"] = True
+        try:
+            scene.frame_set(frame)
+        finally:
+            _state["internal_frame_change"] = False
+    rebuild_animated_grids(scene)
+
+
+def _install_discontinuous_collider_frame(scene, frame):
+    """Install target occupancy without deriving motion across a seek/reset."""
+    reset_motion_baseline()
+    _evaluate_simulation_frame(scene, frame)
 
 
 def _in_render():
@@ -886,7 +922,7 @@ def _on_frame_change(scene, _depsgraph):
     the catch-up budget; and a backward jump with no usable cache holds
     rather than showing a frame that was never simulated.
     """
-    if not _state["running"]:
+    if not _state["running"] or _state["internal_frame_change"]:
         return
 
     # The domain is the run's config source and the surface mesh's parent. If
@@ -915,11 +951,6 @@ def _on_frame_change(scene, _depsgraph):
         # Re-entering the frame the state already represents (a frame_set to
         # the current frame): there is nothing to advance and nothing wrong.
         return
-    # An animated collider's transform changes with the frame, not with an
-    # object edit, so its grid is not rebuilt by the depsgraph path; refresh
-    # it now, at this frame's transform, before re-seeding, a cache load, or
-    # the frame's physics reads it.
-    rebuild_animated_grids(scene)
     if frame <= _state["seed_frame"]:
         if not reseed(scene):
             stop_deferred()
@@ -929,11 +960,13 @@ def _on_frame_change(scene, _depsgraph):
 
     loaded = _load_cached(frame, scene, domain)
     if loaded is not None:
+        _install_discontinuous_collider_frame(scene, frame)
         _apply_cached(loaded, frame)
         return
 
     pending = frame - _state["last_frame"]
     if pending < 0:
+        _install_discontinuous_collider_frame(scene, frame)
         _state["warning"] = cache.warning() or (
             f"Frame {frame} is behind the simulation, which is at frame "
             f"{_state['last_frame']}. Flow-X has no cache to scrub back through - "
@@ -965,6 +998,7 @@ def _on_frame_change(scene, _depsgraph):
     if _state["gpu_frame"] != _state["last_frame"]:
         reloaded = _load_cached(_state["last_frame"], scene, domain)
         if reloaded is not None:
+            _install_discontinuous_collider_frame(scene, _state["last_frame"])
             _apply_cached(reloaded, _state["last_frame"])
         elif not reseed(scene):
             stop_deferred()
@@ -972,11 +1006,14 @@ def _on_frame_change(scene, _depsgraph):
     frame_dt = _frame_dt(scene)
     target = _state["last_frame"] + pending
     while _state["last_frame"] < target:
-        _step(frame_dt, _state["last_frame"] + 1)
+        next_frame = _state["last_frame"] + 1
+        _evaluate_simulation_frame(scene, next_frame)
+        _step(frame_dt, next_frame)
     # A clamped jump only simulated as far as `target`, but the run claims
     # the scene's frame anyway - the warning above says why it's approximate.
     if frame != target:
         _state["last_frame"] = frame
+        _install_discontinuous_collider_frame(scene, frame)
     viz.tag_viewports_redraw()
 
 

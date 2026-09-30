@@ -54,6 +54,7 @@ PARAMS_FIELDS = (
     ("collider_y", "i"),
     ("collider_z", "i"),
     ("collider_voxel", "f"),
+    ("collider_motion", "i"),
     ("surface_x", "i"),
     ("surface_y", "i"),
     ("surface_z", "i"),

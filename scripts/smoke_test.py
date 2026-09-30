@@ -676,6 +676,21 @@ def _run_demo(demo, method, flip_blend=0.0):
     colliders = [obj.name for obj in scene.objects if obj.flowx_collider.is_collider]
     if not colliders:
         raise RuntimeError(f"{demo.name}: no tagged colliders found")
+    animated = [
+        obj
+        for obj in scene.objects
+        if obj.type == "MESH" and obj.flowx_collider.is_collider and obj.flowx_collider.is_animated
+    ]
+    # Add a small rigid rotation to the shipped translating-ball fixture. A
+    # sphere's occupancy is unchanged by rotation, so any tangential wall field
+    # observed below came from transform velocity rather than voxel movement.
+    for obj in animated:
+        scene.frame_set(scene.frame_start)
+        start_rotation = obj.rotation_euler.z
+        obj.keyframe_insert("rotation_euler", index=2, frame=scene.frame_start)
+        obj.rotation_euler.z = start_rotation + math.radians(20.0)
+        obj.keyframe_insert("rotation_euler", index=2, frame=scene.frame_start + 5)
+    scene.frame_set(scene.frame_start)
     domain.flowx_domain.solver_method = method.upper()
     domain.flowx_domain.apic_flip_blend = flip_blend
     print(
@@ -698,6 +713,30 @@ def _run_demo(demo, method, flip_blend=0.0):
     _check_particles(sph, stats)
     _check_surface(sph, stats)
     _check_collider_grids()
+    if animated:
+        velocity = mod.collision.get_solver_velocity()
+        if velocity is None:
+            raise RuntimeError("animated collider produced no wall-velocity field")
+        components = list(zip(*([iter(velocity)] * 3), strict=True))
+        if not any(abs(vx) > 1e-4 or abs(vy) > 1e-4 for vx, vy, _vz in components):
+            raise RuntimeError("rotating collider produced no tangential wall velocity")
+        if not any(vz < -1e-4 for _vx, _vy, vz in components):
+            raise RuntimeError("translating collider produced no downward wall velocity")
+
+        # A seek/reset must install current occupancy without interpreting the
+        # discontinuity as a collider impulse.
+        mod.collision.reset_motion_baseline()
+        mod.collision.rebuild_animated_grids(scene)
+        if mod.collision.get_solver_velocity() is not None:
+            raise RuntimeError("reset collider baseline retained a stale wall velocity")
+
+        jump_target = scene.frame_start + 3
+        scene.frame_set(scene.frame_start)
+        scene.frame_set(jump_target)
+        if sph.stats()["frame"] != jump_target:
+            raise RuntimeError("animated-collider catch-up did not reach its requested frame")
+        if mod.collision.get_solver_velocity() is None:
+            raise RuntimeError("animated-collider catch-up lost per-frame wall motion")
 
 
 def _check_no_stale_collider_state(demo_name):

@@ -157,6 +157,9 @@ struct Params {
   int collider_y;
   int collider_z;
   float collider_voxel;
+  /* The collider buffer appends one packed float3 velocity per voxel after
+   * its occupancy values only while a moving collider contributes motion. */
+  int collider_motion;
   /* surface splat lattice */
   int surface_x;
   int surface_y;

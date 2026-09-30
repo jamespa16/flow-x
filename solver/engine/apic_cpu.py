@@ -49,6 +49,7 @@ class ApicCpuEngine(CpuEngine):
         self.grid_velocity_old = None
         self.grid_vorticity = None
         self.grid_cell = None
+        self._solid_velocity = None
         self.last_divergence_before = 0.0
         self.last_divergence_after = 0.0
         # Max-norm counterparts of the RMS pair above, and how many iterations
@@ -79,6 +80,7 @@ class ApicCpuEngine(CpuEngine):
         self.grid_velocity_old = None
         self.grid_vorticity = None
         self.grid_cell = None
+        self._solid_velocity = None
 
     # --- particle and grid geometry -------------------------------------
 
@@ -104,6 +106,7 @@ class ApicCpuEngine(CpuEngine):
             radius = P["particle_radius"]
             damping = P["boundary_damping"]
             for index in stuck:
+                wall = self._sample_collider_velocity(positions[index : index + 1])[0]
                 nearest, dist2 = self._nearest_free_voxel(positions[index], voxel)
                 if nearest is None:
                     continue
@@ -114,7 +117,8 @@ class ApicCpuEngine(CpuEngine):
                     else np.array((0.0, 0.0, 1.0), dtype=np.float32)
                 )
                 positions[index] += push * (dist + radius)
-                vn = float(np.dot(velocities[index], push))
+                relative = velocities[index] - wall
+                vn = float(np.dot(relative, push))
                 if vn < 0.0:
                     velocities[index] -= vn * (1.0 + damping) * push
 
@@ -178,7 +182,9 @@ class ApicCpuEngine(CpuEngine):
         dx = self.params["grid_spacing"]
         z, y, x = np.indices((nz, ny, nx), dtype=np.float64)
         points = self._lo() + np.stack((x + 0.5, y + 0.5, z + 0.5), axis=-1) * dx
-        return self._occupied(points.reshape(-1, 3)).reshape(nz, ny, nx)
+        flat_points = points.reshape(-1, 3)
+        self._solid_velocity = self._collider_velocity(flat_points).reshape(nz, ny, nx, 3)
+        return self._occupied(flat_points).reshape(nz, ny, nx)
 
     def _classify_cells(self):
         nx, ny, nz = self.config.cell_dims
@@ -276,6 +282,67 @@ class ApicCpuEngine(CpuEngine):
         self.grid_velocity[..., 2][active[..., 2]] += self.params["gravity"] * dt
         np.clip(self.grid_velocity[..., :3], -vmax, vmax, out=self.grid_velocity[..., :3])
 
+    def _sample_collider_velocity(self, points):
+        """Return wall velocities for physical points, with a static fallback."""
+        points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+        helper = getattr(self, "_collider_velocity", None)
+        if helper is not None:
+            values = np.asarray(helper(points), dtype=np.float64)
+            return values.reshape(-1, 3)
+
+        grid = getattr(self, "collider_velocity", None)
+        voxel = float(self.params["collider_voxel"])
+        if grid is None or voxel <= 0.0:
+            return np.zeros((len(points), 3), dtype=np.float64)
+        coords = np.floor((points - self._lo()) / voxel).astype(np.int64)
+        dims = np.asarray(self.collider_dims, dtype=np.int64)
+        inside = np.all((coords >= 0) & (coords < dims), axis=1)
+        values = np.zeros((len(points), 3), dtype=np.float64)
+        if inside.any():
+            c = coords[inside]
+            values[inside] = np.asarray(grid[c[:, 2], c[:, 1], c[:, 0]], dtype=np.float64)
+        return values
+
+    def _solid_face_velocity(self, cell_type, axis):
+        """Average collider velocity from the solid cells touching each face."""
+        cell_velocity = self._solid_velocity
+        if cell_velocity is None:
+            cell_velocity = np.zeros(cell_type.shape + (3,), dtype=np.float32)
+
+        if axis == 0:
+            low, high = cell_type[:, :, :-1] < 0.0, cell_type[:, :, 1:] < 0.0
+            low_velocity = cell_velocity[:, :, :-1]
+            high_velocity = cell_velocity[:, :, 1:]
+            count = low.astype(np.float32) + high.astype(np.float32)
+            return np.divide(
+                low[..., None] * low_velocity + high[..., None] * high_velocity,
+                count[..., None],
+                out=np.zeros_like(low_velocity),
+                where=count[..., None] > 0.0,
+            )
+        if axis == 1:
+            low, high = cell_type[:, :-1, :] < 0.0, cell_type[:, 1:, :] < 0.0
+            low_velocity = cell_velocity[:, :-1, :]
+            high_velocity = cell_velocity[:, 1:, :]
+            count = low.astype(np.float32) + high.astype(np.float32)
+            return np.divide(
+                low[..., None] * low_velocity + high[..., None] * high_velocity,
+                count[..., None],
+                out=np.zeros_like(low_velocity),
+                where=count[..., None] > 0.0,
+            )
+
+        low, high = cell_type[:-1, :, :] < 0.0, cell_type[1:, :, :] < 0.0
+        low_velocity = cell_velocity[:-1, :, :]
+        high_velocity = cell_velocity[1:, :, :]
+        count = low.astype(np.float32) + high.astype(np.float32)
+        return np.divide(
+            low[..., None] * low_velocity + high[..., None] * high_velocity,
+            count[..., None],
+            out=np.zeros_like(low_velocity),
+            where=count[..., None] > 0.0,
+        )
+
     def _apply_solid_faces(self, cell_type):
         u = self.grid_velocity[..., 0]
         v = self.grid_velocity[..., 1]
@@ -285,15 +352,21 @@ class ApicCpuEngine(CpuEngine):
         u[:, :, 0] = 0.0
         u[:, :, nx] = 0.0
         if nx > 1:
-            u[:nz, :ny, 1:nx][(cell_type[:, :, :-1] < 0.0) | (cell_type[:, :, 1:] < 0.0)] = 0.0
+            solid = (cell_type[:, :, :-1] < 0.0) | (cell_type[:, :, 1:] < 0.0)
+            wall = self._solid_face_velocity(cell_type, 0)
+            u[:nz, :ny, 1:nx][solid] = wall[..., 0][solid]
         v[:, 0, :] = 0.0
         v[:, ny, :] = 0.0
         if ny > 1:
-            v[:nz, 1:ny, :nx][(cell_type[:, :-1, :] < 0.0) | (cell_type[:, 1:, :] < 0.0)] = 0.0
+            solid = (cell_type[:, :-1, :] < 0.0) | (cell_type[:, 1:, :] < 0.0)
+            wall = self._solid_face_velocity(cell_type, 1)
+            v[:nz, 1:ny, :nx][solid] = wall[..., 1][solid]
         w[0, :, :] = 0.0
         w[nz, :, :] = 0.0
         if nz > 1:
-            w[1:nz, :ny, :nx][(cell_type[:-1, :, :] < 0.0) | (cell_type[1:, :, :] < 0.0)] = 0.0
+            solid = (cell_type[:-1, :, :] < 0.0) | (cell_type[1:, :, :] < 0.0)
+            wall = self._solid_face_velocity(cell_type, 2)
+            w[1:nz, :ny, :nx][solid] = wall[..., 2][solid]
 
     @staticmethod
     def _derivative(values, axis, spacing):

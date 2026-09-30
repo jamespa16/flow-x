@@ -32,7 +32,7 @@ Header (fixed part, then the collider name list):
     per collider: name length (I) + name bytes
     config_hash        (32s, sha256)
 
-Version 4 records the resolved solver method/device and a state bitmask in the
+Version 5 records the resolved solver method/device and a state bitmask in the
 header. Every frame stores positions and velocities; PBF also stores its prior
 density channel, which surface tension consumes before the next density solve.
 APIC adds its three padded affine rows per particle, and an enabled whitewater
@@ -63,7 +63,9 @@ the geometry counts, not the collider simply moving), and a motion
 fingerprint - the active action's keyframes when the collider is animated,
 or its current world matrix when it isn't - so re-keying a collider's
 animation or manually moving a static one invalidates the cache, but an
-animated collider simply playing forward does not. A file is only trusted
+animated collider simply playing forward does not. The animated-collider flag
+itself is also hashed, so changing whether motion is transferred invalidates
+the cache. A file is only trusted
 while the scene still hashes to its header's hash, checked once per write
 and once per load rather than by walking historical frames.
 
@@ -85,7 +87,7 @@ from ..collision import mesh_fingerprint
 from ..domain import find_domain, world_bounds
 
 MAGIC = b"FLWXCA01"
-FORMAT_VERSION = 4
+FORMAT_VERSION = 5
 
 STATE_AFFINE = 1 << 0
 STATE_WHITEWATER = 1 << 1
@@ -266,6 +268,10 @@ def config_hash(domain, scene, method=None, device=None):
     digest.update(struct.pack("<" + "f" * len(look), *look))
     for name in collider_names(scene):
         digest.update(name.encode("utf-8"))
+        # Whether the collider transfers kinematic velocity is part of the
+        # physics configuration, independently of its motion fingerprint.
+        obj = scene.objects[name]
+        digest.update(struct.pack("<?", bool(getattr(obj.flowx_collider, "is_animated", False))))
         mesh_fp = mesh_fingerprint(name)
         digest.update(mesh_fp if mesh_fp is not None else b"")
         digest.update(_motion_fingerprint(scene.objects[name]))
@@ -372,7 +378,7 @@ def _unpack_header(data):
 
 
 def _frame_size(state_flags, particle_count, whitewater_capacity):
-    """Bytes in one fixed-size v4 state record."""
+    """Bytes in one fixed-size v5 state record."""
     particle_floats = 8
     if state_flags & STATE_PBF_DENSITY:
         particle_floats += 1

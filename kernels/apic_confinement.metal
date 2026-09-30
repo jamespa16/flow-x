@@ -23,6 +23,7 @@ FLOWX_KERNEL void apic_confinement(
     FLOWX_DEVICE float4 *velocity [[buffer(BUF_GRID_VELOCITY)]],
     FLOWX_CONST_DEVICE float4 *vorticity [[buffer(BUF_GRID_VORT)]],
     FLOWX_CONST_DEVICE float4 *cell_data [[buffer(BUF_GRID_SCRATCH)]],
+    FLOWX_CONST_DEVICE float *collider [[buffer(BUF_COLLIDER)]],
     FLOWX_CONSTANT Params &P [[buffer(BUF_PARAMS)]],
     FLOWX_TID)
 {
@@ -33,8 +34,12 @@ FLOWX_KERNEL void apic_confinement(
   int3 node = apic_node_coord(P, index);
   float4 value = velocity[index];
   for (int axis = 0; axis < 3; ++axis) {
-    if (!apic_face_valid(P, node, axis) || apic_face_solid(P, cell_data, node, axis)) {
+    if (!apic_face_valid(P, node, axis)) {
       value[axis] = 0.0f;
+      continue;
+    }
+    if (apic_face_solid(P, cell_data, node, axis)) {
+      value[axis] = apic_solid_face_velocity(P, cell_data, collider, node, axis)[axis];
       continue;
     }
     int3 low = node;

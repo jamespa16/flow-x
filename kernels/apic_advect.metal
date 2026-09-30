@@ -51,8 +51,9 @@ FLOWX_KERNEL void apic_advect(FLOWX_DEVICE float4 *positions [[buffer(BUF_POSITI
     if (found) {
       float dist = sqrt(best);
       float3 normal = dist > 1e-6f ? (nearest - p) / dist : float3(0.0f, 0.0f, 1.0f);
+      float3 wall = apic_collider_velocity(P, collider, c);
       p += normal * (dist + radius);
-      float vn = dot(v, normal);
+      float vn = dot(v - wall, normal);
       if (vn < 0.0f) {
         v -= vn * (1.0f + P.boundary_damping) * normal;
       }
